@@ -1,0 +1,42 @@
+[package]
+name = "signal-rs"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Native Rust Signal desktop client (iced UI, presage/libsignal protocol)"
+
+[dependencies]
+presage = { git = "https://github.com/whisperfish/presage", rev = "30ca664b1fa6ef8629bfc5afd4d4d48b6ffc34c3" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "30ca664b1fa6ef8629bfc5afd4d4d48b6ffc34c3" }
+iced = { version = "0.14", features = ["tokio", "image", "qr_code", "advanced"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "fs"] }
+futures = "0.3"
+emojis = "0.9"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "6"
+chrono = "0.4"
+mime_guess = "2"
+rand = "0.9"
+hex = "0.4"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+notify-rust = "4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+iced_test = "0.14"
+tempfile = "3"
+
+# Mirrors presage's workspace: patches don't propagate from git dependencies.
+[patch.crates-io]
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
+
+# unoptimized ML-KEM can stack-overflow when decrypting PQXDH prekey messages
+[profile.dev.package.libcrux-ml-kem]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
