@@ -13,6 +13,9 @@ use presage::libsignal_service::content::{Content, ContentBody};
 use presage::libsignal_service::master_key::{MasterKey, StorageServiceKey};
 use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::StorageService;
+use presage::libsignal_service::configuration::Endpoint;
+use presage::libsignal_service::push_service::HttpAuthOverride;
+use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::ServiceId;
 use presage::libsignal_service::sender::AttachmentSpec;
@@ -91,6 +94,8 @@ pub enum Event {
     Sent { thread: Thread, ts: u64, error: Option<String> },
     Attachment { key: String, path: Result<PathBuf, String> },
     Error(String),
+    /// Neutral status banner (e.g. history import in progress); `None` clears it.
+    Notice(Option<String>),
 }
 
 pub fn now_ms() -> u64 {
@@ -137,13 +142,86 @@ fn db_passphrase(data_dir: &Path) -> anyhow::Result<String> {
         return Ok(k.trim().to_owned());
     }
     let key = hex::encode(rand::random::<[u8; 32]>());
-    std::fs::write(&path, &key)?;
+    write_private(&path, &key)?;
+    Ok(key)
+}
+
+/// Writes a secret readable only by the owner.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(key)
+    Ok(())
+}
+
+/// presage's QR omits capabilities; `backup5` is what makes the phone offer
+/// "Transfer message history" (Signal-Desktop sends the same).
+pub fn link_url(url: &url::Url) -> String {
+    let mut url = url.clone();
+    url.query_pairs_mut().append_pair("capabilities", "backup5");
+    url.to_string()
+}
+
+#[derive(serde::Deserialize, Debug, PartialEq)]
+#[serde(untagged)]
+enum TransferArchive {
+    Ready { cdn: u32, key: String },
+    /// RELINK_REQUESTED or CONTINUE_WITHOUT_UPLOAD: the phone chose not to send history.
+    Skipped { error: String },
+}
+
+/// Waits for the phone's history upload, downloads and imports it.
+/// Returns the newest timestamp per imported thread (to mark them read).
+async fn import_history(manager: Mgr, data_dir: PathBuf, key: [u8; 32], me: Uuid) -> anyhow::Result<Vec<(Thread, u64)>> {
+    let mut push = manager.push_service();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let archive = loop {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "the phone didn't upload history within an hour");
+        let resp = push
+            .request(reqwest::Method::GET, Endpoint::service("/v1/devices/transfer_archive?timeout=300"), HttpAuthOverride::NoOverride)?
+            .send()
+            .await?;
+        match resp.status().as_u16() {
+            204 => continue, // long-poll timed out; the phone is still uploading
+            200 => break resp.json::<TransferArchive>().await?,
+            s => anyhow::bail!("transfer archive request failed: HTTP {s}"),
+        }
+    };
+    let (cdn, cdn_key) = match archive {
+        TransferArchive::Ready { cdn, key } => (cdn, key),
+        TransferArchive::Skipped { error } => {
+            tracing::info!(error, "phone skipped history transfer");
+            let _ = std::fs::remove_file(data_dir.join("transfer.key"));
+            return Ok(Vec::new());
+        }
+    };
+    let pointer = AttachmentPointer {
+        cdn_number: Some(cdn),
+        attachment_identifier: Some(AttachmentIdentifier::CdnKey(cdn_key)),
+        ..Default::default()
+    };
+    let download = push.get_attachment(&pointer).await?;
+    let path = data_dir.join("transfer.bin");
+    let mut file = futures::io::AllowStdIo::new(std::fs::File::create(&path)?);
+    futures::io::copy(download.stream, &mut file).await?;
+    drop(file);
+
+    let imported = crate::history::read_archive(&path, key, me).await?;
+    tracing::info!(rows = imported.rows.len(), "importing message history");
+    let store = manager.store().clone();
+    let mut newest: HashMap<Thread, u64> = HashMap::new();
+    for (thread, content) in imported.rows {
+        let ts = content.metadata.client_timestamp.timestamp_millis() as u64;
+        let e = newest.entry(thread.clone()).or_default();
+        *e = (*e).max(ts);
+        store.save_message(&thread, content).await?;
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(data_dir.join("transfer.key"));
+    Ok(newest.into_iter().collect())
 }
 
 async fn main(
@@ -161,7 +239,7 @@ async fn main(
     let manager = if store.is_registered().await {
         Manager::load_registered(store).await?
     } else {
-        link(store, &mut cmds, &events).await?
+        link(store, &data_dir, &mut cmds, &events).await?
     };
 
     let mut b = Backend {
@@ -202,6 +280,18 @@ async fn main(
         }
     });
 
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+    let transfer_key = std::fs::read_to_string(data_dir.join("transfer.key"))
+        .ok()
+        .and_then(|k| <[u8; 32]>::try_from(hex::decode(k.trim()).ok()?).ok());
+    if let Some(key) = transfer_key {
+        b.emit(Event::Notice(Some("Importing your message history from your phone…".into())));
+        let (m, dir, me) = (b.manager.clone(), data_dir.clone(), b.me);
+        tokio::task::spawn_local(async move {
+            let _ = done_tx.send(import_history(m, dir, key, me).await);
+        });
+    }
+
     loop {
         tokio::select! {
             cmd = cmds.recv() => match cmd {
@@ -209,12 +299,26 @@ async fn main(
                 None => return Ok(()), // UI gone
             },
             Some(r) = in_rx.recv() => b.received(r).await,
+            Some(result) = done_rx.recv() => {
+                b.emit(Event::Notice(None));
+                match result {
+                    Ok(threads) => {
+                        for (thread, ts) in &threads {
+                            b.state.mark_read(thread, *ts);
+                        }
+                        b.refresh().await;
+                    }
+                    // The key is kept, so the next start retries.
+                    Err(e) => b.emit(Event::Error(format!("History import failed: {e:#}"))),
+                }
+            }
         }
     }
 }
 
 async fn link(
     store: SqliteStore,
+    data_dir: &Path,
     cmds: &mut mpsc::UnboundedReceiver<Command>,
     events: &fmpsc::UnboundedSender<Event>,
 ) -> anyhow::Result<Mgr> {
@@ -233,12 +337,17 @@ async fn link(
             Manager::link_secondary_device(store.clone(), SignalServers::Production, device_name, tx),
             async move {
                 if let Ok(url) = rx.await {
-                    let _ = ev.send(Event::LinkUrl(url.to_string())).await;
+                    let _ = ev.send(Event::LinkUrl(link_url(&url))).await;
                 }
             }
         );
         match result {
             Ok(mut m) => {
+                // presage keeps this key in memory only; persist it until the import finishes,
+                // as Signal-Desktop does, so a restart mid-transfer can resume.
+                if let Some(key) = m.registration_data().ephemeral_backup_key() {
+                    write_private(&data_dir.join("transfer.key"), &hex::encode(key))?;
+                }
                 if let Err(e) = m.request_contacts().await {
                     tracing::warn!(%e, "contact sync request failed");
                 }
@@ -695,6 +804,24 @@ mod tests {
         assert_eq!(attachment_key(&p), "abcd");
         let q = AttachmentPointer { size: Some(3), ..Default::default() };
         assert!(attachment_key(&q).ends_with("-3"));
+    }
+
+    #[test]
+    fn link_url_advertises_history_transfer() {
+        let url = url::Url::parse("sgnl://linkdevice?uuid=a&pub_key=b%2Bc").unwrap();
+        let out = url::Url::parse(&link_url(&url)).unwrap();
+        let q: HashMap<_, _> = out.query_pairs().into_owned().collect();
+        assert_eq!(q["capabilities"], "backup5");
+        assert_eq!((q["uuid"].as_str(), q["pub_key"].as_str()), ("a", "b+c"), "existing params intact");
+    }
+
+    #[test]
+    fn transfer_archive_responses() {
+        let ready: TransferArchive = serde_json::from_str(r#"{"cdn":3,"key":"abc"}"#).unwrap();
+        assert_eq!(ready, TransferArchive::Ready { cdn: 3, key: "abc".into() });
+        let skipped: TransferArchive = serde_json::from_str(r#"{"error":"CONTINUE_WITHOUT_UPLOAD"}"#).unwrap();
+        assert_eq!(skipped, TransferArchive::Skipped { error: "CONTINUE_WITHOUT_UPLOAD".into() });
+        assert!(serde_json::from_str::<TransferArchive>("{}").is_err());
     }
 
     #[test]

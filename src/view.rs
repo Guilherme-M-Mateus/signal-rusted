@@ -140,6 +140,17 @@ pub fn view(app: &App) -> Element<'_, Message> {
         ]
         .into(),
     };
+    let body: Element<_> = match &app.notice {
+        None => body,
+        Some(n) => column![
+            container(text(n.clone()).color(Color::WHITE))
+                .padding([6, 12])
+                .width(Length::Fill)
+                .style(|_| container::Style { background: Some(BLUE.into()), ..Default::default() }),
+            body
+        ]
+        .into(),
+    };
     match &app.error {
         None => body,
         Some(e) => column![

@@ -65,6 +65,7 @@ pub struct App {
     pub open: Option<Open>,
     pub dark: bool,
     pub error: Option<String>,
+    pub notice: Option<String>,
     pub attachments: HashMap<String, Attach>,
     pub typing: HashMap<Thread, HashMap<Uuid, Instant>>,
     data_dir: PathBuf,
@@ -120,6 +121,7 @@ impl App {
             open: None,
             dark: true,
             error: None,
+            notice: None,
             attachments: HashMap::new(),
             typing: HashMap::new(),
             data_dir,
@@ -418,6 +420,7 @@ impl App {
                 self.attachments.insert(key, a);
             }
             Event::Error(e) => self.error = Some(e),
+            Event::Notice(n) => self.notice = n,
         }
         Task::none()
     }

@@ -1,5 +1,6 @@
 pub mod richtext;
 pub mod emoji;
+pub mod history;
 pub mod timeline;
 pub mod state;
 pub mod storage;
