@@ -180,7 +180,7 @@ fn link_view<'a>(
     }
     col = match (qr, waiting) {
         (Some(data), _) => col
-            .push(container(qr_code(data).cell_size(5)).padding(12).style(|_| container::Style {
+            .push(container(qr_code(data).cell_size(6).style(qr_style)).padding(24).style(|_| container::Style {
                 background: Some(Color::WHITE.into()),
                 ..Default::default()
             }))
@@ -191,6 +191,12 @@ fn link_view<'a>(
             .push(button(text("Generate QR code")).on_press(Message::Link)),
     };
     center(col).padding(24).into()
+}
+
+/// Always dark-on-light: phone scanners (Signal's included) can't read inverted codes,
+/// and iced's default follows the theme, which inverts it in dark mode.
+fn qr_style(_: &Theme) -> qr_code::Style {
+    qr_code::Style { cell: Color::BLACK, background: Color::WHITE }
 }
 
 fn sidebar(app: &App) -> Element<'_, Message> {
@@ -600,6 +606,33 @@ mod tests {
     use crate::backend::Event;
     use crate::timeline::tests::{content, uuid};
     use iced_test::simulator;
+
+    #[test]
+    fn qr_is_dark_on_light_in_every_theme() {
+        for dark in [true, false] {
+            let s = qr_style(&signal_theme(dark));
+            assert_eq!((s.cell, s.background), (Color::BLACK, Color::WHITE));
+        }
+    }
+
+    /// Writes `snapshots/link-dark-*.png`; `scripts/decode_qr.py` checks a phone could read it.
+    #[test]
+    fn link_screen_snapshot() {
+        let (mut app, _rx) = app();
+        app.update(Message::Backend(Event::NeedsLink));
+        app.update(Message::Link);
+        app.update(Message::Backend(Event::LinkUrl("sgnl://linkdevice?uuid=AbC123&pub_key=BQ%2Bxyz".into())));
+        app.dark = true;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("link-dark") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        let snap = ui.snapshot(&app.theme()).expect("render");
+        assert!(snap.matches_image(dir.join("link-dark")).expect("write png"));
+    }
 
     #[test]
     fn truncation() {
