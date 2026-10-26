@@ -31,6 +31,10 @@ libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag =
 protobuf = "3.7.2"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 url = "2"
+# Voice notes: playback (symphonia decoders: mp3, aac/m4a, ogg vorbis) and mic capture via cpal.
+rodio = { version = "0.23", default-features = false, features = ["playback", "recording", "mp3", "mp4", "vorbis"] }
+# Builds its bundled LAME (LGPL) with cc; no system library needed.
+mp3lame-encoder = "0.2"
 
 [dev-dependencies]
 iced_test = "0.14"

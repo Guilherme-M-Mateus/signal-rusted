@@ -64,6 +64,8 @@ pub enum Command {
         ranges: Vec<BodyRange>,
         attachments: Vec<PathBuf>,
         quote: Option<QuoteRef>,
+        /// Marks the attachments as a voice note (Signal shows them as a voice message).
+        voice_note: bool,
     },
     /// Replaces our message `target_ts`; `attachments`/`quote` are the original's, which an edit keeps.
     Edit {
@@ -170,6 +172,11 @@ pub enum Event {
 
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Attachment cache; also where voice notes are recorded before sending.
+pub fn attachments_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("attachments")
 }
 
 /// Stable cache key for an attachment (digest is unique per upload).
@@ -387,7 +394,7 @@ async fn main(
     mut cmds: mpsc::UnboundedReceiver<Command>,
     events: fmpsc::UnboundedSender<Event>,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(data_dir.join("attachments"))?;
+    std::fs::create_dir_all(attachments_dir(&data_dir))?;
     let pass = db_passphrase(&data_dir)?;
     let db = data_dir.join("signal.db3");
     let store =
@@ -405,7 +412,7 @@ async fn main(
         manager,
         events,
         state: AppState::load(&data_dir.join("state.json")),
-        attachments_dir: data_dir.join("attachments"),
+        attachments_dir: attachments_dir(&data_dir),
         open: None,
         group_ids: HashMap::new(),
         storage_synced: false,
@@ -696,8 +703,8 @@ impl Backend {
                 self.refresh().await;
             }
             Command::Close => self.open = None,
-            Command::Send { thread, ts, body, ranges, attachments, quote } => {
-                let (attachments, error) = match self.send(&thread, ts, body, ranges, attachments, quote).await {
+            Command::Send { thread, ts, body, ranges, attachments, quote, voice_note } => {
+                let (attachments, error) = match self.send(&thread, ts, body, ranges, attachments, quote, voice_note).await {
                     Ok(a) => (a, None),
                     Err(e) => (Vec::new(), Some(format!("{e:#}"))),
                 };
@@ -819,6 +826,7 @@ impl Backend {
         ranges: Vec<BodyRange>,
         files: Vec<PathBuf>,
         quote: Option<QuoteRef>,
+        voice_note: bool,
     ) -> anyhow::Result<Vec<AttachmentPointer>> {
         let mut specs = Vec::new();
         for path in &files {
@@ -829,7 +837,7 @@ impl Backend {
                     length: data.len(),
                     file_name: path.file_name().map(|s| s.to_string_lossy().into_owned()),
                     preview: None,
-                    voice_note: None,
+                    voice_note: voice_note.then_some(true),
                     borderless: None,
                     width: None,
                     height: None,
