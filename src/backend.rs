@@ -91,7 +91,8 @@ pub enum Event {
     Incoming { thread: Thread, content: Box<Content> },
     Receipt { timestamps: Vec<u64>, level: Delivery },
     Typing { thread: Thread, who: Uuid, started: bool },
-    Sent { thread: Thread, ts: u64, error: Option<String> },
+    /// `attachments` are the uploaded pointers, replacing the optimistic placeholders.
+    Sent { thread: Thread, ts: u64, attachments: Vec<AttachmentPointer>, error: Option<String> },
     Attachment { key: String, path: Result<PathBuf, String> },
     Error(String),
     /// Neutral status banner (e.g. history import in progress); `None` clears it.
@@ -529,9 +530,12 @@ impl Backend {
             }
             Command::Close => self.open = None,
             Command::Send { thread, ts, body, ranges, attachments, quote } => {
-                let error = self.send(&thread, ts, body, ranges, attachments, quote).await.err();
+                let (attachments, error) = match self.send(&thread, ts, body, ranges, attachments, quote).await {
+                    Ok(a) => (a, None),
+                    Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+                };
                 self.state.mark_read(&thread, ts);
-                self.emit(Event::Sent { thread, ts, error: error.map(|e| format!("{e:#}")) });
+                self.emit(Event::Sent { thread, ts, attachments, error });
                 self.refresh().await;
             }
             Command::React { thread, target_author, target_ts, emoji, remove } => {
@@ -565,17 +569,21 @@ impl Backend {
             }
             Command::FetchAttachment(p) => {
                 let key = attachment_key(&p);
-                let path = self.fetch_attachment(&p, &key).await.map_err(|e| format!("{e:#}"));
+                let path = self.fetch_attachment(&p).await.map_err(|e| format!("{e:#}"));
                 self.emit(Event::Attachment { key, path });
             }
         }
     }
 
-    async fn fetch_attachment(&self, p: &AttachmentPointer, key: &str) -> anyhow::Result<PathBuf> {
+    fn cache_path(&self, p: &AttachmentPointer) -> PathBuf {
         let ext = mime_guess::get_mime_extensions_str(p.content_type.as_deref().unwrap_or(""))
             .and_then(|e| e.first())
             .unwrap_or(&"bin");
-        let path = self.attachments_dir.join(format!("{key}.{ext}"));
+        self.attachments_dir.join(format!("{}.{ext}", attachment_key(p)))
+    }
+
+    async fn fetch_attachment(&self, p: &AttachmentPointer) -> anyhow::Result<PathBuf> {
+        let path = self.cache_path(p);
         if !path.exists() {
             let data = self.manager.get_attachment(p).await?;
             let tmp = path.with_extension("part");
@@ -593,13 +601,13 @@ impl Backend {
         ranges: Vec<BodyRange>,
         files: Vec<PathBuf>,
         quote: Option<QuoteRef>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<AttachmentPointer>> {
         let mut specs = Vec::new();
-        for path in files {
+        for path in &files {
             let data = tokio::fs::read(&path).await?;
             specs.push((
                 AttachmentSpec {
-                    content_type: mime_guess::from_path(&path).first_or_octet_stream().to_string(),
+                    content_type: mime_guess::from_path(path).first_or_octet_stream().to_string(),
                     length: data.len(),
                     file_name: path.file_name().map(|s| s.to_string_lossy().into_owned()),
                     preview: None,
@@ -615,6 +623,12 @@ impl Backend {
         }
         let attachments =
             self.manager.upload_attachments(specs).await?.into_iter().collect::<Result<Vec<_>, _>>()?;
+        // Cache our own uploads so they display without downloading them back.
+        for (path, pointer) in files.iter().zip(&attachments) {
+            if let Err(e) = tokio::fs::copy(path, self.cache_path(pointer)).await {
+                tracing::warn!(%e, "failed to cache sent attachment");
+            }
+        }
         let dm = DataMessage {
             body: (!body.is_empty()).then_some(body),
             body_ranges: ranges,
@@ -629,7 +643,9 @@ impl Backend {
             }),
             ..Default::default()
         };
-        self.send_body(thread, dm, ts).await
+        let sent = dm.attachments.clone();
+        self.send_body(thread, dm, ts).await?;
+        Ok(sent)
     }
 
     async fn send_body(&mut self, thread: &Thread, body: impl Into<ContentBody>, ts: u64) -> anyhow::Result<()> {

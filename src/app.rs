@@ -375,7 +375,6 @@ impl App {
                     }
                     o.timeline = Some(timeline);
                     self.auto_download();
-                    return crate::view::scroll_to_end();
                 }
             }
             Event::Incoming { thread, content } => {
@@ -401,13 +400,17 @@ impl App {
                     by.remove(&who);
                 }
             }
-            Event::Sent { thread, ts, error } => {
+            Event::Sent { thread, ts, attachments, error } => {
                 if let Some(t) = self.open.as_mut().filter(|o| o.thread == thread).and_then(|o| o.timeline.as_mut()) {
                     let me = t.me;
                     if let Some(m) = t.messages.iter_mut().find(|m| m.id == ts && m.author == me) {
                         m.delivery = if error.is_some() { Delivery::Failed } else { m.delivery.max(Delivery::Sent) };
+                        if !attachments.is_empty() {
+                            m.attachments = attachments; // real pointers; their files are already cached
+                        }
                     }
                 }
+                self.auto_download();
                 if let Some(e) = error {
                     self.error = Some(format!("Message not sent: {e}"));
                 }
@@ -676,7 +679,7 @@ pub(crate) mod tests {
         assert_eq!((m.id, m.delivery, m.outgoing), (*ts, Delivery::Sending, true));
 
         let ts = *ts;
-        app.update(Message::Backend(Event::Sent { thread: alice(), ts, error: None }));
+        app.update(Message::Backend(Event::Sent { thread: alice(), ts, attachments: vec![], error: None }));
         let m = app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.last().unwrap();
         assert_eq!(m.delivery, Delivery::Sent);
         app.update(Message::Backend(Event::Receipt { timestamps: vec![ts], level: Delivery::Read }));
@@ -698,7 +701,7 @@ pub(crate) mod tests {
         else {
             panic!()
         };
-        app.update(Message::Backend(Event::Sent { thread: alice(), ts, error: Some("rate limited".into()) }));
+        app.update(Message::Backend(Event::Sent { thread: alice(), ts, attachments: vec![], error: Some("rate limited".into()) }));
         let m = app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.last().unwrap();
         assert_eq!(m.delivery, Delivery::Failed);
         assert!(app.error.as_deref().unwrap().contains("rate limited"));
@@ -793,6 +796,32 @@ pub(crate) mod tests {
         assert_eq!(fetches, 1, "only the image, only once");
         app.update(Message::FetchAttachment("02".into()));
         assert!(matches!(rx.try_recv(), Ok(Command::FetchAttachment(_))), "files download on request");
+    }
+
+    #[test]
+    fn sent_photo_swaps_placeholder_for_uploaded_pointer() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        app.update(Message::Picked(vec![PathBuf::from("/tmp/cat.png")]));
+        app.update(Message::Send);
+        let Some(Command::Send { ts, .. }) = drain(&mut rx).into_iter().find(|c| matches!(c, Command::Send { .. })) else { panic!() };
+        let placeholder = &app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.last().unwrap().attachments[0];
+        assert!(placeholder.cdn_number.is_none(), "optimistic placeholder until upload");
+
+        let uploaded = presage::proto::AttachmentPointer {
+            content_type: Some("image/png".into()),
+            digest: Some(vec![0xcd]),
+            cdn_number: Some(3),
+            size: Some(10),
+            ..Default::default()
+        };
+        app.update(Message::Backend(Event::Sent { thread: alice(), ts, attachments: vec![uploaded], error: None }));
+        let m = app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.last().unwrap();
+        assert_eq!(m.attachments[0].digest.as_deref(), Some(&[0xcd][..]));
+        assert!(
+            drain(&mut rx).iter().any(|c| matches!(c, Command::FetchAttachment(p) if p.digest.as_deref() == Some(&[0xcd][..]))),
+            "image requested (served from the cache the backend filled)"
+        );
     }
 
     #[test]

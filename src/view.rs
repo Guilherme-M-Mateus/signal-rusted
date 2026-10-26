@@ -11,7 +11,7 @@ use iced::widget::{
     Column, Space, button, center, column, container, image, mouse_area, qr_code, rich_text, row, rule,
     scrollable, span, text, text_editor, text_input,
 };
-use iced::{Alignment, Background, Border, Color, Element, Font, Length, Task, Theme, color};
+use iced::{Alignment, Background, Border, Color, Element, Font, Length, Theme, color};
 use presage::libsignal_service::prelude::Uuid;
 use presage::proto::{AttachmentPointer, BodyRange};
 
@@ -21,12 +21,7 @@ use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label};
 use crate::{emoji, richtext};
 
 pub const COMPOSER: &str = "composer";
-pub const TIMELINE: &str = "timeline";
 const BLUE: Color = color!(0x2c6bed);
-
-pub fn scroll_to_end<T>() -> Task<T> {
-    iced::widget::operation::snap_to_end(TIMELINE)
-}
 
 pub fn signal_theme(dark: bool) -> Theme {
     use iced::theme::Palette;
@@ -314,7 +309,8 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
                 prev_author = Some(m.author);
                 col = col.push(message(app, o, m, show_author));
             }
-            scrollable(col).id(TIMELINE).anchor_bottom().height(Length::Fill).into()
+            // anchor_bottom opens at the newest message; a per-chat id gives each chat its own scroll state.
+            scrollable(col).id(format!("timeline:{}", crate::state::thread_key(&o.thread))).anchor_bottom().height(Length::Fill).into()
         }
     };
 
@@ -643,6 +639,27 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
         let snap = ui.snapshot(&app.theme()).expect("render");
         assert!(snap.matches_image(dir.join("link-dark")).expect("write png"));
+    }
+
+    /// Writes `snapshots/long-thread-*.png`: a fresh 60-message chat must open at the newest message.
+    #[test]
+    fn long_thread_opens_at_newest() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let mut t = crate::timeline::Timeline::new(uuid(1));
+        for i in 1..=60u64 {
+            t.apply(&content(uuid(2), i * 60_000, crate::timeline::tests::text(i * 60_000, &format!("fake message {i}"))));
+        }
+        app.update(Message::Backend(Event::Timeline { thread: alice(), timeline: t }));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("long-thread") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        let snap = ui.snapshot(&app.theme()).expect("render");
+        assert!(snap.matches_image(dir.join("long-thread")).expect("write png"));
     }
 
     #[test]
