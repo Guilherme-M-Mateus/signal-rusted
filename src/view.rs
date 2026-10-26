@@ -222,7 +222,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         }
         let typing = app.typing_names(&c.thread);
         let preview = if !typing.is_empty() { "typing…".to_string() } else { truncate(&c.preview, 48) };
-        let mut bottom = row![text(preview).size(13).width(Length::Fill).style(|t: &Theme| text::Style { color: Some(muted(t)) })];
+        let mut bottom = row![text(preview).size(13).wrapping(text::Wrapping::None).width(Length::Fill).style(|t: &Theme| text::Style { color: Some(muted(t)) })];
         if c.unread > 0 {
             bottom = bottom.push(
                 container(text(c.unread.to_string()).size(12).color(Color::WHITE))
