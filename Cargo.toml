@@ -6,8 +6,8 @@ license = "AGPL-3.0-only"
 description = "Native Rust Signal desktop client (iced UI, presage/libsignal protocol)"
 
 [dependencies]
-presage = { git = "https://github.com/whisperfish/presage", rev = "30ca664b1fa6ef8629bfc5afd4d4d48b6ffc34c3" }
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "30ca664b1fa6ef8629bfc5afd4d4d48b6ffc34c3" }
+presage = { path = "vendor/presage" }
+presage-store-sqlite = { path = "vendor/presage-store-sqlite" }
 iced = { version = "0.14", features = ["tokio", "image", "qr_code", "advanced"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "fs"] }
 futures = "0.3"

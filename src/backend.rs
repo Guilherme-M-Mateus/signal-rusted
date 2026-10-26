@@ -10,6 +10,9 @@ use futures::channel::{mpsc as fmpsc, oneshot};
 use futures::{SinkExt, Stream, StreamExt, pin_mut};
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::{Content, ContentBody};
+use presage::libsignal_service::master_key::{MasterKey, StorageServiceKey};
+use presage::libsignal_service::prelude::ProfileKey;
+use presage::libsignal_service::StorageService;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::ServiceId;
 use presage::libsignal_service::sender::AttachmentSpec;
@@ -172,6 +175,10 @@ async fn main(
     };
     b.emit(Event::Ready { me: b.me });
     b.refresh().await;
+    if let Err(e) = b.sync_storage().await {
+        b.emit(Event::Error(format!("Couldn't sync your chat list: {e:#}")));
+    }
+    b.refresh().await;
 
     // Receive loop on a clone; incoming content is funneled back through this channel so
     // all state (read markers, open thread) stays on one task.
@@ -269,21 +276,58 @@ impl Backend {
     }
 
     async fn names(&self) -> HashMap<Uuid, String> {
-        let mut names = HashMap::new();
+        let mut names: HashMap<Uuid, String> = self
+            .state
+            .profile_names
+            .iter()
+            .filter_map(|(id, n)| Some((Uuid::parse_str(id).ok()?, n.clone())))
+            .collect();
         if let Ok(contacts) = self.manager.store().contacts().await {
             for c in contacts.flatten() {
-                let name = if !c.name.is_empty() {
-                    c.name
+                if !c.name.is_empty() {
+                    names.insert(c.uuid, c.name);
                 } else if let Some(p) = c.phone_number {
-                    p.to_string()
-                } else {
-                    continue;
-                };
-                names.insert(c.uuid, name);
+                    names.entry(c.uuid).or_insert_with(|| p.to_string());
+                }
             }
         }
         names.insert(self.me, "Note to Self".into());
         names
+    }
+
+    /// Pulls the account's chat list from the storage service, as Signal-Desktop does after
+    /// linking: saves profile keys, fetches groups, remembers which chats to list.
+    async fn sync_storage(&mut self) -> anyhow::Result<()> {
+        let store = self.manager.store();
+        let master = match store.fetch_master_key().await? {
+            Some(k) => k,
+            None => match store.fetch_account_entropy_pool().await? {
+                Some(aep) => MasterKey { inner: aep.derive_svr_key() },
+                None => anyhow::bail!("the phone hasn't shared the account keys yet"),
+            },
+        };
+        let svc = StorageService::new(self.manager.push_service(), StorageServiceKey::from_master_key(&master)).await?;
+        let manifest = svc.manifest().await?;
+        let keys: Vec<Vec<u8>> = manifest.identifiers.iter().map(|i| i.raw.clone()).collect();
+        let ikm = (!manifest.record_ikm.is_empty()).then_some(manifest.record_ikm.as_slice());
+        let mut records = Vec::new();
+        for chunk in keys.chunks(500) {
+            records.extend(svc.read_items(chunk.to_vec(), ikm).await?);
+        }
+        let plan = crate::storage::plan(&records);
+        tracing::info!(records = records.len(), listed = plan.listed.len(), groups = plan.groups.len(), "storage sync");
+
+        let mut store = self.manager.store().clone();
+        for (id, key) in &plan.profile_keys {
+            store.upsert_profile_key(id, ProfileKey::create(*key)).await?;
+        }
+        for key in &plan.groups {
+            if let Err(e) = self.manager.fetch_group(key).await {
+                tracing::warn!(%e, "failed to fetch group from storage service");
+            }
+        }
+        self.state.set_storage(plan.listed, plan.names);
+        Ok(())
     }
 
     /// Rebuilds the conversation list from the store.
@@ -303,15 +347,24 @@ impl Backend {
                 threads.push((Thread::Contact(ServiceId::Aci(c.uuid.into())), title, false));
             }
         }
-        let me = Thread::Contact(ServiceId::Aci(self.me.into()));
-        if !threads.iter().any(|(t, ..)| *t == me) {
-            threads.push((me, "Note to Self".into(), false));
+        // People from the storage service who aren't in the address book.
+        for key in &self.state.listed {
+            let Some(id) = ServiceId::parse_from_service_id_string(key) else { continue };
+            let thread = Thread::Contact(id);
+            if !threads.iter().any(|(t, ..)| *t == thread) {
+                let title = names.get(&id.raw_uuid()).cloned().unwrap_or_else(|| "Unknown".into());
+                threads.push((thread, title, false));
+            }
         }
+        let me = Thread::Contact(ServiceId::Aci(self.me.into()));
+        threads.retain(|(t, ..)| *t != me); // titled "Note to Self" below, not by our own contact name
+        threads.push((me.clone(), "Note to Self".into(), false));
 
         let mut out = Vec::new();
         for (thread, title, is_group) in threads {
             let Some((last_ts, preview)) = self.last_message(&thread).await else {
-                if is_group {
+                // Groups, Note to Self and chats the storage service lists show even when empty.
+                if is_group || thread == me || self.state.listed.contains(&crate::state::thread_key(&thread)) {
                     out.push(Conversation { thread, title, last_ts: 0, preview: String::new(), unread: 0, is_group });
                 }
                 continue; // contacts without messages live in the "new chat" search

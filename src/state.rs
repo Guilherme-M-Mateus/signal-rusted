@@ -1,6 +1,6 @@
-//! Small app-level state presage doesn't track: per-thread read markers.
+//! Small app-level state presage doesn't track: read markers and the storage-service chat list.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use presage::store::Thread;
@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 pub struct AppState {
     /// thread key -> newest sent-timestamp the user has seen.
     last_read: HashMap<String, u64>,
+    /// Chats the storage service says belong in the list even without local messages.
+    #[serde(default)]
+    pub listed: HashSet<String>,
+    /// Profile names from the storage service, for people outside the address book.
+    #[serde(default)]
+    pub profile_names: HashMap<String, String>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -47,6 +53,13 @@ impl AppState {
         true
     }
 
+    /// Replaces the storage-service snapshot and saves it.
+    pub fn set_storage(&mut self, listed: HashSet<String>, profile_names: HashMap<String, String>) {
+        self.listed = listed;
+        self.profile_names = profile_names;
+        self.save();
+    }
+
     fn save(&self) {
         let tmp = self.path.with_extension("tmp");
         let ok = serde_json::to_vec(self)
@@ -78,6 +91,19 @@ mod tests {
 
         let s2 = AppState::load(&path);
         assert_eq!((s2.last_read(&alice), s2.last_read(&group)), (10, 7));
+    }
+
+    #[test]
+    fn storage_snapshot_persists_and_old_files_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, br#"{"last_read":{"group:01":5}}"#).unwrap();
+        let mut s = AppState::load(&path);
+        assert!(s.listed.is_empty(), "files from before this field load fine");
+        s.set_storage(HashSet::from(["x".to_string()]), HashMap::from([("u".to_string(), "Ana".to_string())]));
+        let s2 = AppState::load(&path);
+        assert!(s2.listed.contains("x"));
+        assert_eq!(s2.profile_names["u"], "Ana");
     }
 
     #[test]
