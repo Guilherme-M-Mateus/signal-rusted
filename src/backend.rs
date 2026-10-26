@@ -66,6 +66,7 @@ pub enum Command {
     React { thread: Thread, target_author: Uuid, target_ts: u64, emoji: String, remove: bool },
     Typing { thread: Thread, started: bool },
     FetchAttachment(AttachmentPointer),
+    Search(String),
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +77,50 @@ pub struct Conversation {
     pub preview: String,
     pub unread: usize,
     pub is_group: bool,
+    /// Group members (for @mentions); empty for 1:1 chats.
+    pub members: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchResult {
+    pub thread: Thread,
+    pub title: String,
+    /// Sent timestamp of the matching message.
+    pub id: u64,
+    pub author: Uuid,
+    pub snippet: String,
+}
+
+pub const SEARCH_LIMIT: usize = 100;
+
+/// Case-insensitive substring search over one chat's stored rows (newest first, as the store
+/// yields them), merged into `results`, which stays newest first and capped at `SEARCH_LIMIT`.
+pub fn search_thread(
+    me: Uuid,
+    query: &str,
+    thread: &Thread,
+    title: &str,
+    rows: impl IntoIterator<Item = Content>,
+    results: &mut Vec<SearchResult>,
+) {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return;
+    }
+    let t = Timeline::from_newest_first(me, rows, usize::MAX);
+    for m in t.messages.iter().filter(|m| m.kind == Kind::Normal && !m.deleted) {
+        let text = m.body.replace('\u{FFFC}', "@");
+        let lower = text.to_lowercase();
+        let Some(at) = lower.find(&q) else { continue };
+        // Start a little before the match so it shows in the one-line sidebar row.
+        let skip = lower[..at].chars().count().saturating_sub(20);
+        let rest: String = text.chars().skip(skip).collect();
+        let rest = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet = if skip > 0 { format!("…{rest}") } else { rest };
+        results.push(SearchResult { thread: thread.clone(), title: title.to_owned(), id: m.id, author: m.author, snippet });
+    }
+    results.sort_by(|a, b| b.id.cmp(&a.id));
+    results.truncate(SEARCH_LIMIT);
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +132,7 @@ pub enum Event {
     Ready { me: Uuid },
     Names(HashMap<Uuid, String>),
     Conversations(Vec<Conversation>),
+    SearchResults { query: String, results: Vec<SearchResult> },
     Timeline { thread: Thread, timeline: Timeline },
     Incoming { thread: Thread, content: Box<Content> },
     Receipt { timestamps: Vec<u64>, level: Delivery },
@@ -252,6 +298,7 @@ async fn main(
         open: None,
         group_ids: HashMap::new(),
         storage_synced: false,
+        threads: Vec::new(),
     };
     b.emit(Event::Ready { me: b.me });
     b.refresh().await;
@@ -369,6 +416,8 @@ struct Backend {
     /// group identifier -> master key, to route typing messages.
     group_ids: HashMap<[u8; 32], [u8; 32]>,
     storage_synced: bool,
+    /// The listed chats (thread, title), searched by `Command::Search`.
+    threads: Vec<(Thread, String)>,
 }
 
 impl Backend {
@@ -453,17 +502,18 @@ impl Backend {
     async fn refresh(&mut self) {
         let names = self.names().await;
         let store = self.manager.store();
-        let mut threads: Vec<(Thread, String, bool)> = Vec::new();
+        let mut threads: Vec<(Thread, String, bool, Vec<Uuid>)> = Vec::new();
         if let Ok(groups) = store.groups().await {
             for (key, g) in groups.flatten() {
                 self.group_ids.insert(group_id(&key), key);
-                threads.push((Thread::Group(key), g.title, true));
+                let members = g.members.iter().map(|m| ServiceId::from(m.aci).raw_uuid()).collect();
+                threads.push((Thread::Group(key), g.title, true, members));
             }
         }
         if let Ok(contacts) = store.contacts().await {
             for c in contacts.flatten() {
                 let title = names.get(&c.uuid).cloned().unwrap_or_else(|| c.uuid.to_string());
-                threads.push((Thread::Contact(ServiceId::Aci(c.uuid.into())), title, false));
+                threads.push((Thread::Contact(ServiceId::Aci(c.uuid.into())), title, false, Vec::new()));
             }
         }
         // People from the storage service who aren't in the address book.
@@ -472,26 +522,27 @@ impl Backend {
             let thread = Thread::Contact(id);
             if !threads.iter().any(|(t, ..)| *t == thread) {
                 let title = names.get(&id.raw_uuid()).cloned().unwrap_or_else(|| "Unknown".into());
-                threads.push((thread, title, false));
+                threads.push((thread, title, false, Vec::new()));
             }
         }
         let me = Thread::Contact(ServiceId::Aci(self.me.into()));
         threads.retain(|(t, ..)| *t != me); // titled "Note to Self" below, not by our own contact name
-        threads.push((me.clone(), "Note to Self".into(), false));
+        threads.push((me.clone(), "Note to Self".into(), false, Vec::new()));
 
         let mut out = Vec::new();
-        for (thread, title, is_group) in threads {
+        for (thread, title, is_group, members) in threads {
             let Some((last_ts, preview)) = self.last_message(&thread).await else {
                 // Groups, Note to Self and chats the storage service lists show even when empty.
                 if is_group || thread == me || self.state.listed.contains(&crate::state::thread_key(&thread)) {
-                    out.push(Conversation { thread, title, last_ts: 0, preview: String::new(), unread: 0, is_group });
+                    out.push(Conversation { thread, title, last_ts: 0, preview: String::new(), unread: 0, is_group, members });
                 }
                 continue; // contacts without messages live in the "new chat" search
             };
             let unread = self.unread(&thread).await;
-            out.push(Conversation { thread, title, last_ts, preview, unread, is_group });
+            out.push(Conversation { thread, title, last_ts, preview, unread, is_group, members });
         }
         out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        self.threads = out.iter().map(|c| (c.thread.clone(), c.title.clone())).collect();
         self.emit(Event::Names(names));
         self.emit(Event::Conversations(out));
     }
@@ -571,6 +622,16 @@ impl Backend {
                 let key = attachment_key(&p);
                 let path = self.fetch_attachment(&p).await.map_err(|e| format!("{e:#}"));
                 self.emit(Event::Attachment { key, path });
+            }
+            Command::Search(query) => {
+                // shortcut: scans every stored row per search; move to SQL (FTS) if it gets slow.
+                let mut results = Vec::new();
+                for (thread, title) in &self.threads {
+                    if let Ok(rows) = self.manager.store().messages(thread, ..).await {
+                        search_thread(self.me, &query, thread, title, rows.flatten(), &mut results);
+                    }
+                }
+                self.emit(Event::SearchResults { query, results });
             }
         }
     }
@@ -823,6 +884,48 @@ mod tests {
         assert_eq!(group_id(&[1; 32]), group_id(&[1; 32]));
         assert_ne!(group_id(&[1; 32]), group_id(&[2; 32]));
         assert_ne!(group_id(&[1; 32]), [1; 32]);
+    }
+
+    #[test]
+    fn search_finds_messages_case_insensitively_newest_first() {
+        use crate::timeline::tests::{content, text, uuid};
+        use presage::proto::data_message::Delete;
+        let me = uuid(1);
+        let alice = Thread::Contact(ServiceId::Aci(uuid(2).into()));
+        let group = Thread::Group([9; 32]);
+        let delete = DataMessage { delete: Some(Delete { target_sent_timestamp: Some(25) }), ..Default::default() };
+        let alice_rows = vec![
+            content(uuid(2), 30, text(30, "say HELLO to everyone")),
+            content(uuid(2), 26, delete),
+            content(uuid(2), 25, text(25, "hello, deleted")),
+            content(uuid(2), 20, text(20, "nothing here")),
+            content(me, 10, text(10, "hello alice")),
+        ];
+        let long = format!("{} hello at the end", "word ".repeat(10));
+        let group_rows = vec![content(uuid(3), 27, text(27, &long))];
+
+        let mut results = Vec::new();
+        search_thread(me, " hello ", &alice, "Alice", alice_rows, &mut results);
+        search_thread(me, "hello", &group, "Friends", group_rows, &mut results);
+        let got: Vec<_> = results.iter().map(|r| (r.title.as_str(), r.id, r.author)).collect();
+        assert_eq!(got, [("Alice", 30, uuid(2)), ("Friends", 27, uuid(3)), ("Alice", 10, me)]);
+        assert_eq!(results[1].thread, group);
+        assert_eq!(results[0].snippet, "say HELLO to everyone");
+        assert!(results[1].snippet.starts_with('…') && results[1].snippet.contains("hello at the end"), "{}", results[1].snippet);
+
+        search_thread(me, "  ", &alice, "Alice", vec![content(uuid(2), 40, text(40, "x"))], &mut results);
+        assert_eq!(results.len(), 3, "blank query matches nothing");
+    }
+
+    #[test]
+    fn search_is_capped_to_the_newest() {
+        use crate::timeline::tests::{content, text, uuid};
+        let alice = Thread::Contact(ServiceId::Aci(uuid(2).into()));
+        let rows: Vec<_> = (1..=150u64).rev().map(|i| content(uuid(2), i, text(i, "ping"))).collect();
+        let mut results = Vec::new();
+        search_thread(uuid(1), "ping", &alice, "Alice", rows, &mut results);
+        assert_eq!(results.len(), SEARCH_LIMIT);
+        assert_eq!((results[0].id, results[99].id), (150, 51));
     }
 
     #[test]

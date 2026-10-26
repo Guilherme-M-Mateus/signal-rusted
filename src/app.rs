@@ -11,7 +11,7 @@ use presage::libsignal_service::protocol::ServiceId;
 use presage::store::Thread;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::backend::{self, Command, Conversation, Event, QuoteRef, attachment_key, now_ms};
+use crate::backend::{self, Command, Conversation, Event, QuoteRef, SearchResult, attachment_key, now_ms};
 use crate::timeline::{Delivery, Message as Msg, Timeline};
 use crate::{emoji, richtext};
 
@@ -20,6 +20,7 @@ pub const PAGE: usize = 150;
 /// Images up to this size are downloaded automatically, like Signal's auto-download.
 const AUTO_DOWNLOAD_BYTES: u32 = 25 * 1024 * 1024;
 const TYPING_TIMEOUT: Duration = Duration::from_secs(15);
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub enum Screen {
     Connecting,
@@ -46,6 +47,8 @@ pub struct Open {
     pub reacting: Option<(Uuid, u64)>,
     pub picker: Option<Picker>,
     pub spoilers: HashSet<(u64, usize)>,
+    /// Members picked from the @-autocomplete: (inserted name, ACI).
+    pub mentions: Vec<(String, Uuid)>,
     last_keystroke: Option<Instant>,
     typing_sent: bool,
 }
@@ -62,6 +65,8 @@ pub struct App {
     pub names: HashMap<Uuid, String>,
     pub conversations: Vec<Conversation>,
     pub search: String,
+    /// Message search results for `search`, newest first.
+    pub results: Vec<SearchResult>,
     pub open: Option<Open>,
     pub dark: bool,
     pub error: Option<String>,
@@ -77,6 +82,8 @@ pub enum Message {
     DeviceName(String),
     Link,
     Search(String),
+    /// Debounced: searches messages if the query is still current.
+    RunSearch(String),
     OpenThread(Thread, String, bool),
     Compose(text_editor::Action),
     Send,
@@ -92,6 +99,7 @@ pub enum Message {
     PickerQuery(String),
     PickerGroup(emojis::Group),
     InsertEmoji(&'static str),
+    Mention(Uuid),
     Spoiler(u64, usize),
     LoadOlder,
     FetchAttachment(String),
@@ -118,6 +126,7 @@ impl App {
             names: HashMap::new(),
             conversations: Vec::new(),
             search: String::new(),
+            results: Vec::new(),
             open: None,
             dark: true,
             error: None,
@@ -179,7 +188,26 @@ impl App {
                     self.send(Command::Link { device_name });
                 }
             }
-            Message::Search(s) => self.search = s,
+            Message::Search(s) => {
+                self.search = s;
+                if self.search.trim().chars().count() < 2 {
+                    self.results.clear();
+                    return Task::none();
+                }
+                let q = self.search.clone();
+                return Task::perform(
+                    async move {
+                        tokio::time::sleep(SEARCH_DEBOUNCE).await;
+                        q
+                    },
+                    Message::RunSearch,
+                );
+            }
+            Message::RunSearch(q) => {
+                if q == self.search {
+                    self.send(Command::Search(q.trim().to_owned()));
+                }
+            }
             Message::OpenThread(thread, title, is_group) => {
                 if self.open.as_ref().is_some_and(|o| o.thread == thread) {
                     return Task::none();
@@ -199,10 +227,12 @@ impl App {
                     reacting: None,
                     picker: None,
                     spoilers: HashSet::new(),
+                    mentions: Vec::new(),
                     last_keystroke: None,
                     typing_sent: false,
                 });
                 self.search.clear();
+                self.results.clear();
                 return iced::widget::operation::focus(crate::view::COMPOSER);
             }
             Message::Compose(action) => {
@@ -294,6 +324,20 @@ impl App {
                     return iced::widget::operation::focus(crate::view::COMPOSER);
                 }
             }
+            Message::Mention(id) => {
+                let Some(typed) = self.mention_query().map(|q| q.chars().count()) else { return Task::none() };
+                let name = display_name(&self.names, id);
+                let Some(o) = &mut self.open else { return Task::none() };
+                // Replace the typed "@query" before the cursor with the full name.
+                for _ in 0..=typed {
+                    o.composer.perform(text_editor::Action::Edit(text_editor::Edit::Backspace));
+                }
+                o.composer.perform(text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(format!(
+                    "@{name} "
+                )))));
+                o.mentions.push((name, id));
+                return iced::widget::operation::focus(crate::view::COMPOSER);
+            }
             Message::Spoiler(id, seg) => {
                 if let Some(o) = &mut self.open {
                     o.spoilers.insert((id, seg));
@@ -354,6 +398,11 @@ impl App {
                 self.screen = Screen::Main;
             }
             Event::Names(n) => self.names = n,
+            Event::SearchResults { query, results } => {
+                if query == self.search.trim() {
+                    self.results = results;
+                }
+            }
             Event::Conversations(c) => {
                 self.conversations = c;
                 if let Some(o) = &mut self.open {
@@ -437,6 +486,8 @@ impl App {
             return;
         }
         let (body, ranges) = richtext::parse_markup(&emoji::replace_shortcodes(raw.trim()));
+        let picked: Vec<(String, String)> = o.mentions.drain(..).map(|(n, id)| (n, id.to_string())).collect();
+        let (body, ranges) = richtext::apply_mentions(&body, ranges, &picked);
         let ts = now_ms();
         let mut m = Msg::new(ts, me, true);
         m.body = body.clone();
@@ -557,6 +608,32 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The `@query` typed just before the cursor in a group chat's composer.
+    pub fn mention_query(&self) -> Option<String> {
+        let o = self.open.as_ref().filter(|o| o.is_group)?;
+        let at = o.composer.cursor().position;
+        let line = o.composer.line(at.line)?;
+        mention_query(line.text.get(..at.column)?).map(str::to_owned)
+    }
+
+    /// Group members (not us) whose name matches the `@query` being typed.
+    pub fn mention_matches(&self) -> Vec<(Uuid, String)> {
+        let Some(q) = self.mention_query().map(|q| q.to_lowercase()) else { return Vec::new() };
+        let Some(c) = self.open.as_ref().and_then(|o| self.conversations.iter().find(|c| c.thread == o.thread)) else {
+            return Vec::new();
+        };
+        let mut v: Vec<(Uuid, String)> = c
+            .members
+            .iter()
+            .filter(|id| **id != self.me)
+            .map(|id| (*id, display_name(&self.names, *id)))
+            .filter(|(_, n)| n.to_lowercase().contains(&q))
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v.truncate(8);
+        v
+    }
+
     /// Contacts matching the search that have no conversation yet ("new chat").
     pub fn contact_matches(&self) -> Vec<(Uuid, String)> {
         let q = self.search.trim().to_lowercase();
@@ -576,6 +653,14 @@ impl App {
         v.truncate(50);
         v
     }
+}
+
+/// The letters after an `@` that ends `before` (the `@` at the start or after a space).
+fn mention_query(before: &str) -> Option<&str> {
+    let at = before.rfind('@')?;
+    let q = &before[at + 1..];
+    let starts_word = before[..at].chars().next_back().is_none_or(char::is_whitespace);
+    (starts_word && q.chars().all(char::is_alphanumeric)).then_some(q)
 }
 
 fn default_device_name() -> String {
@@ -614,7 +699,33 @@ pub(crate) mod tests {
             preview: "hi there".into(),
             unread: 2,
             is_group: false,
+            members: Vec::new(),
         }])));
+        (app, rx)
+    }
+
+    pub fn group() -> Thread {
+        Thread::Group([7; 32])
+    }
+
+    /// Like `app()`, plus an open group "Friends" with us, Alice, Bob and Bobby.
+    pub fn open_group() -> (App, UnboundedReceiver<Command>) {
+        let (mut app, mut rx) = app();
+        app.names.insert(uuid(4), "Bobby".into());
+        let mut convs = app.conversations.clone();
+        convs.push(Conversation {
+            thread: group(),
+            title: "Friends".into(),
+            last_ts: 5,
+            preview: String::new(),
+            unread: 0,
+            is_group: true,
+            members: vec![uuid(ME), uuid(ALICE), uuid(3), uuid(4)],
+        });
+        app.update(Message::Backend(Event::Conversations(convs)));
+        app.update(Message::OpenThread(group(), "Friends".into(), true));
+        app.update(Message::Backend(Event::Timeline { thread: group(), timeline: Timeline::new(uuid(ME)) }));
+        drain(&mut rx);
         (app, rx)
     }
 
@@ -626,13 +737,13 @@ pub(crate) mod tests {
         app.update(Message::Backend(Event::Timeline { thread: alice(), timeline: t }));
     }
 
-    fn type_text(app: &mut App, s: &str) {
+    pub fn type_text(app: &mut App, s: &str) {
         for c in s.chars() {
             app.update(Message::Compose(text_editor::Action::Edit(text_editor::Edit::Insert(c))));
         }
     }
 
-    fn drain(rx: &mut UnboundedReceiver<Command>) -> Vec<Command> {
+    pub fn drain(rx: &mut UnboundedReceiver<Command>) -> Vec<Command> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
@@ -844,6 +955,94 @@ pub(crate) mod tests {
         assert_eq!(app.contact_matches(), vec![(uuid(3), "Bob".to_string())], "Alice already has a chat");
         app.update(Message::Search("".into()));
         assert!(app.contact_matches().is_empty());
+    }
+
+    #[test]
+    fn mention_query_needs_a_word_start() {
+        assert_eq!(mention_query("hi @Bo"), Some("Bo"));
+        assert_eq!(mention_query("@"), Some(""));
+        assert_eq!(mention_query("mail@Bo"), None);
+        assert_eq!(mention_query("hi @Bob "), None, "a space ends it");
+        assert_eq!(mention_query("hi"), None);
+    }
+
+    #[test]
+    fn mention_autocomplete_lists_members_but_not_me_or_in_1to1() {
+        let (mut app, _rx) = open_group();
+        type_text(&mut app, "hey @bo");
+        let names: Vec<String> = app.mention_matches().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, ["Bob", "Bobby"]);
+        type_text(&mut app, " ");
+        assert!(app.mention_matches().is_empty(), "closed after a space");
+
+        let (mut app, mut rx) = self::app();
+        open_alice(&mut app, &mut rx);
+        type_text(&mut app, "@a");
+        assert!(app.mention_matches().is_empty(), "no mentions in 1:1 chats");
+    }
+
+    fn sent(rx: &mut UnboundedReceiver<Command>) -> (String, Vec<presage::proto::BodyRange>) {
+        drain(rx)
+            .into_iter()
+            .find_map(|c| match c {
+                Command::Send { body, ranges, .. } => Some((body, ranges)),
+                _ => None,
+            })
+            .expect("sent")
+    }
+
+    #[test]
+    fn picked_mention_is_sent_as_placeholder_with_aci() {
+        let (mut app, mut rx) = open_group();
+        type_text(&mut app, "*hi @bo");
+        app.update(Message::Mention(uuid(3)));
+        type_text(&mut app, "and @Ali");
+        app.update(Message::Mention(uuid(ALICE)));
+        type_text(&mut app, "😀*");
+        assert_eq!(app.open.as_ref().unwrap().composer.text().trim_end(), "*hi @Bob and @Alice 😀*");
+        app.update(Message::Send);
+        let (body, ranges) = sent(&mut rx);
+        assert_eq!(body, "hi \u{FFFC} and \u{FFFC} 😀");
+        let segs = richtext::segments(&body, &ranges);
+        let mentions: Vec<_> = segs.iter().filter_map(|s| s.mention.clone()).collect();
+        assert_eq!(mentions, [uuid(3).to_string(), uuid(ALICE).to_string()]);
+        assert!(segs.iter().all(|s| s.style.bold), "bold spans the mentions: {segs:?}");
+        assert!(app.open.as_ref().unwrap().mentions.is_empty(), "picks reset after sending");
+    }
+
+    #[test]
+    fn mention_edited_away_is_not_sent() {
+        let (mut app, mut rx) = open_group();
+        type_text(&mut app, "@bo");
+        app.update(Message::Mention(uuid(3)));
+        // Delete "b " so it reads "@Bo", then make it "@Boo!".
+        for _ in 0..2 {
+            app.update(Message::Compose(text_editor::Action::Edit(text_editor::Edit::Backspace)));
+        }
+        type_text(&mut app, "o!");
+        app.update(Message::Send);
+        let (body, ranges) = sent(&mut rx);
+        assert_eq!(body, "@Boo!");
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn search_is_debounced_and_ignores_stale_results() {
+        let (mut app, mut rx) = app();
+        assert!(app.update(Message::Search("h".into())).units() == 0, "too short to search");
+        app.update(Message::Search("hel".into()));
+        app.update(Message::RunSearch("he".into()));
+        assert!(drain(&mut rx).is_empty(), "no longer current");
+        app.update(Message::RunSearch("hel".into()));
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Search(q)] if q == "hel"));
+
+        let result = SearchResult { thread: alice(), title: "Alice".into(), id: 10, author: uuid(ALICE), snippet: "hello".into() };
+        app.update(Message::Backend(Event::SearchResults { query: "he".into(), results: vec![result.clone()] }));
+        assert!(app.results.is_empty(), "stale");
+        app.update(Message::Backend(Event::SearchResults { query: "hel".into(), results: vec![result] }));
+        assert_eq!(app.results.len(), 1);
+        app.update(Message::Search("".into()));
+        assert!(app.results.is_empty());
     }
 
     #[test]
