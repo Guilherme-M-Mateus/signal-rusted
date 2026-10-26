@@ -8,7 +8,7 @@ use iced::keyboard::{self, key};
 use iced::widget::text::Span;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::widget::{
-    Column, Space, button, center, column, container, image, mouse_area, qr_code, rich_text, row, rule,
+    Column, Space, button, center, column, container, image, mouse_area, progress_bar, qr_code, rich_text, row, rule,
     scrollable, span, text, text_editor, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, Theme, color};
@@ -367,8 +367,50 @@ fn delivery_mark(d: Delivery) -> &'static str {
     }
 }
 
+/// Inline player: play/pause, progress and time; the first press downloads.
+fn audio_player<'a>(app: &'a App, a: &AttachmentPointer, key: String, fg: Color) -> Element<'a, Message> {
+    let now = std::time::Instant::now();
+    let total = app.durations.get(&key).copied();
+    let playing = app.playback.as_ref().filter(|p| p.key == key);
+    let pos = playing.map(|p| p.position(now)).unwrap_or_default();
+    let (icon, press) = match app.attachments.get(&key) {
+        Some(Attach::Loading) => ("…", None),
+        _ if a.cdn_number.is_none() && a.attachment_identifier.is_none() && !app.attachments.contains_key(&key) => ("▶", None),
+        _ if playing.is_some_and(|p| !p.is_paused()) => ("⏸", Some(Message::PlayPause(key.clone()))),
+        _ => ("▶", Some(Message::PlayPause(key.clone()))),
+    };
+    let time = match (playing, total) {
+        (Some(_), Some(t)) => format!("{} / {}", crate::audio::mmss(pos.min(t)), crate::audio::mmss(t)),
+        (Some(_), None) => crate::audio::mmss(pos),
+        (None, Some(t)) => crate::audio::mmss(t),
+        (None, None) => "--:--".into(),
+    };
+    let frac = match total {
+        Some(t) if !t.is_zero() => (pos.as_secs_f32() / t.as_secs_f32()).min(1.0),
+        _ => 0.0,
+    };
+    let mut r = row![
+        button(text(icon).size(16)).on_press_maybe(press).style(button::secondary),
+        progress_bar(0.0..=1.0, frac).length(140).girth(4),
+        text(time).size(12).color(fg),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let voice = a.flags.unwrap_or(0) & presage::proto::attachment_pointer::Flags::VoiceMessage as u32 != 0;
+    if !voice && a.file_name.is_some() {
+        r = r.push(text(attachment_label(a)).size(12).color(fg));
+    }
+    match app.attachments.get(&key) {
+        Some(Attach::Failed(e)) => column![r, text(format!("Download failed: {e}")).size(12).color(fg)].into(),
+        _ => r.into(),
+    }
+}
+
 fn attachment<'a>(app: &'a App, a: &AttachmentPointer, fg: Color) -> Element<'a, Message> {
     let key = attachment_key(a);
+    if a.content_type.as_deref().is_some_and(|c| c.starts_with("audio/")) {
+        return audio_player(app, a, key, fg);
+    }
     let is_image = a.content_type.as_deref().is_some_and(|c| c.starts_with("image/"));
     match app.attachments.get(&key) {
         Some(Attach::Ready(path)) if is_image => image(image::Handle::from_path(path)).width(Length::Shrink).height(Length::Shrink).into(),
@@ -544,6 +586,21 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
                 .style(|t: &Theme| container::Style { text_color: Some(muted(t)), ..Default::default() }),
         );
     }
+    if let Some(started) = o.recording {
+        return col
+            .push(
+                row![
+                    text("🔴").size(14),
+                    text(format!("Recording  {}", crate::audio::mmss(started.elapsed()))).width(Length::Fill),
+                    button(text("Cancel")).on_press(Message::CancelRecording).style(button::secondary),
+                    button(text("Send")).on_press(Message::SendRecording),
+                ]
+                .spacing(8)
+                .padding([8, 0])
+                .align_y(Alignment::Center),
+            )
+            .into();
+    }
     let editor = text_editor(&o.composer)
         .id(COMPOSER)
         .placeholder("Message  (*bold* _italic_ ~strike~ `mono` ||spoiler|| :emoji:)")
@@ -563,7 +620,11 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
             button(text("📎").size(18)).on_press(Message::Attach).style(button::text),
             button(text("😀").size(18)).on_press(Message::TogglePicker).style(button::text),
             container(editor).max_height(180).width(Length::Fill),
-            button(text("Send")).on_press(Message::Send),
+            if draft.trim().is_empty() && o.files.is_empty() {
+                button(text("🎤").size(18)).on_press(Message::Record).style(button::text)
+            } else {
+                button(text("Send")).on_press(Message::Send)
+            },
         ]
         .spacing(6)
         .align_y(Alignment::Center),
@@ -609,7 +670,7 @@ fn emoji_picker(p: &crate::app::Picker) -> Element<'_, Message> {
 #[allow(unused_must_use)]
 mod tests {
     use super::*;
-    use crate::app::tests::{alice, app, open_alice};
+    use crate::app::tests::{alice, app, fake_audio, open_alice, voice_note};
     use crate::backend::Event;
     use crate::timeline::tests::{content, uuid};
     use iced_test::simulator;
@@ -707,6 +768,9 @@ mod tests {
         let mine = crate::timeline::tests::text(30, "👍🏽❤️");
         app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(1), 30, mine)) }));
         app.update(Message::Backend(Event::Receipt { timestamps: vec![30], level: Delivery::Read }));
+        let key = voice_note(&mut app);
+        app.attachments.insert(key.clone(), Attach::Ready("/nonexistent/a0.m4a".into()));
+        app.durations.insert(key, std::time::Duration::from_secs(12));
         app
     }
 
@@ -779,6 +843,55 @@ mod tests {
             _ => None,
         });
         assert_eq!(sent.as_deref(), Some("hello 👋"));
+    }
+
+    #[test]
+    fn voice_note_player_in_bubble() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let key = voice_note(&mut app);
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("--:--").is_ok(), "length unknown until downloaded");
+        ui.click("▶").expect("play button");
+        assert!(ui.into_messages().any(|m| matches!(m, Message::PlayPause(k) if k == key)));
+
+        app.attachments.insert(key.clone(), Attach::Ready("/nonexistent/a0.m4a".into()));
+        app.durations.insert(key.clone(), std::time::Duration::from_secs(75));
+        app.playback = Some(crate::audio::Playback::new(key, std::time::Instant::now()));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("0:00 / 1:15").is_ok(), "progress / length");
+        assert!(ui.find("⏸").is_ok(), "pause while playing");
+    }
+
+    #[test]
+    fn mic_replaces_send_and_records_a_voice_note() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let audio = fake_audio(&mut app);
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Send").is_err(), "empty composer shows the mic instead of Send");
+        ui.click("🎤").expect("mic button");
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+        assert!(matches!(audio.try_recv(), Ok(crate::audio::Cmd::Record(_))));
+
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Recording  0:00").is_ok(), "elapsed time");
+        assert!(ui.find("Cancel").is_ok());
+        ui.click("Send").expect("send recording");
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+        let Ok(crate::audio::Cmd::Finish(Some((path, reply)))) = audio.try_recv() else { panic!("finish") };
+        let _ = reply.send(Ok(path.clone())); // what the device thread does after encoding
+        app.update(Message::Recorded(Ok(path)));
+        let sent = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|c| match c {
+            crate::backend::Command::Send { voice_note, attachments, .. } => Some((voice_note, attachments.len())),
+            _ => None,
+        });
+        assert_eq!(sent, Some((true, 1)));
+        assert!(simulator(view(&app)).find("🎤").is_ok(), "back to the composer");
     }
 
     #[test]

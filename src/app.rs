@@ -13,7 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{self, Command, Conversation, Event, QuoteRef, attachment_key, now_ms};
 use crate::timeline::{Delivery, Message as Msg, Timeline};
-use crate::{emoji, richtext};
+use crate::{audio, emoji, richtext};
 
 /// Messages rendered at once; "Load older" extends it (keeps layout cheap on long threads).
 pub const PAGE: usize = 150;
@@ -46,6 +46,8 @@ pub struct Open {
     pub reacting: Option<(Uuid, u64)>,
     pub picker: Option<Picker>,
     pub spoilers: HashSet<(u64, usize)>,
+    /// When the current voice-note recording started.
+    pub recording: Option<Instant>,
     last_keystroke: Option<Instant>,
     typing_sent: bool,
 }
@@ -68,6 +70,13 @@ pub struct App {
     pub notice: Option<String>,
     pub attachments: HashMap<String, Attach>,
     pub typing: HashMap<Thread, HashMap<Uuid, Instant>>,
+    /// Device thread for playback/recording, started on first use (tests inject a channel).
+    pub audio: Option<std::sync::mpsc::Sender<audio::Cmd>>,
+    pub playback: Option<audio::Playback>,
+    /// Lengths of downloaded audio attachments, by attachment key.
+    pub durations: HashMap<String, Duration>,
+    /// Audio to start once its download finishes.
+    play_when_ready: Option<String>,
     data_dir: PathBuf,
 }
 
@@ -95,6 +104,13 @@ pub enum Message {
     Spoiler(u64, usize),
     LoadOlder,
     FetchAttachment(String),
+    PlayPause(String),
+    AudioDuration(String, Option<Duration>),
+    Record,
+    RecordStarted(Result<(), String>),
+    CancelRecording,
+    SendRecording,
+    Recorded(Result<PathBuf, String>),
     SaveAttachment(String),
     Saved(Result<(), String>),
     Theme(iced::theme::Mode),
@@ -124,6 +140,10 @@ impl App {
             notice: None,
             attachments: HashMap::new(),
             typing: HashMap::new(),
+            audio: None,
+            playback: None,
+            durations: HashMap::new(),
+            play_when_ready: None,
             data_dir,
         };
         (app, iced::system::theme().map(Message::Theme))
@@ -147,7 +167,11 @@ impl App {
             iced::system::theme_changes().map(Message::Theme),
         ];
         let typing_active = self.typing.values().any(|m| !m.is_empty());
-        if typing_active || self.open.as_ref().is_some_and(|o| o.typing_sent) {
+        let audio_active = self.playback.as_ref().is_some_and(|p| !p.is_paused())
+            || self.open.as_ref().is_some_and(|o| o.recording.is_some());
+        if audio_active {
+            subs.push(iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick));
+        } else if typing_active || self.open.as_ref().is_some_and(|o| o.typing_sent) {
             subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
         }
         Subscription::batch(subs)
@@ -157,6 +181,10 @@ impl App {
         if let Some(tx) = &self.cmd {
             let _ = tx.send(c);
         }
+    }
+
+    fn audio(&mut self, c: audio::Cmd) {
+        let _ = self.audio.get_or_insert_with(audio::spawn).send(c);
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -185,6 +213,9 @@ impl App {
                     return Task::none();
                 }
                 self.stop_typing();
+                if self.open.as_ref().is_some_and(|o| o.recording.is_some()) {
+                    self.audio(audio::Cmd::Finish(None));
+                }
                 self.send(Command::Open(thread.clone()));
                 self.open = Some(Open {
                     thread,
@@ -199,6 +230,7 @@ impl App {
                     reacting: None,
                     picker: None,
                     spoilers: HashSet::new(),
+                    recording: None,
                     last_keystroke: None,
                     typing_sent: false,
                 });
@@ -218,7 +250,7 @@ impl App {
                     }
                 }
             }
-            Message::Send => self.send_message(),
+            Message::Send => self.send_message(false),
             Message::Attach => {
                 return Task::perform(
                     async {
@@ -305,6 +337,49 @@ impl App {
                 }
             }
             Message::FetchAttachment(key) => self.fetch(&key),
+            Message::PlayPause(key) => self.play_pause(key),
+            Message::AudioDuration(key, d) => {
+                if let Some(d) = d {
+                    self.durations.insert(key, d);
+                }
+            }
+            Message::Record => {
+                let Some(o) = self.open.as_mut().filter(|o| o.recording.is_none()) else { return Task::none() };
+                o.recording = Some(Instant::now());
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.audio(audio::Cmd::Record(tx));
+                return Task::perform(async { rx.await.unwrap_or_else(|_| Err("audio stopped".into())) }, Message::RecordStarted);
+            }
+            Message::RecordStarted(r) => {
+                if let Err(e) = r {
+                    if let Some(o) = &mut self.open {
+                        o.recording = None;
+                    }
+                    self.error = Some(e);
+                }
+            }
+            Message::CancelRecording => {
+                if let Some(o) = self.open.as_mut().filter(|o| o.recording.is_some()) {
+                    o.recording = None;
+                    self.audio(audio::Cmd::Finish(None));
+                }
+            }
+            Message::SendRecording => {
+                let Some(o) = self.open.as_mut().filter(|o| o.recording.is_some()) else { return Task::none() };
+                o.recording = None;
+                // shortcut: the recorded file stays next to the cache after sending; sweep it if they pile up.
+                let path = backend::attachments_dir(&self.data_dir).join(format!("voice-note-{}.mp3", now_ms()));
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.audio(audio::Cmd::Finish(Some((path, tx))));
+                return Task::perform(async { rx.await.unwrap_or_else(|_| Err("audio stopped".into())) }, Message::Recorded);
+            }
+            Message::Recorded(Ok(path)) => {
+                if let Some(o) = &mut self.open {
+                    o.files = vec![path];
+                }
+                self.send_message(true);
+            }
+            Message::Recorded(Err(e)) => self.error = Some(format!("Voice note not sent: {e}")),
             Message::SaveAttachment(key) => {
                 let Some(Attach::Ready(src)) = self.attachments.get(&key) else { return Task::none() };
                 let src = src.clone();
@@ -416,11 +491,24 @@ impl App {
                 }
             }
             Event::Attachment { key, path } => {
+                let mut task = Task::none();
+                if let Some(p) = path.as_ref().ok().filter(|p| mime_guess::from_path(p).first_raw().is_some_and(|m| m.starts_with("audio/"))) {
+                    let (k, p) = (key.clone(), p.clone());
+                    task = Task::perform(
+                        async move { tokio::task::spawn_blocking(move || audio::duration(&p)).await.ok().flatten() },
+                        move |d| Message::AudioDuration(k.clone(), d),
+                    );
+                }
                 let a = match path {
                     Ok(p) => Attach::Ready(p),
                     Err(e) => Attach::Failed(e),
                 };
-                self.attachments.insert(key, a);
+                self.attachments.insert(key.clone(), a);
+                if self.play_when_ready.as_ref() == Some(&key) {
+                    self.play_when_ready = None;
+                    self.play_pause(key);
+                }
+                return task;
             }
             Event::Error(e) => self.error = Some(e),
             Event::Notice(n) => self.notice = n,
@@ -428,7 +516,7 @@ impl App {
         Task::none()
     }
 
-    fn send_message(&mut self) {
+    fn send_message(&mut self, voice_note: bool) {
         let me = self.me;
         let Some(o) = &mut self.open else { return };
         let raw = o.composer.text();
@@ -454,6 +542,7 @@ impl App {
             .map(|p| presage::proto::AttachmentPointer {
                 content_type: Some(mime_guess::from_path(p).first_or_octet_stream().to_string()),
                 file_name: p.file_name().map(|n| n.to_string_lossy().into_owned()),
+                flags: voice_note.then_some(presage::proto::attachment_pointer::Flags::VoiceMessage as u32),
                 ..Default::default()
             })
             .collect();
@@ -467,6 +556,7 @@ impl App {
             ranges,
             attachments: std::mem::take(&mut o.files),
             quote: o.quote.take(),
+            voice_note,
         };
         o.composer = text_editor::Content::new();
         o.picker = None;
@@ -490,6 +580,31 @@ impl App {
         self.send(Command::React { thread, target_author: author, target_ts: id, emoji, remove });
     }
 
+    fn play_pause(&mut self, key: String) {
+        let now = Instant::now();
+        match &mut self.playback {
+            Some(p) if p.key == key && p.is_paused() => {
+                p.resume(now);
+                self.audio(audio::Cmd::Resume);
+            }
+            Some(p) if p.key == key => {
+                p.pause(now);
+                self.audio(audio::Cmd::Pause);
+            }
+            _ => match self.attachments.get(&key) {
+                Some(Attach::Ready(path)) => {
+                    let path = path.clone();
+                    self.playback = Some(audio::Playback::new(key, now));
+                    self.audio(audio::Cmd::Play(path));
+                }
+                _ => {
+                    self.fetch(&key);
+                    self.play_when_ready = Some(key);
+                }
+            },
+        }
+    }
+
     fn stop_typing(&mut self) {
         if let Some(o) = self.open.as_mut().filter(|o| o.typing_sent) {
             o.typing_sent = false;
@@ -500,6 +615,9 @@ impl App {
 
     fn tick(&mut self) {
         let now = Instant::now();
+        if self.playback.as_ref().is_some_and(|p| p.finished(now, self.durations.get(&p.key).copied())) {
+            self.playback = None;
+        }
         for by in self.typing.values_mut() {
             by.retain(|_, at| now.duration_since(*at) < TYPING_TIMEOUT);
         }
@@ -601,6 +719,7 @@ pub(crate) mod tests {
     pub fn app() -> (App, UnboundedReceiver<Command>) {
         let (tx, rx) = unbounded_channel();
         let (mut app, _) = App::new(PathBuf::from("/nonexistent"));
+        fake_audio(&mut app); // never touch real audio devices from tests
         app.update(Message::Backend(Event::Started(tx)));
         app.update(Message::Backend(Event::Ready { me: uuid(ME) }));
         app.update(Message::Backend(Event::Names(HashMap::from([
@@ -616,6 +735,27 @@ pub(crate) mod tests {
             is_group: false,
         }])));
         (app, rx)
+    }
+
+    /// Replaces the audio device thread with a captured channel.
+    pub fn fake_audio(app: &mut App) -> std::sync::mpsc::Receiver<audio::Cmd> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.audio = Some(tx);
+        rx
+    }
+
+    /// An incoming voice note from Alice (ts 40), not downloaded yet.
+    pub fn voice_note(app: &mut App) -> String {
+        let a = presage::proto::AttachmentPointer {
+            content_type: Some("audio/aac".into()),
+            digest: Some(vec![0xa0]),
+            cdn_number: Some(3),
+            flags: Some(presage::proto::attachment_pointer::Flags::VoiceMessage as u32),
+            ..Default::default()
+        };
+        let dm = presage::proto::DataMessage { timestamp: Some(40), attachments: vec![a.clone()], ..Default::default() };
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(ALICE), 40, dm)) }));
+        attachment_key(&a)
     }
 
     pub fn open_alice(app: &mut App, rx: &mut UnboundedReceiver<Command>) {
@@ -822,6 +962,73 @@ pub(crate) mod tests {
             drain(&mut rx).iter().any(|c| matches!(c, Command::FetchAttachment(p) if p.digest.as_deref() == Some(&[0xcd][..]))),
             "image requested (served from the cache the backend filled)"
         );
+    }
+
+    #[test]
+    fn voice_note_downloads_on_play_then_plays_pauses_and_finishes() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let audio = fake_audio(&mut app);
+        let key = voice_note(&mut app);
+        assert!(drain(&mut rx).is_empty(), "audio isn't auto-downloaded");
+
+        app.update(Message::PlayPause(key.clone()));
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::FetchAttachment(_)]));
+        assert!(app.playback.is_none() && audio.try_recv().is_err(), "nothing to play yet");
+        app.update(Message::PlayPause(key.clone()));
+        assert!(drain(&mut rx).is_empty(), "download requested once");
+
+        let path = PathBuf::from("/nonexistent/a0.m4a");
+        app.update(Message::Backend(Event::Attachment { key: key.clone(), path: Ok(path.clone()) }));
+        assert!(matches!(audio.try_recv(), Ok(audio::Cmd::Play(p)) if p == path), "starts once downloaded");
+        assert!(app.playback.as_ref().is_some_and(|p| p.key == key && !p.is_paused()));
+
+        app.update(Message::PlayPause(key.clone()));
+        assert!(matches!(audio.try_recv(), Ok(audio::Cmd::Pause)));
+        assert!(app.playback.as_ref().unwrap().is_paused());
+        app.update(Message::Tick);
+        assert!(app.playback.is_some(), "length unknown: keeps its place");
+        app.update(Message::PlayPause(key.clone()));
+        assert!(matches!(audio.try_recv(), Ok(audio::Cmd::Resume)));
+
+        app.update(Message::AudioDuration(key.clone(), Some(Duration::ZERO)));
+        app.update(Message::Tick);
+        assert!(app.playback.is_none(), "finished");
+    }
+
+    #[test]
+    fn recording_sends_a_voice_note_or_cancels() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let audio = fake_audio(&mut app);
+
+        app.update(Message::Record);
+        assert!(matches!(audio.try_recv(), Ok(audio::Cmd::Record(_))));
+        app.update(Message::CancelRecording);
+        assert!(matches!(audio.try_recv(), Ok(audio::Cmd::Finish(None))));
+        assert!(app.open.as_ref().unwrap().recording.is_none());
+
+        app.update(Message::Record);
+        app.update(Message::RecordStarted(Err("Microphone unavailable".into())));
+        assert!(app.open.as_ref().unwrap().recording.is_none() && app.error.is_some(), "mic failure reported");
+        app.error = None;
+
+        app.update(Message::Record);
+        app.update(Message::SendRecording);
+        let cmds: Vec<audio::Cmd> = audio.try_iter().collect();
+        let Some(audio::Cmd::Finish(Some((path, _)))) = cmds.into_iter().last() else { panic!() };
+        assert!(path.starts_with("/nonexistent/attachments") && path.extension() == Some("mp3".as_ref()), "{path:?}");
+        assert!(drain(&mut rx).is_empty(), "sent only once encoded");
+
+        app.update(Message::Recorded(Ok(path.clone())));
+        let cmds = drain(&mut rx);
+        let Some(Command::Send { attachments, voice_note, body, .. }) = cmds.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("{cmds:?}")
+        };
+        assert_eq!((attachments.as_slice(), *voice_note, body.as_str()), (&[path][..], true, ""));
+        let m = app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.last().unwrap();
+        assert_eq!(m.attachments[0].content_type.as_deref(), Some("audio/mpeg"));
+        assert_eq!(m.attachments[0].flags, Some(presage::proto::attachment_pointer::Flags::VoiceMessage as u32));
     }
 
     #[test]
