@@ -16,7 +16,7 @@ use presage::libsignal_service::prelude::Uuid;
 use presage::proto::{AttachmentPointer, BodyRange};
 
 use crate::app::{App, Attach, Message, Open, Screen, TIMERS, display_name};
-use crate::backend::attachment_key;
+use crate::backend::{attachment_key, now_ms};
 use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label, short_duration};
 use crate::{emoji, richtext};
 
@@ -512,18 +512,36 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
         ..Default::default()
     });
 
-    let hovered = o.hovered == Some(key) || o.reacting == Some(key);
+    let now = now_ms();
+    let hovered = o.hovered == Some(key) || o.reacting == Some(key) || o.deleting == Some(key);
     let actions: Element<_> = if hovered && !m.deleted {
-        row![
+        let mut r = row![
             button(text("☺").size(16)).on_press(Message::ToggleReactions(Some(key))).style(button::text),
             button(text("↩").size(16)).on_press(Message::Reply(m.author, m.id)).style(button::text),
-        ]
-        .into()
+        ];
+        if m.can_edit(now) {
+            r = r.push(button(text("✎").size(16)).on_press(Message::Edit(m.id)).style(button::text));
+        }
+        r.push(button(text("🗑").size(16)).on_press(Message::ToggleDelete(Some(key))).style(button::text)).into()
     } else {
         Space::new().width(72).into()
     };
 
     let mut col = column![if m.outgoing { row![actions, bubble] } else { row![bubble, actions] }.align_y(Alignment::Center)];
+    if o.deleting == Some(key) {
+        let mut bar = row![].spacing(6).align_y(Alignment::Center);
+        if m.can_delete_for_everyone(now) {
+            bar = bar.push(button(text("Delete for everyone").size(13)).on_press(Message::DeleteForEveryone(m.id)).style(button::danger));
+        }
+        bar = bar
+            .push(button(text("Delete for me").size(13)).on_press(Message::DeleteForMe(m.author, m.id)).style(button::secondary))
+            .push(button(text("Cancel").size(13)).on_press(Message::ToggleDelete(None)).style(button::text));
+        col = col.push(container(bar).padding(4).style(|t: &Theme| container::Style {
+            background: Some(surface(t).into()),
+            border: Border { radius: 12.0.into(), ..Default::default() },
+            ..Default::default()
+        }));
+    }
     if o.reacting == Some(key) {
         let bar = emoji::REACTIONS
             .iter()
@@ -570,6 +588,21 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
             container(row![
                 column![text(format!("Replying to {who}")).size(12).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), text(truncate(&q.text, 90)).size(13)].width(Length::Fill),
                 button(text("✕")).on_press(Message::CancelReply).style(button::text),
+            ])
+            .padding([4, 10])
+            .style(|t: &Theme| container::Style {
+                background: Some(surface(t).into()),
+                border: Border { radius: 8.0.into(), ..Default::default() },
+                ..Default::default()
+            }),
+        );
+    }
+    if let Some(id) = o.editing {
+        let original = o.timeline.as_ref().and_then(|t| t.find(app.me, id)).map(Msg::preview).unwrap_or_default();
+        col = col.push(
+            container(row![
+                column![text("Editing message").size(12).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), text(truncate(&original, 90)).size(13)].width(Length::Fill),
+                button(text("✕")).on_press(Message::CancelEdit).style(button::text),
             ])
             .padding([4, 10])
             .style(|t: &Theme| container::Style {
@@ -678,7 +711,7 @@ fn emoji_picker(p: &crate::app::Picker) -> Element<'_, Message> {
 mod tests {
     use super::*;
     use crate::app::tests::{alice, app, open_alice};
-    use crate::backend::Event;
+    use crate::backend::{Command, Event};
     use crate::timeline::tests::{content, uuid};
     use iced_test::simulator;
 
@@ -847,6 +880,52 @@ mod tests {
             _ => None,
         });
         assert_eq!(sent.as_deref(), Some("hello 👋"));
+    }
+
+    fn click(app: &mut App, label: &str) {
+        let mut ui = simulator(view(app));
+        ui.click(label).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+    }
+
+    #[test]
+    fn hover_edit_then_send_through_the_ui() {
+        let (mut app, mut rx) = app();
+        let id = crate::app::tests::with_own_message(&mut app, &mut rx, "*typo*");
+        app.open.as_mut().unwrap().hovered = Some((uuid(1), id));
+        click(&mut app, "✎");
+        assert!(simulator(view(&app)).find("Editing message").is_ok(), "edit bar");
+        assert_eq!(app.open.as_ref().unwrap().composer.text().trim_end(), "*typo*");
+        app.update(Message::Compose(text_editor::Action::Edit(text_editor::Edit::Insert('!'))));
+        click(&mut app, "Send");
+        let cmds: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::Edit { target_ts, body, .. } if *target_ts == id && body == "typo!")),
+            "{cmds:?}"
+        );
+        assert!(simulator(view(&app)).find("Editing message").is_err(), "bar gone after sending");
+    }
+
+    #[test]
+    fn hover_delete_offers_everyone_only_for_own_recent_messages() {
+        let (mut app, mut rx) = app();
+        let id = crate::app::tests::with_own_message(&mut app, &mut rx, "oops");
+        app.open.as_mut().unwrap().hovered = Some((uuid(1), id));
+        click(&mut app, "🗑");
+        click(&mut app, "Delete for everyone");
+        assert!(matches!(rx.try_recv(), Ok(Command::DeleteForEveryone { target_ts, .. }) if target_ts == id));
+        assert!(simulator(view(&app)).find("This message was deleted.").is_ok());
+
+        // Alice's message: no edit, and only "Delete for me".
+        app.open.as_mut().unwrap().hovered = Some((uuid(2), 10));
+        assert!(simulator(view(&app)).find("✎").is_err());
+        click(&mut app, "🗑");
+        assert!(simulator(view(&app)).find("Delete for everyone").is_err());
+        click(&mut app, "Delete for me");
+        assert!(matches!(rx.try_recv(), Ok(Command::DeleteForMe { target_ts: 10, .. })));
+        assert_eq!(app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.len(), 1);
     }
 
     #[test]
