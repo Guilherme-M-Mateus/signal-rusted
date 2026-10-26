@@ -189,6 +189,75 @@ fn parse_into(input: &str, body: &mut String, ranges: &mut Vec<BodyRange>, liter
     }
 }
 
+/// Turns every `@Name` of a picked mention `(name, aci)` in `body` into U+FFFC plus a
+/// `MentionAci` range, shifting the style `ranges` (UTF-16) onto the shortened body.
+/// A name followed by a letter/digit (`@Bobby` for "Bob") doesn't count.
+pub fn apply_mentions(body: &str, ranges: Vec<BodyRange>, mentions: &[(String, String)]) -> (String, Vec<BodyRange>) {
+    let mut out = String::new();
+    let mut out16 = 0;
+    let mut in16 = 0;
+    // (start, end) in the original body and start in `out`, all UTF-16.
+    let mut hits: Vec<(usize, usize, usize)> = Vec::new();
+    let mut mention_ranges = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        let rest = &body[i..];
+        let hit = rest.strip_prefix('@').and_then(|r| {
+            mentions
+                .iter()
+                .filter(|(name, _)| {
+                    !name.is_empty()
+                        && r.starts_with(name.as_str())
+                        && !r[name.len()..].chars().next().is_some_and(char::is_alphanumeric)
+                })
+                .max_by_key(|(name, _)| name.len())
+        });
+        if let Some((name, aci)) = hit {
+            let len16 = 1 + utf16_len(name);
+            hits.push((in16, in16 + len16, out16));
+            mention_ranges.push(BodyRange {
+                start: Some(out16 as u32),
+                length: Some(1),
+                associated_value: Some(AssociatedValue::MentionAci(aci.clone())),
+            });
+            out.push('\u{FFFC}');
+            i += 1 + name.len();
+            in16 += len16;
+            out16 += 1;
+            continue;
+        }
+        let c = rest.chars().next().expect("non-empty");
+        out.push(c);
+        i += c.len_utf8();
+        in16 += c.len_utf16();
+        out16 += c.len_utf16();
+    }
+    // An offset inside a replaced name snaps to the placeholder's start (or end, for range ends).
+    let map = |x: usize, end: bool| {
+        let mut shift = 0;
+        for &(s, e, at) in &hits {
+            if x >= e {
+                shift += e - s - 1;
+            } else if x > s {
+                return at + usize::from(end);
+            }
+        }
+        x - shift
+    };
+    let mut ranges: Vec<BodyRange> = ranges
+        .into_iter()
+        .filter_map(|mut r| {
+            let (start, len) = (r.start? as usize, r.length? as usize);
+            let (s, e) = (map(start, false), map(start + len, true));
+            r.start = Some(s as u32);
+            r.length = Some(e.checked_sub(s).filter(|l| *l > 0)? as u32);
+            Some(r)
+        })
+        .collect();
+    ranges.extend(mention_ranges);
+    (out, ranges)
+}
+
 fn find_close(input: &str, open: usize, delim: &str, prev: Option<char>) -> Option<usize> {
     if !is_boundary(prev) {
         return None;
@@ -377,6 +446,91 @@ mod tests {
                 seg(")!", Style::default()),
             ]
         );
+    }
+
+    const BOB: &str = "8f2c6b9e-1a1b-4c3d-9e8f-123456789abc";
+    const CAROL: &str = "0e0e0e0e-1a1b-4c3d-9e8f-123456789abc";
+
+    fn mention_markup(input: &str, picks: &[(&str, &str)]) -> (String, Vec<BodyRange>) {
+        let (body, ranges) = parse_markup(input);
+        let picks: Vec<(String, String)> = picks.iter().map(|(n, a)| (n.to_string(), a.to_string())).collect();
+        apply_mentions(&body, ranges, &picks)
+    }
+
+    fn mention_at(ranges: &[BodyRange], aci: &str) -> Vec<(u32, u32)> {
+        ranges
+            .iter()
+            .filter(|r| matches!(&r.associated_value, Some(AssociatedValue::MentionAci(a)) if a == aci))
+            .map(|r| (r.start.unwrap(), r.length.unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn mention_becomes_placeholder_with_range() {
+        let (body, ranges) = mention_markup("hi @Bob!", &[("Bob", BOB)]);
+        assert_eq!(body, "hi \u{FFFC}!");
+        assert_eq!(mention_at(&ranges, BOB), [(3, 1)]);
+        let out = segments(&body, &ranges);
+        assert_eq!(out[1].mention.as_deref(), Some(BOB));
+        assert_eq!(out[2].text, "!");
+    }
+
+    #[test]
+    fn mention_offsets_count_emoji_as_utf16() {
+        // 👍🏽 is 4 units, 😀 2.
+        let (body, ranges) = mention_markup("👍🏽 @Bob 😀 @Bob", &[("Bob", BOB)]);
+        assert_eq!(body, "👍🏽 \u{FFFC} 😀 \u{FFFC}");
+        assert_eq!(mention_at(&ranges, BOB), [(5, 1), (10, 1)]);
+        // Emoji inside the name itself.
+        let (body, ranges) = mention_markup("@Bob 🎉 ok", &[("Bob 🎉", BOB)]);
+        assert_eq!(body, "\u{FFFC} ok");
+        assert_eq!(mention_at(&ranges, BOB), [(0, 1)]);
+    }
+
+    #[test]
+    fn multiple_people_and_style_after_mentions_shift() {
+        let (body, ranges) = mention_markup("@Bob and @Carol Ann *done*", &[("Bob", BOB), ("Carol Ann", CAROL)]);
+        assert_eq!(body, "\u{FFFC} and \u{FFFC} done");
+        assert_eq!(mention_at(&ranges, BOB), [(0, 1)]);
+        assert_eq!(mention_at(&ranges, CAROL), [(6, 1)]);
+        let out = segments(&body, &ranges);
+        assert_eq!(out.last().unwrap(), &seg("done", st(|s| s.bold = true)));
+    }
+
+    #[test]
+    fn mention_inside_bold_keeps_the_bold_around_it() {
+        let (body, ranges) = mention_markup("*hey @Bob you* 😀", &[("Bob", BOB)]);
+        assert_eq!(body, "hey \u{FFFC} you 😀");
+        let bold: Vec<_> = ranges.iter().filter(|r| r.associated_value == Some(AssociatedValue::Style(ProtoStyle::Bold as i32))).collect();
+        assert_eq!((bold[0].start, bold[0].length), (Some(0), Some(9)));
+        let out = segments(&body, &ranges);
+        assert_eq!(out[1].mention.as_deref(), Some(BOB));
+        assert!(out[1].style.bold);
+        assert_eq!(out[2], seg(" you", st(|s| s.bold = true)));
+    }
+
+    #[test]
+    fn range_ending_inside_a_name_snaps_to_the_placeholder() {
+        // Bold "hi @B" (0..5) where "@Bob" (3..7) is replaced: bold covers the placeholder.
+        let (body, ranges) = apply_mentions("hi @Bob x", vec![style_range(0, 5, ProtoStyle::Bold), style_range(5, 1, ProtoStyle::Italic)], &[("Bob".into(), BOB.into())]);
+        assert_eq!(body, "hi \u{FFFC} x");
+        assert_eq!((ranges[0].start, ranges[0].length), (Some(0), Some(4)));
+        // Italic on part of the name styles the whole placeholder.
+        assert_eq!((ranges[1].start, ranges[1].length), (Some(3), Some(1)));
+        assert_eq!(ranges.len(), 3);
+    }
+
+    #[test]
+    fn edited_away_or_longer_names_are_not_mentions() {
+        for input in ["hi Bob", "hi @Bo", "hi @Bobby", "hi"] {
+            let (body, ranges) = mention_markup(input, &[("Bob", BOB)]);
+            assert_eq!(body, input);
+            assert!(ranges.is_empty(), "{input}: {ranges:?}");
+        }
+        // The longest picked name wins.
+        let (_, ranges) = mention_markup("@Bob Smith", &[("Bob", BOB), ("Bob Smith", CAROL)]);
+        assert_eq!(mention_at(&ranges, CAROL), [(0, 1)]);
+        assert!(mention_at(&ranges, BOB).is_empty());
     }
 
     #[test]

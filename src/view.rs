@@ -261,6 +261,27 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             );
         }
     }
+    if !app.results.is_empty() && app.search.trim().chars().count() >= 2 {
+        list = list.push(container(text("Messages").size(13)).padding([8, 12]));
+        for r in &app.results {
+            let is_group = matches!(r.thread, presage::store::Thread::Group(_));
+            let item = column![
+                row![
+                    text(r.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill),
+                    text(short_time(r.id)).size(12).style(|t: &Theme| text::Style { color: Some(muted(t)) }),
+                ],
+                text(truncate(&r.snippet, 48)).size(13).wrapping(text::Wrapping::None).style(|t: &Theme| text::Style { color: Some(muted(t)) }),
+            ]
+            .spacing(2);
+            list = list.push(
+                button(item)
+                    .width(Length::Fill)
+                    .padding([6, 12])
+                    .on_press(Message::OpenThread(r.thread.clone(), r.title.clone(), is_group))
+                    .style(button::text),
+            );
+        }
+    }
     column![
         container(text("Signal").size(22).font(Font { weight: Weight::Bold, ..Font::DEFAULT })).padding([12, 16]),
         container(text_input("Search", &app.search).on_input(Message::Search).padding(8)).padding([0, 12]),
@@ -565,6 +586,23 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         });
         col = col.push(chips.wrap());
     }
+    let matches = app.mention_matches();
+    if !matches.is_empty() {
+        let list = matches.into_iter().fold(Column::new(), |c, (id, name)| {
+            c.push(
+                button(row![avatar(&name, &id.to_string(), 24.0), text(name.clone())].spacing(8).align_y(Alignment::Center))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .on_press(Message::Mention(id))
+                    .style(button::text),
+            )
+        });
+        col = col.push(container(list).padding(4).style(|t: &Theme| container::Style {
+            background: Some(surface(t).into()),
+            border: Border { radius: 8.0.into(), ..Default::default() },
+            ..Default::default()
+        }));
+    }
     let draft = o.composer.text();
     let (body, ranges) = richtext::parse_markup(&emoji::replace_shortcodes(draft.trim()));
     if !ranges.is_empty() {
@@ -862,6 +900,49 @@ mod tests {
         let at = crate::backend::now_ms() + 290_000;
         app.update(Message::Backend(Event::Expiring { thread: alice(), expires: vec![(uuid(2), 20, at)] }));
         assert!(simulator(view(&app)).find("⏳ 4m").is_ok());
+    }
+
+    #[test]
+    fn mention_autocomplete_click_inserts_name() {
+        let (mut app, mut rx) = crate::app::tests::open_group();
+        crate::app::tests::type_text(&mut app, "hi @bobb");
+        let mut ui = simulator(view(&app));
+        ui.click("Bobby").expect("member suggested"); // (Alice is also a sidebar chat)
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+        assert_eq!(app.open.as_ref().unwrap().composer.text().trim_end(), "hi @Bobby");
+        app.update(Message::Send);
+        let sent = crate::app::tests::drain(&mut rx).into_iter().find_map(|c| match c {
+            crate::backend::Command::Send { body, ranges, .. } => Some((body, ranges)),
+            _ => None,
+        });
+        let (body, ranges) = sent.expect("sent");
+        assert_eq!(body, "hi \u{FFFC}");
+        assert_eq!(richtext::segments(&body, &ranges)[1].mention, Some(uuid(4).to_string()));
+    }
+
+    #[test]
+    fn clicking_a_message_result_opens_its_conversation() {
+        let (mut app, mut rx) = app();
+        let bob = presage::store::Thread::Contact(presage::libsignal_service::protocol::ServiceId::Aci(uuid(3).into()));
+        app.update(Message::Search("lunch".into()));
+        let result = crate::backend::SearchResult {
+            thread: bob.clone(),
+            title: "Bob".into(),
+            id: 99,
+            author: uuid(3),
+            snippet: "lunch tomorrow?".into(),
+        };
+        app.update(Message::Backend(Event::SearchResults { query: "lunch".into(), results: vec![result] }));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Messages").is_ok(), "section header");
+        ui.click("lunch tomorrow?").expect("result listed");
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+        assert!(matches!(rx.try_recv(), Ok(crate::backend::Command::Open(t)) if t == bob));
+        assert!(app.results.is_empty(), "search cleared once opened");
     }
 
     #[test]
