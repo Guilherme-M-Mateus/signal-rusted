@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::{mpsc as fmpsc, oneshot};
 use futures::{SinkExt, Stream, StreamExt, pin_mut};
@@ -23,7 +23,7 @@ use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretPar
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
-use presage::proto::data_message::{Quote as ProtoQuote, Reaction};
+use presage::proto::data_message::{Flags, Quote as ProtoQuote, Reaction};
 use presage::proto::sync_message;
 use presage::proto::{
     AttachmentPointer, BodyRange, DataMessage, GroupContextV2, ReceiptMessage, SyncMessage,
@@ -66,6 +66,8 @@ pub enum Command {
     React { thread: Thread, target_author: Uuid, target_ts: u64, emoji: String, remove: bool },
     Typing { thread: Thread, started: bool },
     FetchAttachment(AttachmentPointer),
+    /// Disappearing-message timer in seconds (0 = off); 1:1 chats only.
+    SetTimer { thread: Thread, seconds: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +78,8 @@ pub struct Conversation {
     pub preview: String,
     pub unread: usize,
     pub is_group: bool,
+    /// Disappearing-message timer in seconds (0 = off).
+    pub expire_timer: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +98,10 @@ pub enum Event {
     /// `attachments` are the uploaded pointers, replacing the optimistic placeholders.
     Sent { thread: Thread, ts: u64, attachments: Vec<AttachmentPointer>, error: Option<String> },
     Attachment { key: String, path: Result<PathBuf, String> },
+    /// Running countdowns in a thread: (author, sent ts, expires at ms).
+    Expiring { thread: Thread, expires: Vec<(Uuid, u64, u64)> },
+    /// Disappeared messages, already deleted from the store: (author, sent ts).
+    Expired { thread: Thread, ids: Vec<(Uuid, u64)> },
     Error(String),
     /// Neutral status banner (e.g. history import in progress); `None` clears it.
     Notice(Option<String>),
@@ -108,6 +116,28 @@ pub fn attachment_key(p: &AttachmentPointer) -> String {
     p.digest.as_deref().map(hex::encode).unwrap_or_else(|| {
         format!("{:?}-{}", p.attachment_identifier, p.size.unwrap_or(0))
     })
+}
+
+/// Countdowns a shown timeline starts, as (author, sent ts, expires at): Signal starts
+/// incoming ones when read (`now_ms`) and outgoing ones when sent. Notices never expire.
+pub fn countdowns(t: &Timeline, now_ms: u64) -> impl Iterator<Item = (Uuid, u64, u64)> + '_ {
+    t.messages
+        .iter()
+        .filter(|m| m.expire_timer > 0 && m.kind == Kind::Normal && !m.deleted)
+        .map(move |m| {
+            let start = if m.outgoing { m.id } else { now_ms };
+            (m.author, m.id, crate::state::expires_at(start, m.expire_timer))
+        })
+}
+
+/// Signal's timer-change message. `expire_timer` being set makes presage bump the chat's
+/// `expire_timer_version` and store the new timer once sent.
+pub fn timer_update(seconds: u32) -> DataMessage {
+    DataMessage {
+        flags: Some(Flags::ExpirationTimerUpdate as u32),
+        expire_timer: Some(seconds),
+        ..Default::default()
+    }
 }
 
 pub fn group_id(master_key: &[u8; 32]) -> [u8; 32] {
@@ -292,7 +322,10 @@ async fn main(
     }
 
     loop {
+        // Capped so a suspended machine (monotonic clock paused) still catches up within a minute.
+        let next = b.state.next_expiry().map(|at| Duration::from_millis(at.saturating_sub(now_ms())).min(Duration::from_secs(60)));
         tokio::select! {
+            _ = async { match next { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => b.expire().await,
             cmd = cmds.recv() => match cmd {
                 Some(cmd) => b.command(cmd).await,
                 None => return Ok(()), // UI gone
@@ -481,15 +514,16 @@ impl Backend {
 
         let mut out = Vec::new();
         for (thread, title, is_group) in threads {
+            let expire_timer = self.manager.store().expire_timer(&thread).await.ok().flatten().map_or(0, |(t, _)| t);
             let Some((last_ts, preview)) = self.last_message(&thread).await else {
                 // Groups, Note to Self and chats the storage service lists show even when empty.
                 if is_group || thread == me || self.state.listed.contains(&crate::state::thread_key(&thread)) {
-                    out.push(Conversation { thread, title, last_ts: 0, preview: String::new(), unread: 0, is_group });
+                    out.push(Conversation { thread, title, last_ts: 0, preview: String::new(), unread: 0, is_group, expire_timer });
                 }
                 continue; // contacts without messages live in the "new chat" search
             };
             let unread = self.unread(&thread).await;
-            out.push(Conversation { thread, title, last_ts, preview, unread, is_group });
+            out.push(Conversation { thread, title, last_ts, preview, unread, is_group, expire_timer });
         }
         out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
         self.emit(Event::Names(names));
@@ -525,6 +559,7 @@ impl Backend {
                 let timeline = Timeline::from_newest_first(self.me, rows.flatten(), HISTORY_ROWS);
                 self.open = Some(thread.clone());
                 self.mark_read(&thread, &timeline).await;
+                self.start_expiries(&thread, &timeline);
                 self.emit(Event::Timeline { thread, timeline });
                 self.refresh().await;
             }
@@ -535,7 +570,24 @@ impl Backend {
                     Err(e) => (Vec::new(), Some(format!("{e:#}"))),
                 };
                 self.state.mark_read(&thread, ts);
+                // presage put the thread's timer on the message; its countdown starts now.
+                let timer = self.manager.store().expire_timer(&thread).await.ok().flatten().map_or(0, |(t, _)| t);
+                if error.is_none() && timer > 0 {
+                    self.state.start_expiry(&thread, self.me, ts, crate::state::expires_at(ts, timer));
+                    self.emit_expiring(&thread);
+                }
                 self.emit(Event::Sent { thread, ts, attachments, error });
+                self.refresh().await;
+            }
+            Command::SetTimer { thread, seconds } => {
+                let ts = now_ms();
+                let r = self.send_body(&thread, timer_update(seconds), ts).await;
+                if self.report("change disappearing messages", r).is_some() {
+                    // Show our notice; presage saved it and bumped the stored timer version.
+                    if let Ok(Some(c)) = self.manager.store().message(&thread, ts).await {
+                        self.emit(Event::Incoming { thread, content: Box::new(c) });
+                    }
+                }
                 self.refresh().await;
             }
             Command::React { thread, target_author, target_ts, emoji, remove } => {
@@ -712,6 +764,44 @@ impl Backend {
         }
     }
 
+    fn emit_expiring(&self, thread: &Thread) {
+        let expires = self.state.expiries(thread).map(|e| (e.author, e.ts, e.expires_at)).collect();
+        self.emit(Event::Expiring { thread: thread.clone(), expires });
+    }
+
+    /// Starts the countdowns of disappearing messages now shown in the open conversation.
+    fn start_expiries(&mut self, thread: &Thread, timeline: &Timeline) {
+        let mut any = false;
+        for (author, ts, at) in countdowns(timeline, now_ms()) {
+            any |= self.state.start_expiry(thread, author, ts, at);
+        }
+        if any || self.state.expiries(thread).next().is_some() {
+            self.emit_expiring(thread);
+        }
+    }
+
+    /// Deletes messages whose countdown ran out (their reactions go with them: nothing to attach to).
+    async fn expire(&mut self) {
+        let due = self.state.take_due(now_ms());
+        if due.is_empty() {
+            return;
+        }
+        let mut by_thread: HashMap<String, Vec<(Uuid, u64)>> = HashMap::new();
+        for e in due {
+            by_thread.entry(e.thread).or_default().push((e.author, e.ts));
+        }
+        for (key, ids) in by_thread {
+            let Some(thread) = crate::state::parse_thread_key(&key) else { continue };
+            for (_, ts) in &ids {
+                if let Err(e) = self.manager.store().clone().delete_message(&thread, *ts).await {
+                    tracing::warn!(%e, "failed to delete expired message");
+                }
+            }
+            self.emit(Event::Expired { thread, ids });
+        }
+        self.refresh().await;
+    }
+
     async fn received(&mut self, r: Received) {
         match r {
             // QueueEmpty means we're connected again: retry a storage sync that failed offline.
@@ -790,6 +880,11 @@ impl Backend {
                 self.notify(&thread, &c).await;
             }
         }
+        if self.open.as_ref() == Some(&thread) {
+            let mut t = Timeline::new(self.me);
+            t.apply(&c);
+            self.start_expiries(&thread, &t);
+        }
         self.emit(Event::Incoming { thread, content: Box::new(c) });
         self.refresh().await;
     }
@@ -817,6 +912,26 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeline::tests::{content, text, uuid};
+
+    #[test]
+    fn countdowns_start_on_read_for_incoming_and_on_send_for_outgoing() {
+        let mut t = Timeline::new(uuid(1));
+        t.apply(&content(uuid(2), 1_000, DataMessage { expire_timer: Some(30), ..text(1_000, "theirs") }));
+        t.apply(&content(uuid(1), 2_000, DataMessage { expire_timer: Some(60), ..text(2_000, "mine") }));
+        t.apply(&content(uuid(2), 3_000, text(3_000, "no timer")));
+        t.apply(&content(uuid(2), 4_000, timer_update(30)));
+        let c: Vec<_> = countdowns(&t, 10_000).collect();
+        assert_eq!(c, [(uuid(2), 1_000, 40_000), (uuid(1), 2_000, 62_000)], "timer notices never expire");
+    }
+
+    #[test]
+    fn timer_update_message() {
+        let dm = timer_update(300);
+        assert_eq!((dm.flags, dm.expire_timer), (Some(Flags::ExpirationTimerUpdate as u32), Some(300)));
+        assert_eq!(dm.expire_timer_version, None, "presage fills in the bumped version");
+        assert_eq!(timer_update(0).expire_timer, Some(0), "Off is an explicit 0, not 'keep the timer'");
+    }
 
     #[test]
     fn group_id_is_deterministic_and_distinct() {

@@ -1,8 +1,11 @@
-//! Small app-level state presage doesn't track: read markers and the storage-service chat list.
+//! Small app-level state presage doesn't track: read markers, the storage-service chat list
+//! and disappearing-message countdowns.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use presage::libsignal_service::prelude::Uuid;
+use presage::libsignal_service::protocol::ServiceId;
 use presage::store::Thread;
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +19,38 @@ pub struct AppState {
     /// Profile names from the storage service, for people outside the address book.
     #[serde(default)]
     pub profile_names: HashMap<String, String>,
+    /// Disappearing messages whose countdown has started.
+    #[serde(default)]
+    pub expiring: Vec<Expiry>,
     #[serde(skip)]
     path: PathBuf,
+}
+
+/// One message's countdown; Signal identifies a message by thread + author + sent timestamp.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct Expiry {
+    pub thread: String,
+    pub author: Uuid,
+    pub ts: u64,
+    pub expires_at: u64,
+}
+
+/// When a countdown started at `start_ms` with a `timer_s` timer runs out.
+pub fn expires_at(start_ms: u64, timer_s: u32) -> u64 {
+    start_ms + u64::from(timer_s) * 1000
+}
+
+/// Seconds left, rounded up so 0 only means gone.
+pub fn remaining_s(expires_at: u64, now_ms: u64) -> u64 {
+    expires_at.saturating_sub(now_ms).div_ceil(1000)
+}
+
+/// Inverse of `thread_key`.
+pub fn parse_thread_key(key: &str) -> Option<Thread> {
+    match key.strip_prefix("group:") {
+        Some(k) => Some(Thread::Group(hex::decode(k).ok()?.try_into().ok()?)),
+        None => ServiceId::parse_from_service_id_string(key).map(Thread::Contact),
+    }
 }
 
 pub fn thread_key(t: &Thread) -> String {
@@ -58,6 +91,37 @@ impl AppState {
         self.listed = listed;
         self.profile_names = profile_names;
         self.save();
+    }
+
+    /// Starts a countdown unless one is already running; returns true (and saves) if new.
+    pub fn start_expiry(&mut self, t: &Thread, author: Uuid, ts: u64, expires_at: u64) -> bool {
+        let thread = thread_key(t);
+        if self.expiring.iter().any(|e| e.thread == thread && e.author == author && e.ts == ts) {
+            return false;
+        }
+        self.expiring.push(Expiry { thread, author, ts, expires_at });
+        self.save();
+        true
+    }
+
+    pub fn expiries(&self, t: &Thread) -> impl Iterator<Item = &Expiry> {
+        let key = thread_key(t);
+        self.expiring.iter().filter(move |e| e.thread == key)
+    }
+
+    /// The earliest pending expiry, for the backend's sleep.
+    pub fn next_expiry(&self) -> Option<u64> {
+        self.expiring.iter().map(|e| e.expires_at).min()
+    }
+
+    /// Removes (and saves) every countdown that ran out by `now_ms`.
+    pub fn take_due(&mut self, now_ms: u64) -> Vec<Expiry> {
+        let (due, keep) = std::mem::take(&mut self.expiring).into_iter().partition(|e| e.expires_at <= now_ms);
+        self.expiring = keep;
+        if !due.is_empty() {
+            self.save();
+        }
+        due
     }
 
     fn save(&self) {
@@ -112,6 +176,46 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(&path, b"{not json").unwrap();
         assert_eq!(AppState::load(&path).last_read(&Thread::Group([1; 32])), 0);
+    }
+
+    #[test]
+    fn expiry_math() {
+        assert_eq!(expires_at(1_000, 30), 31_000);
+        assert_eq!(remaining_s(31_000, 1_000), 30);
+        assert_eq!(remaining_s(31_000, 30_001), 1, "rounds up");
+        assert_eq!(remaining_s(31_000, 40_000), 0);
+    }
+
+    #[test]
+    fn countdowns_survive_restart_and_fire_when_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let a = crate::timeline::tests::uuid(2);
+        let alice = Thread::Contact(ServiceId::Aci(a.into()));
+        let group = Thread::Group([9; 32]);
+
+        let mut s = AppState::load(&path);
+        assert_eq!(s.next_expiry(), None);
+        assert!(s.start_expiry(&alice, a, 10, 5_000));
+        assert!(!s.start_expiry(&alice, a, 10, 9_000), "a running countdown never restarts");
+        assert!(s.start_expiry(&group, a, 10, 2_000));
+
+        let mut s = AppState::load(&path);
+        assert_eq!(s.next_expiry(), Some(2_000), "restart keeps the countdowns");
+        assert_eq!(s.expiries(&alice).count(), 1);
+        assert!(s.take_due(1_999).is_empty());
+        let due = s.take_due(2_000);
+        assert_eq!(due.iter().map(|e| parse_thread_key(&e.thread)).collect::<Vec<_>>(), [Some(group)]);
+        assert_eq!(AppState::load(&path).next_expiry(), Some(5_000), "fired ones are forgotten on disk");
+    }
+
+    #[test]
+    fn thread_keys_round_trip() {
+        let c = Thread::Contact(ServiceId::Aci(crate::timeline::tests::uuid(1).into()));
+        for t in [c, Thread::Group([7; 32])] {
+            assert_eq!(parse_thread_key(&thread_key(&t)), Some(t));
+        }
+        assert_eq!(parse_thread_key("group:zz"), None);
     }
 
     #[test]

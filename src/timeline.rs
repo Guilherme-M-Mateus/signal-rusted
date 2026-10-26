@@ -47,6 +47,8 @@ pub struct Message {
     pub edited: bool,
     pub deleted: bool,
     pub delivery: Delivery,
+    /// Disappearing-message timer in seconds (0 = off).
+    pub expire_timer: u32,
 }
 
 impl Message {
@@ -64,6 +66,7 @@ impl Message {
             edited: false,
             deleted: false,
             delivery: if outgoing { Delivery::Sent } else { Delivery::Delivered },
+            expire_timer: 0,
         }
     }
 
@@ -281,6 +284,7 @@ fn fill(m: &mut Message, dm: &DataMessage) {
         m.attachments.push(sticker);
     }
     m.quote = dm.quote.as_ref().map(quote);
+    m.expire_timer = dm.expire_timer.unwrap_or(0);
 }
 
 fn quote(q: &ProtoQuote) -> Quote {
@@ -308,6 +312,17 @@ pub fn human_duration(s: u32) -> String {
         s => (s, "second"),
     };
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Compact countdown for message footers: 45s, 5m, 8h, 3d, 2w (largest whole unit).
+pub fn short_duration(s: u64) -> String {
+    match s {
+        s if s >= 604_800 => format!("{}w", s / 604_800),
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 #[cfg(test)]
@@ -543,5 +558,18 @@ pub(crate) mod tests {
         assert_eq!(human_duration(86_400 * 2), "2 days");
         assert_eq!(human_duration(604_800), "1 week");
         assert_eq!(timer_notice(0), "Disappearing messages turned off");
+        assert_eq!(
+            [45, 300, 3_599, 28_800, 86_400 * 3, 2_419_200].map(short_duration),
+            ["45s", "5m", "59m", "8h", "3d", "4w"]
+        );
+    }
+
+    #[test]
+    fn messages_carry_their_timer() {
+        let mut t = tl();
+        let dm = DataMessage { expire_timer: Some(30), ..text(10, "poof") };
+        t.apply(&content(uuid(ALICE), 10, dm));
+        t.apply(&content(uuid(ALICE), 11, text(11, "stays")));
+        assert_eq!(t.messages.iter().map(|m| m.expire_timer).collect::<Vec<_>>(), [30, 0]);
     }
 }

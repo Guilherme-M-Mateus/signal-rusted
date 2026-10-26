@@ -20,6 +20,17 @@ pub const PAGE: usize = 150;
 /// Images up to this size are downloaded automatically, like Signal's auto-download.
 const AUTO_DOWNLOAD_BYTES: u32 = 25 * 1024 * 1024;
 const TYPING_TIMEOUT: Duration = Duration::from_secs(15);
+/// Signal's disappearing-message choices: (seconds, label).
+pub const TIMERS: [(u32, &str); 8] = [
+    (0, "Off"),
+    (30, "30s"),
+    (300, "5m"),
+    (3_600, "1h"),
+    (28_800, "8h"),
+    (86_400, "1d"),
+    (604_800, "1w"),
+    (2_419_200, "4w"),
+];
 
 pub enum Screen {
     Connecting,
@@ -46,6 +57,9 @@ pub struct Open {
     pub reacting: Option<(Uuid, u64)>,
     pub picker: Option<Picker>,
     pub spoilers: HashSet<(u64, usize)>,
+    /// (author, sent ts) -> when it disappears (ms).
+    pub expires: HashMap<(Uuid, u64), u64>,
+    pub timer_menu: bool,
     last_keystroke: Option<Instant>,
     typing_sent: bool,
 }
@@ -94,6 +108,8 @@ pub enum Message {
     InsertEmoji(&'static str),
     Spoiler(u64, usize),
     LoadOlder,
+    ToggleTimerMenu,
+    SetTimer(u32),
     FetchAttachment(String),
     SaveAttachment(String),
     Saved(Result<(), String>),
@@ -147,7 +163,7 @@ impl App {
             iced::system::theme_changes().map(Message::Theme),
         ];
         let typing_active = self.typing.values().any(|m| !m.is_empty());
-        if typing_active || self.open.as_ref().is_some_and(|o| o.typing_sent) {
+        if typing_active || self.open.as_ref().is_some_and(|o| o.typing_sent || !o.expires.is_empty()) {
             subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
         }
         Subscription::batch(subs)
@@ -199,6 +215,8 @@ impl App {
                     reacting: None,
                     picker: None,
                     spoilers: HashSet::new(),
+                    expires: HashMap::new(),
+                    timer_menu: false,
                     last_keystroke: None,
                     typing_sent: false,
                 });
@@ -303,6 +321,24 @@ impl App {
                 if let Some(o) = &mut self.open {
                     o.shown += PAGE;
                 }
+            }
+            Message::ToggleTimerMenu => {
+                if let Some(o) = self.open.as_mut().filter(|o| !o.is_group) {
+                    o.timer_menu = !o.timer_menu;
+                }
+            }
+            Message::SetTimer(seconds) => {
+                // Group timers are a group change (admin APIs); the header is read-only there.
+                let Some(o) = self.open.as_mut().filter(|o| !o.is_group) else { return Task::none() };
+                o.timer_menu = false;
+                let thread = o.thread.clone();
+                if self.timer(&thread) == seconds {
+                    return Task::none();
+                }
+                if let Some(c) = self.conversations.iter_mut().find(|c| c.thread == thread) {
+                    c.expire_timer = seconds;
+                }
+                self.send(Command::SetTimer { thread, seconds });
             }
             Message::FetchAttachment(key) => self.fetch(&key),
             Message::SaveAttachment(key) => {
@@ -421,6 +457,21 @@ impl App {
                     Err(e) => Attach::Failed(e),
                 };
                 self.attachments.insert(key, a);
+            }
+            Event::Expiring { thread, expires } => {
+                if let Some(o) = self.open.as_mut().filter(|o| o.thread == thread) {
+                    o.expires = expires.into_iter().map(|(a, ts, at)| ((a, ts), at)).collect();
+                }
+            }
+            Event::Expired { thread, ids } => {
+                if let Some(o) = self.open.as_mut().filter(|o| o.thread == thread) {
+                    if let Some(t) = &mut o.timeline {
+                        t.messages.retain(|m| !ids.contains(&(m.author, m.id)));
+                    }
+                    for id in &ids {
+                        o.expires.remove(id);
+                    }
+                }
             }
             Event::Error(e) => self.error = Some(e),
             Event::Notice(n) => self.notice = n,
@@ -550,6 +601,11 @@ impl App {
         }
     }
 
+    /// The thread's disappearing-message timer in seconds (0 = off).
+    pub fn timer(&self, thread: &Thread) -> u32 {
+        self.conversations.iter().find(|c| c.thread == *thread).map_or(0, |c| c.expire_timer)
+    }
+
     pub fn typing_names(&self, thread: &Thread) -> Vec<String> {
         self.typing
             .get(thread)
@@ -614,6 +670,7 @@ pub(crate) mod tests {
             preview: "hi there".into(),
             unread: 2,
             is_group: false,
+            expire_timer: 0,
         }])));
         (app, rx)
     }
@@ -844,6 +901,45 @@ pub(crate) mod tests {
         assert_eq!(app.contact_matches(), vec![(uuid(3), "Bob".to_string())], "Alice already has a chat");
         app.update(Message::Search("".into()));
         assert!(app.contact_matches().is_empty());
+    }
+
+    #[test]
+    fn setting_the_timer_sends_once_and_updates_the_header() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        app.update(Message::ToggleTimerMenu);
+        assert!(app.open.as_ref().unwrap().timer_menu);
+        app.update(Message::SetTimer(300));
+        app.update(Message::SetTimer(300));
+        let cmds = drain(&mut rx);
+        assert!(matches!(cmds.as_slice(), [Command::SetTimer { thread, seconds: 300 }] if *thread == alice()), "{cmds:?}");
+        assert_eq!(app.timer(&alice()), 300);
+        assert!(!app.open.as_ref().unwrap().timer_menu, "choosing closes the menu");
+    }
+
+    #[test]
+    fn group_timer_is_read_only() {
+        let (mut app, mut rx) = app();
+        app.update(Message::OpenThread(Thread::Group([5; 32]), "Team".into(), true));
+        drain(&mut rx);
+        app.update(Message::ToggleTimerMenu);
+        app.update(Message::SetTimer(30));
+        assert!(drain(&mut rx).is_empty());
+        assert!(!app.open.as_ref().unwrap().timer_menu);
+    }
+
+    #[test]
+    fn expired_messages_leave_the_open_timeline() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        app.update(Message::Backend(Event::Expiring { thread: alice(), expires: vec![(uuid(ALICE), 10, 99)] }));
+        assert_eq!(app.open.as_ref().unwrap().expires.get(&(uuid(ALICE), 10)), Some(&99));
+        let other = Thread::Contact(ServiceId::Aci(uuid(3).into()));
+        app.update(Message::Backend(Event::Expired { thread: other, ids: vec![(uuid(ALICE), 10)] }));
+        assert_eq!(app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.len(), 1, "other chats' expiries don't touch this one");
+        app.update(Message::Backend(Event::Expired { thread: alice(), ids: vec![(uuid(ALICE), 10)] }));
+        let o = app.open.as_ref().unwrap();
+        assert!(o.timeline.as_ref().unwrap().messages.is_empty() && o.expires.is_empty());
     }
 
     #[test]

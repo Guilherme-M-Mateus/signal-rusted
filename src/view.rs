@@ -15,9 +15,9 @@ use iced::{Alignment, Background, Border, Color, Element, Font, Length, Theme, c
 use presage::libsignal_service::prelude::Uuid;
 use presage::proto::{AttachmentPointer, BodyRange};
 
-use crate::app::{App, Attach, Message, Open, Screen, display_name};
+use crate::app::{App, Attach, Message, Open, Screen, TIMERS, display_name};
 use crate::backend::attachment_key;
-use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label};
+use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label, short_duration};
 use crate::{emoji, richtext};
 
 pub const COMPOSER: &str = "composer";
@@ -281,12 +281,23 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     let header = container(
         row![
             avatar(&o.title, &crate::state::thread_key(&o.thread), 32.0),
-            column![text(o.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), subtitle]
+            column![text(o.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), subtitle].width(Length::Fill),
+            timer_control(app, o),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
     )
     .padding([10, 16]);
+    let header: Element<_> = if o.timer_menu {
+        let current = app.timer(&o.thread);
+        let options = TIMERS.iter().fold(row![].spacing(6), |r, &(secs, label)| {
+            let style = if secs == current { button::primary } else { button::secondary };
+            r.push(button(text(label).size(13)).on_press(Message::SetTimer(secs)).style(style))
+        });
+        column![header, container(options).padding([0, 16]).align_right(Length::Fill)].spacing(4).into()
+    } else {
+        header.into()
+    };
 
     let body: Element<_> = match &o.timeline {
         None => center(text("Loading…")).into(),
@@ -315,6 +326,19 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     };
 
     column![header, rule::horizontal(1), body, composer(app, o)].into()
+}
+
+/// "⏱ 5m": opens the timer choices in 1:1 chats; read-only in groups (changing it there is a
+/// group change, which needs the group admin APIs).
+fn timer_control<'a>(app: &App, o: &Open) -> Element<'a, Message> {
+    let secs = app.timer(&o.thread);
+    let label = TIMERS.iter().find(|(s, _)| *s == secs).map_or_else(|| short_duration(secs.into()), |(_, l)| l.to_string());
+    let label = text(format!("⏱ {label}")).size(13);
+    if o.is_group {
+        label.style(|t: &Theme| text::Style { color: Some(muted(t)) }).into()
+    } else {
+        button(label).on_press(Message::ToggleTimerMenu).style(button::text).into()
+    }
 }
 
 fn rich<'a>(
@@ -448,6 +472,12 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
     let mut footer = row![text(short_time(m.id)).size(11).color(Color { a: 0.7, ..fg })].spacing(6);
     if m.edited && !m.deleted {
         footer = footer.push(text("Edited").size(11).color(Color { a: 0.7, ..fg }));
+    }
+    if let Some(at) = o.expires.get(&key) {
+        let left = short_duration(crate::state::remaining_s(*at, crate::backend::now_ms()));
+        footer = footer.push(text(format!("⏳ {left}")).size(11).color(Color { a: 0.7, ..fg }));
+    } else if m.expire_timer > 0 {
+        footer = footer.push(text("⏳").size(11).color(Color { a: 0.7, ..fg })); // starts when read
     }
     if m.outgoing {
         let mark_color = if m.delivery == Delivery::Read { color!(0xa8d0ff) } else { Color { a: 0.8, ..fg } };
@@ -793,6 +823,45 @@ mod tests {
             let _ = app.update(m);
         }
         assert!(app.open.as_ref().unwrap().composer.text().contains('👍'));
+    }
+
+    #[test]
+    fn header_timer_control_changes_the_timer() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let mut ui = simulator(view(&app));
+        ui.click("⏱ Off").expect("timer control in header");
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+        let mut ui = simulator(view(&app));
+        ui.click("5m").expect("timer choices");
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+        assert!(matches!(rx.try_recv(), Ok(crate::backend::Command::SetTimer { seconds: 300, .. })));
+        assert!(simulator(view(&app)).find("⏱ 5m").is_ok(), "header shows the new timer");
+    }
+
+    #[test]
+    fn group_timer_is_shown_read_only() {
+        let (mut app, _rx) = app();
+        app.update(Message::OpenThread(presage::store::Thread::Group([5; 32]), "Team".into(), true));
+        let mut ui = simulator(view(&app));
+        ui.click("⏱ Off").expect("timer shown");
+        assert_eq!(ui.into_messages().count(), 0, "not clickable in groups");
+    }
+
+    #[test]
+    fn disappearing_messages_show_a_countdown() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let dm = presage::proto::DataMessage { expire_timer: Some(300), ..crate::timeline::tests::text(20, "poof") };
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(2), 20, dm)) }));
+        assert!(simulator(view(&app)).find("⏳").is_ok(), "hourglass before the countdown starts");
+        let at = crate::backend::now_ms() + 290_000;
+        app.update(Message::Backend(Event::Expiring { thread: alice(), expires: vec![(uuid(2), 20, at)] }));
+        assert!(simulator(view(&app)).find("⏳ 4m").is_ok());
     }
 
     #[test]
