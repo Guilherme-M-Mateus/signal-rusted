@@ -7,6 +7,9 @@ use presage::proto::data_message::{Flags, Quote as ProtoQuote, Reaction};
 use presage::proto::sync_message::{self, Content as SyncContent};
 use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, receipt_message};
 
+/// Signal's window for editing and deleting for everyone.
+pub const EDIT_WINDOW_MS: u64 = 24 * 3600 * 1000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Delivery {
     Failed,
@@ -65,6 +68,20 @@ impl Message {
             deleted: false,
             delivery: if outgoing { Delivery::Sent } else { Delivery::Delivered },
         }
+    }
+
+    /// Delete for everyone: our own sent messages inside Signal's 24h window.
+    pub fn can_delete_for_everyone(&self, now: u64) -> bool {
+        self.outgoing
+            && !self.deleted
+            && self.kind == Kind::Normal
+            && self.delivery >= Delivery::Sent
+            && now.saturating_sub(self.id) < EDIT_WINDOW_MS
+    }
+
+    /// Edit: the same window, and only messages with text.
+    pub fn can_edit(&self, now: u64) -> bool {
+        self.can_delete_for_everyone(now) && !self.body.trim().is_empty()
     }
 
     /// One-line text for the conversation list and quote previews.
@@ -242,6 +259,10 @@ impl Timeline {
         let (Some(target), Some(dm)) = (edit.target_sent_timestamp, &edit.data_message) else {
             return false;
         };
+        // A stored delete (nil author, see `apply`) sorts before the edit rows: keep it deleted.
+        if self.messages.iter().any(|m| m.id == target && m.deleted && (m.author == author || m.author.is_nil())) {
+            return false;
+        }
         let mut m = Message::new(target, author, outgoing);
         fill(&mut m, dm);
         m.edited = true;
@@ -453,6 +474,42 @@ pub(crate) mod tests {
         let mut stored = tl();
         stored.apply(&content(Uuid::nil(), 10, NullMessage::default()));
         assert!(stored.messages[0].deleted);
+    }
+
+    #[test]
+    fn edits_never_resurrect_deleted_messages() {
+        let edit = || EditMessage { target_sent_timestamp: Some(10), data_message: Some(text(12, "v2")) };
+        // Stored order: the original row became a nil-author NullMessage; the edit row stays.
+        let mut stored = tl();
+        stored.apply(&content(Uuid::nil(), 10, NullMessage::default()));
+        assert!(!stored.apply(&content(uuid(ME), 12, edit())));
+        assert_eq!(stored.messages.len(), 1);
+        assert!(stored.messages[0].deleted);
+
+        let mut live = tl();
+        live.apply(&content(uuid(ME), 10, text(10, "v1")));
+        let del = DataMessage { delete: Some(Delete { target_sent_timestamp: Some(10) }), ..Default::default() };
+        live.apply(&content(uuid(ME), 11, del));
+        assert!(!live.apply(&content(uuid(ME), 12, edit())));
+        assert!(live.messages[0].deleted);
+    }
+
+    #[test]
+    fn edit_and_delete_for_everyone_window() {
+        let day = EDIT_WINDOW_MS;
+        let mut m = Message::new(day, uuid(ME), true);
+        m.body = "hi".into();
+        assert!(m.can_edit(day + 1) && m.can_delete_for_everyone(day + 1));
+        assert!(!m.can_edit(2 * day) && !m.can_delete_for_everyone(2 * day), "24h old");
+        m.delivery = Delivery::Sending;
+        assert!(!m.can_edit(day), "not sent yet");
+        m.delivery = Delivery::Read;
+        m.body = " ".into();
+        assert!(!m.can_edit(day) && m.can_delete_for_everyone(day), "photo without text");
+        let incoming = Message::new(day, uuid(ALICE), false);
+        assert!(!incoming.can_edit(day) && !incoming.can_delete_for_everyone(day));
+        m.deleted = true;
+        assert!(!m.can_delete_for_everyone(day));
     }
 
     #[test]

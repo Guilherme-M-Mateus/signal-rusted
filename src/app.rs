@@ -44,6 +44,10 @@ pub struct Open {
     pub files: Vec<PathBuf>,
     pub hovered: Option<(Uuid, u64)>,
     pub reacting: Option<(Uuid, u64)>,
+    /// Message whose delete options are shown.
+    pub deleting: Option<(Uuid, u64)>,
+    /// Our message being edited in the composer.
+    pub editing: Option<u64>,
     pub picker: Option<Picker>,
     pub spoilers: HashSet<(u64, usize)>,
     last_keystroke: Option<Instant>,
@@ -85,6 +89,11 @@ pub enum Message {
     RemoveFile(usize),
     Reply(Uuid, u64),
     CancelReply,
+    Edit(u64),
+    CancelEdit,
+    ToggleDelete(Option<(Uuid, u64)>),
+    DeleteForEveryone(u64),
+    DeleteForMe(Uuid, u64),
     Hover(Option<(Uuid, u64)>),
     ToggleReactions(Option<(Uuid, u64)>),
     React(Uuid, u64, String),
@@ -197,6 +206,8 @@ impl App {
                     files: Vec::new(),
                     hovered: None,
                     reacting: None,
+                    deleting: None,
+                    editing: None,
                     picker: None,
                     spoilers: HashSet::new(),
                     last_keystroke: None,
@@ -256,6 +267,32 @@ impl App {
                     o.quote = None;
                 }
             }
+            Message::Edit(id) => {
+                let me = self.me;
+                let Some(o) = &mut self.open else { return Task::none() };
+                let Some(m) = o.timeline.as_ref().and_then(|t| t.find(me, id)).filter(|m| m.can_edit(now_ms())) else {
+                    return Task::none();
+                };
+                o.composer = text_editor::Content::with_text(&richtext::to_markup(&m.body, &m.ranges));
+                o.composer.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+                o.editing = Some(id);
+                (o.quote, o.reacting, o.deleting) = (None, None, None);
+                return iced::widget::operation::focus(crate::view::COMPOSER);
+            }
+            Message::CancelEdit => {
+                if let Some(o) = self.open.as_mut().filter(|o| o.editing.is_some()) {
+                    o.editing = None;
+                    o.composer = text_editor::Content::new();
+                }
+            }
+            Message::ToggleDelete(target) => {
+                if let Some(o) = &mut self.open {
+                    o.deleting = if o.deleting == target { None } else { target };
+                    o.reacting = None;
+                }
+            }
+            Message::DeleteForEveryone(id) => self.delete(self.me, id, true),
+            Message::DeleteForMe(author, id) => self.delete(author, id, false),
             Message::Hover(h) => {
                 if let Some(o) = &mut self.open {
                     o.hovered = h;
@@ -438,6 +475,37 @@ impl App {
         }
         let (body, ranges) = richtext::parse_markup(&emoji::replace_shortcodes(raw.trim()));
         let ts = now_ms();
+        if let Some(target) = o.editing {
+            if body.trim().is_empty() {
+                return; // Signal can't edit a message down to nothing
+            }
+            o.editing = None;
+            o.composer = text_editor::Content::new();
+            o.typing_sent = false;
+            o.last_keystroke = None;
+            let Some(m) = o.timeline.as_mut().and_then(|t| t.messages.iter_mut().find(|m| m.id == target && m.author == me))
+            else {
+                return;
+            };
+            if m.body == body && m.ranges == ranges {
+                return;
+            }
+            (m.body, m.ranges, m.edited, m.delivery) = (body.clone(), ranges.clone(), true, Delivery::Sending);
+            let quote = m.quote.as_ref().and_then(|q| {
+                Some(QuoteRef { id: q.id, author: q.author?, text: q.text.clone(), ranges: q.ranges.clone() })
+            });
+            let cmd = Command::Edit {
+                thread: o.thread.clone(),
+                target_ts: target,
+                ts,
+                body,
+                ranges,
+                attachments: m.attachments.clone(),
+                quote,
+            };
+            self.send(cmd);
+            return;
+        }
         let mut m = Msg::new(ts, me, true);
         m.body = body.clone();
         m.ranges = ranges.clone();
@@ -488,6 +556,32 @@ impl App {
         }
         let thread = o.thread.clone();
         self.send(Command::React { thread, target_author: author, target_ts: id, emoji, remove });
+    }
+
+    /// Deletes for everyone (our own messages, shown as deleted) or just here (removed).
+    fn delete(&mut self, author: Uuid, id: u64, for_everyone: bool) {
+        let Some(o) = &mut self.open else { return };
+        o.deleting = None;
+        let Some(t) = &mut o.timeline else { return };
+        let Some(i) = t.messages.iter().position(|m| m.id == id && m.author == author) else { return };
+        if for_everyone {
+            if !t.messages[i].can_delete_for_everyone(now_ms()) {
+                return;
+            }
+            t.messages[i].deleted = true;
+        } else {
+            t.messages.remove(i);
+        }
+        if o.editing == Some(id) && author == self.me {
+            o.editing = None;
+            o.composer = text_editor::Content::new();
+        }
+        let thread = o.thread.clone();
+        self.send(if for_everyone {
+            Command::DeleteForEveryone { thread, target_ts: id }
+        } else {
+            Command::DeleteForMe { thread, author, target_ts: id }
+        });
     }
 
     fn stop_typing(&mut self) {
@@ -721,6 +815,98 @@ pub(crate) mod tests {
         };
         assert_eq!((q.id, q.author), (10, uuid(ALICE)));
         assert!(app.open.as_ref().unwrap().quote.is_none());
+    }
+
+    /// Alice's chat plus our own message sent a minute ago; returns its id.
+    pub fn with_own_message(app: &mut App, rx: &mut UnboundedReceiver<Command>, markup: &str) -> u64 {
+        open_alice(app, rx);
+        let ts = now_ms() - 60_000;
+        let (body, body_ranges) = richtext::parse_markup(markup);
+        let dm = presage::proto::DataMessage { body: Some(body), body_ranges, timestamp: Some(ts), ..Default::default() };
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(ME), ts, dm)) }));
+        ts
+    }
+
+    fn msgs(app: &App) -> &[Msg] {
+        &app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages
+    }
+
+    #[test]
+    fn edit_puts_markup_in_composer_and_sends_an_edit() {
+        let (mut app, mut rx) = app();
+        let id = with_own_message(&mut app, &mut rx, "*hi* 👍🏽 _there_");
+        app.update(Message::Reply(uuid(ALICE), 10));
+        app.update(Message::Edit(id));
+        let o = app.open.as_ref().unwrap();
+        assert_eq!((o.editing, o.quote.is_none()), (Some(id), true), "editing replaces the reply");
+        assert_eq!(o.composer.text().trim_end(), "*hi* 👍🏽 _there_");
+        type_text(&mut app, " ~now~");
+        app.update(Message::Send);
+        let cmds = drain(&mut rx);
+        let Some(Command::Edit { target_ts, ts, body, ranges, .. }) = cmds.iter().find(|c| matches!(c, Command::Edit { .. }))
+        else {
+            panic!("{cmds:?}")
+        };
+        assert_eq!((*target_ts, body.as_str(), ranges.len()), (id, "hi 👍🏽 there now", 3));
+        assert!(*ts > id, "the edit has its own timestamp");
+        assert!(!cmds.iter().any(|c| matches!(c, Command::Send { .. })));
+        let m = msgs(&app).iter().find(|m| m.id == id).unwrap();
+        assert_eq!((m.body.as_str(), m.edited, m.delivery), ("hi 👍🏽 there now", true, Delivery::Sending));
+        assert_eq!(msgs(&app).len(), 2, "no new message row");
+        let o = app.open.as_ref().unwrap();
+        assert!(o.editing.is_none() && o.composer.text().trim().is_empty());
+
+        app.update(Message::Backend(Event::Sent { thread: alice(), ts: id, attachments: vec![], error: None }));
+        assert_eq!(msgs(&app).iter().find(|m| m.id == id).unwrap().delivery, Delivery::Sent);
+    }
+
+    #[test]
+    fn unchanged_or_cancelled_edits_send_nothing() {
+        let (mut app, mut rx) = app();
+        let id = with_own_message(&mut app, &mut rx, "same");
+        app.update(Message::Edit(id));
+        app.update(Message::Send);
+        app.update(Message::Edit(id));
+        type_text(&mut app, "!");
+        app.update(Message::CancelEdit);
+        assert!(app.open.as_ref().unwrap().composer.text().trim().is_empty());
+        app.update(Message::Send);
+        assert!(drain(&mut rx).iter().all(|c| matches!(c, Command::Typing { .. })));
+        assert!(!msgs(&app)[1].edited);
+    }
+
+    #[test]
+    fn only_recent_own_messages_can_be_edited_or_deleted_for_everyone() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(ME), 20, text(20, "old"))) }));
+        app.update(Message::Edit(20));
+        app.update(Message::Edit(10)); // Alice's
+        assert!(app.open.as_ref().unwrap().editing.is_none());
+        app.update(Message::DeleteForEveryone(20));
+        assert!(!msgs(&app)[1].deleted);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn delete_for_everyone_and_for_me() {
+        let (mut app, mut rx) = app();
+        let id = with_own_message(&mut app, &mut rx, "oops");
+        app.update(Message::Edit(id));
+        app.update(Message::ToggleDelete(Some((uuid(ME), id))));
+        app.update(Message::DeleteForEveryone(id));
+        let o = app.open.as_ref().unwrap();
+        assert!(o.deleting.is_none() && o.editing.is_none(), "menu closed, edit cancelled");
+        assert!(msgs(&app)[1].deleted);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::DeleteForEveryone { target_ts, .. }] if *target_ts == id));
+
+        app.update(Message::DeleteForMe(uuid(ALICE), 10));
+        assert_eq!(msgs(&app).len(), 1, "removed from the timeline");
+        let cmds = drain(&mut rx);
+        assert!(
+            matches!(cmds.as_slice(), [Command::DeleteForMe { author, target_ts: 10, thread }] if *author == uuid(ALICE) && *thread == alice()),
+            "{cmds:?}"
+        );
     }
 
     #[test]

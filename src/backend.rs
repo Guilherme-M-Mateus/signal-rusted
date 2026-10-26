@@ -23,11 +23,13 @@ use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretPar
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
-use presage::proto::data_message::{Quote as ProtoQuote, Reaction};
-use presage::proto::sync_message;
+use presage::proto::addressable_message::Author;
+use presage::proto::conversation_identifier::Identifier;
+use presage::proto::data_message::{Delete, Quote as ProtoQuote, Reaction};
+use presage::proto::sync_message::{self, Content as SyncContent, DeleteForMe, delete_for_me::MessageDeletes};
 use presage::proto::{
-    AttachmentPointer, BodyRange, DataMessage, GroupContextV2, ReceiptMessage, SyncMessage,
-    TypingMessage, receipt_message, typing_message,
+    AddressableMessage, AttachmentPointer, BodyRange, ConversationIdentifier, DataMessage, EditMessage,
+    GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage, receipt_message, typing_message,
 };
 use presage::store::{ContentsStore, StateStore, Thread};
 use presage::Manager;
@@ -63,6 +65,18 @@ pub enum Command {
         attachments: Vec<PathBuf>,
         quote: Option<QuoteRef>,
     },
+    /// Replaces our message `target_ts`; `attachments`/`quote` are the original's, which an edit keeps.
+    Edit {
+        thread: Thread,
+        target_ts: u64,
+        ts: u64,
+        body: String,
+        ranges: Vec<BodyRange>,
+        attachments: Vec<AttachmentPointer>,
+        quote: Option<QuoteRef>,
+    },
+    DeleteForEveryone { thread: Thread, target_ts: u64 },
+    DeleteForMe { thread: Thread, author: Uuid, target_ts: u64 },
     React { thread: Thread, target_author: Uuid, target_ts: u64, emoji: String, remove: bool },
     Typing { thread: Thread, started: bool },
     FetchAttachment(AttachmentPointer),
@@ -92,6 +106,7 @@ pub enum Event {
     Receipt { timestamps: Vec<u64>, level: Delivery },
     Typing { thread: Thread, who: Uuid, started: bool },
     /// `attachments` are the uploaded pointers, replacing the optimistic placeholders.
+    /// For an edit, `ts` is the edited message's id.
     Sent { thread: Thread, ts: u64, attachments: Vec<AttachmentPointer>, error: Option<String> },
     Attachment { key: String, path: Result<PathBuf, String> },
     Error(String),
@@ -112,6 +127,72 @@ pub fn attachment_key(p: &AttachmentPointer) -> String {
 
 pub fn group_id(master_key: &[u8; 32]) -> [u8; 32] {
     GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key)).get_group_identifier()
+}
+
+fn data_message(body: String, ranges: Vec<BodyRange>, attachments: Vec<AttachmentPointer>, quote: Option<QuoteRef>) -> DataMessage {
+    DataMessage {
+        body: (!body.is_empty()).then_some(body),
+        body_ranges: ranges,
+        attachments,
+        quote: quote.map(|q| ProtoQuote {
+            id: Some(q.id),
+            author_aci: Some(q.author.to_string()),
+            text: Some(q.text),
+            body_ranges: q.ranges,
+            r#type: Some(0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The `DataMessage` a body carries: its own, or an edit's new version.
+fn data_message_mut(body: &mut ContentBody) -> Option<&mut DataMessage> {
+    match body {
+        ContentBody::DataMessage(dm) | ContentBody::EditMessage(EditMessage { data_message: Some(dm), .. }) => Some(dm),
+        _ => None,
+    }
+}
+
+/// Timestamps of the stored rows holding `author`'s edits of message `target`
+/// (presage keys each edit by its own timestamp, not the original's).
+fn edit_rows(rows: impl IntoIterator<Item = Content>, author: Uuid, target: u64) -> Vec<u64> {
+    rows.into_iter()
+        .filter(|c| c.metadata.sender.raw_uuid() == author)
+        .filter(|c| {
+            let edit = match &c.body {
+                ContentBody::EditMessage(e) => Some(e),
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    content: Some(SyncContent::Sent(sync_message::Sent { edit_message: Some(e), .. })),
+                    ..
+                }) => Some(e),
+                _ => None,
+            };
+            edit.is_some_and(|e| e.target_sent_timestamp == Some(target))
+        })
+        .map(|c| c.metadata.client_timestamp.timestamp_millis() as u64)
+        .collect()
+}
+
+/// Sync telling our other devices that we deleted `author`'s message `ts` for ourselves.
+fn delete_for_me_sync(thread: &Thread, author: Uuid, ts: u64) -> SyncMessage {
+    let conversation = ConversationIdentifier {
+        identifier: Some(match thread {
+            Thread::Contact(id) => Identifier::ThreadServiceId(id.service_id_string()),
+            Thread::Group(key) => Identifier::ThreadGroupId(group_id(key).to_vec()),
+        }),
+    };
+    let message = AddressableMessage {
+        author: Some(Author::AuthorServiceId(ServiceId::Aci(author.into()).service_id_string())),
+        sent_timestamp: Some(ts),
+    };
+    SyncMessage {
+        content: Some(SyncContent::DeleteForMe(DeleteForMe {
+            message_deletes: vec![MessageDeletes { conversation: Some(conversation), messages: vec![message] }],
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
 }
 
 /// Starts the backend thread; the stream yields `Event::Started` first.
@@ -538,6 +619,31 @@ impl Backend {
                 self.emit(Event::Sent { thread, ts, attachments, error });
                 self.refresh().await;
             }
+            Command::Edit { thread, target_ts, ts, body, ranges, attachments, quote } => {
+                let edit = EditMessage {
+                    target_sent_timestamp: Some(target_ts),
+                    data_message: Some(data_message(body, ranges, attachments, quote)),
+                };
+                // presage stores the edit as its own row (keyed by `ts`); `Timeline` folds it onto the original.
+                let error = self.send_body(&thread, edit, ts).await.err().map(|e| format!("{e:#}"));
+                self.emit(Event::Sent { thread, ts: target_ts, attachments: Vec::new(), error });
+                self.refresh().await;
+            }
+            Command::DeleteForEveryone { thread, target_ts } => {
+                let dm = DataMessage {
+                    delete: Some(Delete { target_sent_timestamp: Some(target_ts) }),
+                    ..Default::default()
+                };
+                // presage's save_message turns our stored copy into the deleted tombstone.
+                let r = self.send_body(&thread, dm, now_ms()).await;
+                self.report("delete for everyone", r);
+                self.refresh().await;
+            }
+            Command::DeleteForMe { thread, author, target_ts } => {
+                let r = self.delete_for_me(&thread, author, target_ts).await;
+                self.report("delete message", r);
+                self.refresh().await;
+            }
             Command::React { thread, target_author, target_ts, emoji, remove } => {
                 let dm = DataMessage {
                     reaction: Some(Reaction {
@@ -629,34 +735,33 @@ impl Backend {
                 tracing::warn!(%e, "failed to cache sent attachment");
             }
         }
-        let dm = DataMessage {
-            body: (!body.is_empty()).then_some(body),
-            body_ranges: ranges,
-            attachments,
-            quote: quote.map(|q| ProtoQuote {
-                id: Some(q.id),
-                author_aci: Some(q.author.to_string()),
-                text: Some(q.text),
-                body_ranges: q.ranges,
-                r#type: Some(0),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let dm = data_message(body, ranges, attachments, quote);
         let sent = dm.attachments.clone();
         self.send_body(thread, dm, ts).await?;
         Ok(sent)
     }
 
+    /// Deletes the message and its edits locally, then tells our other devices to do the same.
+    async fn delete_for_me(&mut self, thread: &Thread, author: Uuid, ts: u64) -> anyhow::Result<()> {
+        let mut store = self.manager.store().clone();
+        let rows = store.messages(thread, ts..).await?;
+        for row_ts in edit_rows(rows.flatten(), author, ts).into_iter().chain([ts]) {
+            store.delete_message(thread, row_ts).await?;
+        }
+        let me = ServiceId::Aci(self.me.into());
+        self.manager.send_message(me, delete_for_me_sync(thread, author, ts), now_ms()).await?;
+        Ok(())
+    }
+
     async fn send_body(&mut self, thread: &Thread, body: impl Into<ContentBody>, ts: u64) -> anyhow::Result<()> {
         let mut body = body.into();
-        if let ContentBody::DataMessage(dm) = &mut body {
+        if let Some(dm) = data_message_mut(&mut body) {
             dm.timestamp = Some(ts);
         }
         match thread {
             Thread::Contact(id) => self.manager.send_message(*id, body, ts).await?,
             Thread::Group(key) => {
-                if let ContentBody::DataMessage(dm) = &mut body {
+                if let Some(dm) = data_message_mut(&mut body) {
                     let revision = self.manager.store().group(*key).await?.map_or(0, |g| g.revision);
                     dm.group_v2 = Some(GroupContextV2 {
                         master_key: Some(key.to_vec()),
@@ -823,6 +928,55 @@ mod tests {
         assert_eq!(group_id(&[1; 32]), group_id(&[1; 32]));
         assert_ne!(group_id(&[1; 32]), group_id(&[2; 32]));
         assert_ne!(group_id(&[1; 32]), [1; 32]);
+    }
+
+    #[test]
+    fn timestamp_and_group_context_reach_into_edits() {
+        let mut body: ContentBody =
+            EditMessage { target_sent_timestamp: Some(10), data_message: Some(DataMessage::default()) }.into();
+        data_message_mut(&mut body).unwrap().timestamp = Some(12);
+        let ContentBody::EditMessage(e) = &body else { panic!() };
+        assert_eq!(e.data_message.as_ref().unwrap().timestamp, Some(12));
+        assert!(data_message_mut(&mut ContentBody::from(SyncMessage::default())).is_none());
+    }
+
+    #[test]
+    fn edit_rows_find_own_and_synced_edits_of_the_target() {
+        use crate::timeline::tests::{content, text, uuid};
+        let edit = |target| EditMessage { target_sent_timestamp: Some(target), data_message: Some(text(0, "v2")) };
+        let synced = SyncMessage {
+            content: Some(SyncContent::Sent(sync_message::Sent { edit_message: Some(edit(10)), ..Default::default() })),
+            ..Default::default()
+        };
+        let rows = vec![
+            content(uuid(1), 10, text(10, "v1")),
+            content(uuid(1), 12, edit(10)),
+            content(uuid(1), 13, edit(11)),
+            content(uuid(2), 14, edit(10)),
+            content(uuid(1), 15, synced),
+        ];
+        assert_eq!(edit_rows(rows, uuid(1), 10), [12, 15]);
+    }
+
+    #[test]
+    fn delete_for_me_sync_addresses_the_message() {
+        let alice = Uuid::from_bytes([2; 16]);
+        let sync = delete_for_me_sync(&Thread::Contact(ServiceId::Aci(alice.into())), alice, 10);
+        let Some(SyncContent::DeleteForMe(d)) = sync.content else { panic!() };
+        let m = &d.message_deletes[0];
+        assert_eq!(
+            m.conversation.as_ref().unwrap().identifier,
+            Some(Identifier::ThreadServiceId(alice.to_string()))
+        );
+        assert_eq!(m.messages[0].author, Some(Author::AuthorServiceId(alice.to_string())));
+        assert_eq!(m.messages[0].sent_timestamp, Some(10));
+        let group = delete_for_me_sync(&Thread::Group([1; 32]), alice, 10);
+        let Some(SyncContent::DeleteForMe(d)) = group.content else { panic!() };
+        assert_eq!(
+            d.message_deletes[0].conversation.as_ref().unwrap().identifier,
+            Some(Identifier::ThreadGroupId(group_id(&[1; 32]).to_vec())),
+            "groups are addressed by their public id, never the master key"
+        );
     }
 
     #[test]

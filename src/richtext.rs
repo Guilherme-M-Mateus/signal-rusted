@@ -189,6 +189,64 @@ fn parse_into(input: &str, body: &mut String, ranges: &mut Vec<BodyRange>, liter
     }
 }
 
+/// Inverse of [`parse_markup`], for putting a sent message back in the composer.
+/// Round-trips anything `parse_markup` produces; ranges that start or end mid-word
+/// (possible from other clients) have no markup form and come back best-effort.
+/// shortcut: mentions are dropped (their U+FFFC stays); keep them if edits need them.
+pub fn to_markup(body: &str, ranges: &[BodyRange]) -> String {
+    // Opening order; mono must be innermost since nothing is parsed inside it.
+    const ORDER: [ProtoStyle; 5] =
+        [ProtoStyle::Spoiler, ProtoStyle::Bold, ProtoStyle::Italic, ProtoStyle::Strikethrough, ProtoStyle::Monospace];
+    let delim = |s: ProtoStyle| DELIMS.iter().find(|(_, d)| *d == s).map_or("", |(d, _)| d);
+    let has = |st: &Style, s: ProtoStyle| match s {
+        ProtoStyle::Spoiler => st.spoiler,
+        ProtoStyle::Bold => st.bold,
+        ProtoStyle::Italic => st.italic,
+        ProtoStyle::Strikethrough => st.strike,
+        ProtoStyle::Monospace => st.mono,
+        ProtoStyle::None => false,
+    };
+    let mut out = String::new();
+    let mut open: Vec<ProtoStyle> = Vec::new();
+    let close_to = |out: &mut String, open: &mut Vec<ProtoStyle>, want: &[ProtoStyle]| loop {
+        let missing = want.iter().any(|s| !open.contains(s));
+        let bad = open.iter().any(|s| !want.contains(s)) || (missing && open.contains(&ProtoStyle::Monospace));
+        match open.pop() {
+            Some(s) if bad => out.push_str(delim(s)),
+            Some(s) => break open.push(s),
+            None => break,
+        }
+    };
+    for seg in segments(body, ranges) {
+        let want: Vec<ProtoStyle> = ORDER.into_iter().filter(|s| has(&seg.style, *s)).collect();
+        close_to(&mut out, &mut open, &want);
+        for s in want.iter().filter(|s| !open.contains(s)).copied().collect::<Vec<_>>() {
+            out.push_str(delim(s));
+            open.push(s);
+        }
+        if open.contains(&ProtoStyle::Monospace) {
+            out.push_str(&seg.text);
+            continue;
+        }
+        let mut rest = seg.text.as_str();
+        while let Some(c) = rest.chars().next() {
+            match DELIMS.iter().find(|(d, _)| rest.starts_with(d)) {
+                Some((d, _)) => {
+                    out.push('\\');
+                    out.push_str(d);
+                    rest = &rest[d.len()..];
+                }
+                None => {
+                    out.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+        }
+    }
+    close_to(&mut out, &mut open, &[]);
+    out
+}
+
 fn find_close(input: &str, open: usize, delim: &str, prev: Option<char>) -> Option<usize> {
     if !is_boundary(prev) {
         return None;
@@ -377,6 +435,35 @@ mod tests {
                 seg(")!", Style::default()),
             ]
         );
+    }
+
+    #[test]
+    fn to_markup_round_trips_composer_markup() {
+        for input in [
+            "plain",
+            "*b* _i_ ~s~ `m` ||sp||",
+            "*bold _both_*",
+            "_ital *both*_ after",
+            "||*secret bold*|| `*not bold*`",
+            "*`code`* (*yes*)!",
+            "👍🏽 *ok* _é_ ||🎉 party|| 😀 ~gone~",
+        ] {
+            let (body, ranges) = parse_markup(input);
+            let markup = to_markup(&body, &ranges);
+            let (body2, ranges2) = parse_markup(&markup);
+            assert_eq!(body2, body, "{input} -> {markup}");
+            assert_eq!(segments(&body2, &ranges2), segments(&body, &ranges), "{input} -> {markup}");
+        }
+        assert_eq!(to_markup("👍🏽 ok", &[style_range(5, 2, ProtoStyle::Bold)]), "👍🏽 *ok*", "UTF-16 offsets");
+    }
+
+    #[test]
+    fn to_markup_escapes_literal_delimiters() {
+        for body in ["a *b* c", "x ||y|| _z_ ~w~", r"back\slash \*", "2*3*4"] {
+            let markup = to_markup(body, &[]);
+            assert_eq!(parse_markup(&markup), (body.to_owned(), vec![]), "{body} -> {markup}");
+        }
+        assert_eq!(to_markup("a *b*", &[]), r"a \*b\*");
     }
 
     #[test]
