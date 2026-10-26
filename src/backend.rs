@@ -250,13 +250,11 @@ async fn main(
         attachments_dir: data_dir.join("attachments"),
         open: None,
         group_ids: HashMap::new(),
+        storage_synced: false,
     };
     b.emit(Event::Ready { me: b.me });
     b.refresh().await;
-    if let Err(e) = b.sync_storage().await {
-        b.emit(Event::Error(format!("Couldn't sync your chat list: {e:#}")));
-    }
-    b.refresh().await;
+    b.try_sync_storage().await;
 
     // Receive loop on a clone; incoming content is funneled back through this channel so
     // all state (read markers, open thread) stays on one task.
@@ -369,6 +367,7 @@ struct Backend {
     open: Option<Thread>,
     /// group identifier -> master key, to route typing messages.
     group_ids: HashMap<[u8; 32], [u8; 32]>,
+    storage_synced: bool,
 }
 
 impl Backend {
@@ -437,6 +436,16 @@ impl Backend {
         }
         self.state.set_storage(plan.listed, plan.names);
         Ok(())
+    }
+
+    /// A failure (usually being offline) isn't shown: the last synced list is cached in
+    /// `AppState`, and the next reconnect retries.
+    async fn try_sync_storage(&mut self) {
+        match self.sync_storage().await {
+            Ok(()) => self.storage_synced = true,
+            Err(e) => tracing::warn!("storage sync failed, will retry on reconnect: {e:#}"),
+        }
+        self.refresh().await;
     }
 
     /// Rebuilds the conversation list from the store.
@@ -689,6 +698,8 @@ impl Backend {
 
     async fn received(&mut self, r: Received) {
         match r {
+            // QueueEmpty means we're connected again: retry a storage sync that failed offline.
+            Received::QueueEmpty if !self.storage_synced => self.try_sync_storage().await,
             Received::QueueEmpty | Received::Contacts => self.refresh().await,
             Received::DecryptionError(id) => {
                 tracing::warn!(sender = %id.service_id_string(), "decryption error");
