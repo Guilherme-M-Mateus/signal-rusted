@@ -25,13 +25,13 @@ use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::proto::addressable_message::Author;
 use presage::proto::conversation_identifier::Identifier;
-use presage::proto::data_message::{Delete, Flags, Quote as ProtoQuote, Reaction};
+use presage::proto::data_message::{Delete, Flags, Quote as ProtoQuote, Reaction, Sticker};
 use presage::proto::sync_message::{self, Content as SyncContent, DeleteForMe, delete_for_me::MessageDeletes};
 use presage::proto::{
     AddressableMessage, AttachmentPointer, BodyRange, ConversationIdentifier, DataMessage, EditMessage,
     GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage, receipt_message, typing_message,
 };
-use presage::store::{ContentsStore, StateStore, Thread};
+use presage::store::{ContentsStore, StateStore, StickerPack, Thread};
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use tokio::sync::mpsc;
@@ -85,6 +85,56 @@ pub enum Command {
     /// Disappearing-message timer in seconds (0 = off); 1:1 chats only.
     SetTimer { thread: Thread, seconds: u32 },
     Search(String),
+    /// Re-reads the installed sticker packs (answered with `Event::Stickers`).
+    LoadStickers,
+    /// `sticker` has no `data`: the backend uploads the pack's stored image as it.
+    SendSticker { thread: Thread, ts: u64, sticker: Sticker },
+    InstallStickerPack { id: Vec<u8>, key: Vec<u8> },
+}
+
+/// An installed pack as the picker shows it.
+#[derive(Clone, Debug)]
+pub struct Pack {
+    pub id: Vec<u8>,
+    pub key: Vec<u8>,
+    pub title: String,
+    pub stickers: Vec<PackSticker>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackSticker {
+    pub id: u32,
+    pub emoji: String,
+    pub image: iced::widget::image::Handle,
+}
+
+/// Packs by title, keeping only stickers whose image is downloaded (and packs that have one).
+pub fn picker_packs(packs: impl IntoIterator<Item = StickerPack>) -> Vec<Pack> {
+    let mut out: Vec<Pack> = packs
+        .into_iter()
+        .map(|p| Pack {
+            title: if p.manifest.title.trim().is_empty() { "Stickers".into() } else { p.manifest.title },
+            stickers: p
+                .manifest
+                .stickers
+                .into_iter()
+                .filter_map(|s| {
+                    let image = iced::widget::image::Handle::from_bytes(s.bytes?);
+                    Some(PackSticker { id: s.id, emoji: s.emoji.unwrap_or_default(), image })
+                })
+                .collect(),
+            id: p.id,
+            key: p.key,
+        })
+        .filter(|p| !p.stickers.is_empty())
+        .collect();
+    out.sort_by_cached_key(|p| (p.title.to_lowercase(), p.id.clone()));
+    out
+}
+
+/// A sticker message: Signal clients upload the sticker image and send it as `data`.
+pub fn sticker_message(sticker: Sticker, data: AttachmentPointer) -> DataMessage {
+    DataMessage { sticker: Some(Sticker { data: Some(data), ..sticker }), ..Default::default() }
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +215,7 @@ pub enum Event {
     Expiring { thread: Thread, expires: Vec<(Uuid, u64, u64)> },
     /// Disappeared messages, already deleted from the store: (author, sent ts).
     Expired { thread: Thread, ids: Vec<(Uuid, u64)> },
+    Stickers { packs: Vec<Pack>, recent: Vec<(Vec<u8>, u32)> },
     Error(String),
     /// Neutral status banner (e.g. history import in progress); `None` clears it.
     Notice(Option<String>),
@@ -340,7 +391,7 @@ enum TransferArchive {
 
 /// Waits for the phone's history upload, downloads and imports it.
 /// Returns the newest timestamp per imported thread (to mark them read).
-async fn import_history(manager: Mgr, data_dir: PathBuf, key: [u8; 32], me: Uuid) -> anyhow::Result<Vec<(Thread, u64)>> {
+async fn import_history(mut manager: Mgr, data_dir: PathBuf, key: [u8; 32], me: Uuid) -> anyhow::Result<Vec<(Thread, u64)>> {
     let mut push = manager.push_service();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     let archive = loop {
@@ -384,6 +435,12 @@ async fn import_history(manager: Mgr, data_dir: PathBuf, key: [u8; 32], me: Uuid
         *e = (*e).max(ts);
         store.save_message(&thread, content).await?;
     }
+    // The backup lists the phone's installed packs (there's no other way to sync existing ones).
+    for (id, key) in &imported.sticker_packs {
+        if let Err(e) = manager.install_sticker_pack(id, key).await {
+            tracing::warn!(%e, "failed to install sticker pack from history");
+        }
+    }
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(data_dir.join("transfer.key"));
     Ok(newest.into_iter().collect())
@@ -419,6 +476,7 @@ async fn main(
         threads: Vec::new(),
     };
     b.emit(Event::Ready { me: b.me });
+    b.emit_stickers().await;
     b.refresh().await;
     b.try_sync_storage().await;
 
@@ -704,19 +762,20 @@ impl Backend {
             }
             Command::Close => self.open = None,
             Command::Send { thread, ts, body, ranges, attachments, quote, voice_note } => {
-                let (attachments, error) = match self.send(&thread, ts, body, ranges, attachments, quote, voice_note).await {
-                    Ok(a) => (a, None),
-                    Err(e) => (Vec::new(), Some(format!("{e:#}"))),
-                };
-                self.state.mark_read(&thread, ts);
-                // presage put the thread's timer on the message; its countdown starts now.
-                let timer = self.manager.store().expire_timer(&thread).await.ok().flatten().map_or(0, |(t, _)| t);
-                if error.is_none() && timer > 0 {
-                    self.state.start_expiry(&thread, self.me, ts, crate::state::expires_at(ts, timer));
-                    self.emit_expiring(&thread);
+                let r = self.send(&thread, ts, body, ranges, attachments, quote, voice_note).await;
+                self.sent(thread, ts, r).await;
+            }
+            Command::SendSticker { thread, ts, sticker } => {
+                let r = self.send_sticker(&thread, ts, sticker).await.map(|p| vec![p]);
+                self.sent(thread, ts, r).await;
+            }
+            Command::LoadStickers => self.emit_stickers().await,
+            Command::InstallStickerPack { id, key } => {
+                // shortcut: downloads the whole pack on the protocol task (a few seconds); spawn it if that hurts.
+                let r = self.manager.install_sticker_pack(&id, &key).await;
+                if self.report("install sticker pack", r).is_some() {
+                    self.emit_stickers().await;
                 }
-                self.emit(Event::Sent { thread, ts, attachments, error });
-                self.refresh().await;
             }
             Command::SetTimer { thread, seconds } => {
                 let ts = now_ms();
@@ -798,6 +857,57 @@ impl Backend {
                 self.emit(Event::SearchResults { query, results });
             }
         }
+    }
+
+    async fn sent(&mut self, thread: Thread, ts: u64, r: anyhow::Result<Vec<AttachmentPointer>>) {
+        let (attachments, error) = match r {
+            Ok(a) => (a, None),
+            Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+        };
+        self.state.mark_read(&thread, ts);
+        // presage put the thread's timer on the message; its countdown starts now.
+        let timer = self.manager.store().expire_timer(&thread).await.ok().flatten().map_or(0, |(t, _)| t);
+        if error.is_none() && timer > 0 {
+            self.state.start_expiry(&thread, self.me, ts, crate::state::expires_at(ts, timer));
+            self.emit_expiring(&thread);
+        }
+        self.emit(Event::Sent { thread, ts, attachments, error });
+        self.refresh().await;
+    }
+
+    async fn emit_stickers(&self) {
+        let packs = self.manager.store().sticker_packs().await;
+        if let Some(packs) = self.report("load sticker packs", packs) {
+            let recent = self.state.recent_stickers.clone();
+            self.emit(Event::Stickers { packs: picker_packs(packs.flatten()), recent });
+        }
+    }
+
+    /// Uploads the installed pack's image as the sticker's attachment and sends it.
+    async fn send_sticker(&mut self, thread: &Thread, ts: u64, sticker: Sticker) -> anyhow::Result<AttachmentPointer> {
+        use anyhow::Context;
+        let pack_id = sticker.pack_id().to_vec();
+        let meta = self.manager.sticker_metadata(&pack_id, sticker.sticker_id()).await?.context("sticker pack not installed")?;
+        let data = meta.bytes.context("sticker not downloaded yet")?;
+        let spec = AttachmentSpec {
+            content_type: meta.content_type.filter(|c| !c.is_empty()).unwrap_or_else(|| "image/webp".into()),
+            length: data.len(),
+            file_name: None,
+            preview: None,
+            voice_note: None,
+            borderless: None,
+            width: None,
+            height: None,
+            caption: None,
+            blur_hash: None,
+        };
+        let pointer = self.manager.upload_attachments(vec![(spec, data.clone())]).await?.into_iter().next().context("no upload result")??;
+        if let Err(e) = tokio::fs::write(self.cache_path(&pointer), &data).await {
+            tracing::warn!(%e, "failed to cache sent sticker");
+        }
+        self.send_body(thread, sticker_message(sticker.clone(), pointer.clone()), ts).await?;
+        self.state.sent_sticker((pack_id, sticker.sticker_id()));
+        Ok(pointer)
     }
 
     fn cache_path(&self, p: &AttachmentPointer) -> PathBuf {
@@ -1086,6 +1196,52 @@ impl Backend {
 mod tests {
     use super::*;
     use crate::timeline::tests::{content, text, uuid};
+
+    fn pack(id: u8, title: &str, stickers: &[(u32, bool)]) -> StickerPack {
+        use presage::store::{Sticker as StoredSticker, StickerPackManifest};
+        StickerPack {
+            id: vec![id],
+            key: vec![id; 32],
+            manifest: StickerPackManifest {
+                title: title.into(),
+                author: String::new(),
+                cover: None,
+                stickers: stickers
+                    .iter()
+                    .map(|(sid, downloaded)| StoredSticker {
+                        id: *sid,
+                        emoji: Some("😀".into()),
+                        content_type: None,
+                        bytes: downloaded.then(|| vec![0u8; 4]),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn picker_packs_sort_by_title_and_skip_undownloaded_stickers() {
+        let packs = picker_packs([
+            pack(1, "zebra", &[(0, true)]),
+            pack(2, "", &[(0, true), (1, false), (2, true)]),
+            pack(3, "Apes", &[(0, true)]),
+            pack(4, "Empty", &[(0, false)]),
+        ]);
+        let shape: Vec<_> = packs.iter().map(|p| (p.title.as_str(), p.stickers.iter().map(|s| s.id).collect::<Vec<_>>())).collect();
+        assert_eq!(shape, [("Apes", vec![0]), ("Stickers", vec![0, 2]), ("zebra", vec![0])]);
+        assert_eq!(packs[0].key, vec![3; 32]);
+    }
+
+    #[test]
+    fn sticker_message_carries_pack_and_uploaded_image() {
+        let s = Sticker { pack_id: Some(vec![1]), pack_key: Some(vec![2]), sticker_id: Some(7), emoji: Some("🐱".into()), data: None };
+        let p = AttachmentPointer { cdn_number: Some(3), content_type: Some("image/webp".into()), ..Default::default() };
+        let dm = sticker_message(s, p.clone());
+        let got = dm.sticker.unwrap();
+        assert_eq!((got.pack_id(), got.pack_key(), got.sticker_id(), got.emoji()), (&[1u8][..], &[2u8][..], 7, "🐱"));
+        assert_eq!(got.data, Some(p));
+        assert!(dm.body.is_none() && dm.attachments.is_empty(), "the image travels only as the sticker's data");
+    }
 
     #[test]
     fn countdowns_start_on_read_for_incoming_and_on_send_for_outgoing() {

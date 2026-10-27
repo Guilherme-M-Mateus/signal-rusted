@@ -22,6 +22,9 @@ pub struct AppState {
     /// Disappearing messages whose countdown has started.
     #[serde(default)]
     pub expiring: Vec<Expiry>,
+    /// Recently sent stickers, newest first: (pack id, sticker id).
+    #[serde(default)]
+    pub recent_stickers: Vec<(Vec<u8>, u32)>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -43,6 +46,16 @@ pub fn expires_at(start_ms: u64, timer_s: u32) -> u64 {
 /// Seconds left, rounded up so 0 only means gone.
 pub fn remaining_s(expires_at: u64, now_ms: u64) -> u64 {
     expires_at.saturating_sub(now_ms).div_ceil(1000)
+}
+
+/// Signal Desktop's recents row holds this many.
+pub const RECENT_STICKERS: usize = 24;
+
+/// Moves `sticker` to the front of `recent`, dropping the oldest past the cap.
+pub fn push_recent(recent: &mut Vec<(Vec<u8>, u32)>, sticker: (Vec<u8>, u32)) {
+    recent.retain(|s| *s != sticker);
+    recent.insert(0, sticker);
+    recent.truncate(RECENT_STICKERS);
 }
 
 /// Inverse of `thread_key`.
@@ -124,6 +137,11 @@ impl AppState {
         due
     }
 
+    pub fn sent_sticker(&mut self, sticker: (Vec<u8>, u32)) {
+        push_recent(&mut self.recent_stickers, sticker);
+        self.save();
+    }
+
     fn save(&self) {
         let tmp = self.path.with_extension("tmp");
         let ok = serde_json::to_vec(self)
@@ -168,6 +186,24 @@ mod tests {
         let s2 = AppState::load(&path);
         assert!(s2.listed.contains("x"));
         assert_eq!(s2.profile_names["u"], "Ana");
+    }
+
+    #[test]
+    fn recent_stickers_persist_newest_first_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, br#"{"last_read":{}}"#).unwrap();
+        let mut s = AppState::load(&path);
+        assert!(s.recent_stickers.is_empty(), "older files load without the field");
+        s.sent_sticker((vec![1], 1));
+        s.sent_sticker((vec![1], 2));
+        s.sent_sticker((vec![1], 1));
+        assert_eq!(AppState::load(&path).recent_stickers, [(vec![1], 1), (vec![1], 2)]);
+        for i in 0..30 {
+            s.sent_sticker((vec![2], i));
+        }
+        assert_eq!(s.recent_stickers.len(), RECENT_STICKERS);
+        assert_eq!(s.recent_stickers[0], (vec![2], 29));
     }
 
     #[test]

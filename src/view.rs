@@ -13,9 +13,10 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, Theme, color};
 use presage::libsignal_service::prelude::Uuid;
+use presage::proto::data_message::Sticker;
 use presage::proto::{AttachmentPointer, BodyRange};
 
-use crate::app::{App, Attach, Message, Open, Screen, TIMERS, display_name};
+use crate::app::{App, Attach, Message, Open, Screen, StickerTab, TIMERS, display_name};
 use crate::backend::{attachment_key, now_ms};
 use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label, short_duration};
 use crate::{emoji, richtext};
@@ -487,6 +488,38 @@ fn attachment<'a>(app: &'a App, a: &AttachmentPointer, fg: Color) -> Element<'a,
     }
 }
 
+/// Signal's sticker size in the timeline.
+const STICKER: f32 = 128.0;
+
+/// Id of a sticker picker cell, for tests.
+fn sticker_cell_id(pack: &[u8], id: u32) -> String {
+    format!("sticker-{}-{id}", hex::encode(pack))
+}
+
+/// The installed pack's image, else the message's downloaded copy; an uninstalled pack offers installing.
+fn sticker<'a>(app: &'a App, m: &'a Msg, s: &'a Sticker, fg: Color) -> Element<'a, Message> {
+    let pack = app.packs.iter().find(|p| p.id == s.pack_id());
+    let installed = pack.and_then(|p| p.stickers.iter().find(|x| x.id == s.sticker_id())).map(|x| x.image.clone());
+    let downloaded = m.attachments.last().and_then(|a| match app.attachments.get(&attachment_key(a)) {
+        Some(Attach::Ready(p)) => Some(image::Handle::from_path(p)),
+        _ => None,
+    });
+    let mut col = Column::new().spacing(4);
+    col = match (installed.or(downloaded), m.attachments.last()) {
+        (Some(h), _) => col.push(image(h).width(STICKER).height(STICKER)),
+        (None, Some(a)) => col.push(attachment(app, a, fg)),
+        (None, None) => col.push(text(m.preview()).color(fg)),
+    };
+    if pack.is_none() && s.pack_key.is_some() {
+        col = col.push(
+            button(text("Install pack").size(13))
+                .on_press(Message::InstallPack(s.pack_id().to_vec(), s.pack_key().to_vec()))
+                .style(button::secondary),
+        );
+    }
+    col.into()
+}
+
 fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Element<'a, Message> {
     if let Kind::System(s) = &m.kind {
         return center(text(s.clone()).size(13).style(|t: &Theme| text::Style { color: Some(muted(t)) }))
@@ -495,7 +528,9 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
             .into();
     }
     let key = (m.author, m.id);
-    let fg = if m.outgoing { Color::WHITE } else { app.theme().palette().text };
+    let is_sticker = m.sticker.is_some() && !m.deleted;
+    // Stickers have no bubble, so their footer sits on the timeline background.
+    let fg = if m.outgoing && !is_sticker { Color::WHITE } else { app.theme().palette().text };
     let mut bubble = Column::new().spacing(4);
     if show_author {
         bubble = bubble.push(text(display_name(&app.names, m.author)).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).color(color!(0x7aa5f7)));
@@ -522,8 +557,12 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
                 }),
             );
         }
-        for a in &m.attachments {
-            bubble = bubble.push(attachment(app, a, fg));
+        if let Some(s) = &m.sticker {
+            bubble = bubble.push(sticker(app, m, s, fg));
+        } else {
+            for a in &m.attachments {
+                bubble = bubble.push(attachment(app, a, fg));
+            }
         }
         if !m.body.is_empty() {
             bubble = bubble.push(container(rich(&m.body, &m.ranges, &app.names, m.id, &o.spoilers, fg)).style(move |_| container::Style {
@@ -549,7 +588,13 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
     bubble = bubble.push(footer);
 
     let bubble = container(bubble).padding([8, 12]).max_width(520).style(move |t: &Theme| container::Style {
-        background: Some(if m.outgoing { Background::Color(BLUE) } else { surface(t).into() }),
+        background: if is_sticker {
+            None
+        } else if m.outgoing {
+            Some(Background::Color(BLUE))
+        } else {
+            Some(surface(t).into())
+        },
         border: Border { radius: 18.0.into(), ..Default::default() },
         ..Default::default()
     });
@@ -623,6 +668,9 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     let mut col = Column::new().spacing(6).padding([8, 16]);
     if let Some(p) = &o.picker {
         col = col.push(emoji_picker(p));
+    }
+    if let Some(tab) = &o.stickers {
+        col = col.push(sticker_picker(app, tab));
     }
     if let Some(q) = &o.quote {
         let who = if q.author == app.me { "You".into() } else { display_name(&app.names, q.author) };
@@ -720,6 +768,7 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         row![
             button(text("📎").size(18)).on_press(Message::Attach).style(button::text),
             button(text("😀").size(18)).on_press(Message::TogglePicker).style(button::text),
+            button(text("🗒").size(18)).on_press(Message::ToggleStickers).style(button::text),
             container(editor).max_height(180).width(Length::Fill),
             if draft.trim().is_empty() && o.files.is_empty() {
                 button(text("🎤").size(18)).on_press(Message::Record).style(button::text)
@@ -767,11 +816,67 @@ fn emoji_picker(p: &crate::app::Picker) -> Element<'_, Message> {
     .into()
 }
 
+fn sticker_picker<'a>(app: &'a App, tab: &StickerTab) -> Element<'a, Message> {
+    let tab_style = |selected: bool| {
+        move |t: &Theme, s| {
+            let mut st = button::text(t, s);
+            if selected {
+                st.background = Some(t.palette().background.into());
+            }
+            st
+        }
+    };
+    let mut tabs = row![button(text("🕘").size(18)).on_press(Message::StickerTab(StickerTab::Recent)).style(tab_style(*tab == StickerTab::Recent))]
+        .spacing(2)
+        .align_y(Alignment::Center);
+    for p in &app.packs {
+        let selected = *tab == StickerTab::Pack(p.id.clone());
+        // Signal shows the pack's cover; its first sticker is close enough.
+        let icon: Element<_> = match p.stickers.first() {
+            Some(s) => image(s.image.clone()).width(24).height(24).into(),
+            None => text(p.title.clone()).size(13).into(),
+        };
+        tabs = tabs.push(button(icon).padding(4).on_press(Message::StickerTab(StickerTab::Pack(p.id.clone()))).style(tab_style(selected)));
+    }
+    let cells: Vec<(&[u8], &crate::backend::PackSticker)> = match tab {
+        StickerTab::Recent => app
+            .recent_stickers
+            .iter()
+            .filter_map(|(pack, id)| {
+                let p = app.packs.iter().find(|p| p.id == *pack)?;
+                Some((p.id.as_slice(), p.stickers.iter().find(|s| s.id == *id)?))
+            })
+            .collect(),
+        StickerTab::Pack(id) => app.packs.iter().filter(|p| p.id == *id).flat_map(|p| p.stickers.iter().map(|s| (p.id.as_slice(), s))).collect(),
+    };
+    let title = match tab {
+        StickerTab::Recent if cells.is_empty() => "No recent stickers",
+        StickerTab::Recent => "Recently used",
+        StickerTab::Pack(id) => app.packs.iter().find(|p| p.id == *id).map_or("", |p| p.title.as_str()),
+    };
+    let grid = cells
+        .into_iter()
+        .fold(row![].spacing(4), |r, (pack, s)| {
+            let cell = container(image(s.image.clone()).width(72).height(72)).id(sticker_cell_id(pack, s.id));
+            r.push(button(cell).padding(2).on_press(Message::SendSticker(pack.to_vec(), s.id)).style(button::text))
+        })
+        .wrap();
+    container(column![tabs, text(title).size(13).style(|t: &Theme| text::Style { color: Some(muted(t)) }), scrollable(grid).height(240)].spacing(6))
+        .width(Length::Fill)
+        .padding(8)
+        .style(|t: &Theme| container::Style {
+            background: Some(surface(t).into()),
+            border: Border { radius: 12.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests {
     use super::*;
-    use crate::app::tests::{alice, app, fake_audio, open_alice, voice_note};
+    use crate::app::tests::{alice, app, fake_audio, fake_packs, open_alice, voice_note};
     use crate::backend::{Command, Event};
     use crate::timeline::tests::{content, uuid};
     use iced_test::simulator;
@@ -990,6 +1095,72 @@ mod tests {
         click(&mut app, "Delete for me");
         assert!(matches!(rx.try_recv(), Ok(Command::DeleteForMe { target_ts: 10, .. })));
         assert_eq!(app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.len(), 1);
+    }
+
+    /// An incoming sticker from Alice (ts 50) from pack `pack`.
+    fn incoming_sticker(app: &mut App, pack: u8) {
+        let s = Sticker {
+            pack_id: Some(vec![pack]),
+            pack_key: Some(vec![pack; 32]),
+            sticker_id: Some(1),
+            emoji: Some("🐱".into()),
+            data: Some(AttachmentPointer { content_type: Some("image/webp".into()), digest: Some(vec![0x51]), cdn_number: Some(3), ..Default::default() }),
+        };
+        let dm = presage::proto::DataMessage { timestamp: Some(50), sticker: Some(s), ..Default::default() };
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(2), 50, dm)) }));
+    }
+
+    #[test]
+    fn sticker_picker_opens_and_clicking_a_sticker_sends_it() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        fake_packs(&mut app, vec![(vec![9], 3)]);
+        click(&mut app, "🗒");
+        assert!(simulator(view(&app)).find("Recently used").is_ok(), "recents tab first");
+        app.update(Message::StickerTab(StickerTab::Pack(vec![8])));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Cats").is_ok(), "pack title");
+        ui.click(iced::widget::Id::from(sticker_cell_id(&[8], 2))).expect("sticker cell");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        assert!(msgs.iter().any(|m| matches!(m, Message::SendSticker(p, 2) if *p == [8])), "{msgs:?}");
+        for m in msgs {
+            app.update(m);
+        }
+        assert!(crate::app::tests::drain(&mut rx).iter().any(|c| matches!(c, Command::SendSticker { .. })));
+        assert!(simulator(view(&app)).find("Cats").is_err(), "picker closed");
+    }
+
+    #[test]
+    fn received_sticker_from_an_uninstalled_pack_offers_install() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        fake_packs(&mut app, Vec::new());
+        incoming_sticker(&mut app, 8);
+        assert!(simulator(view(&app)).find("Install pack").is_err(), "installed pack: just the image");
+        incoming_sticker(&mut app, 5);
+        click(&mut app, "Install pack");
+        let cmds = crate::app::tests::drain(&mut rx);
+        assert!(cmds.iter().any(|c| matches!(c, Command::InstallStickerPack { id, key } if *id == [5] && *key == [5; 32])), "{cmds:?}");
+    }
+
+    /// Writes `snapshots/stickers-*.png`: borderless stickers and the open picker.
+    #[test]
+    fn sticker_snapshot() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        fake_packs(&mut app, Vec::new());
+        incoming_sticker(&mut app, 8);
+        app.update(Message::SendSticker(vec![9], 3));
+        app.update(Message::ToggleStickers);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("stickers") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        let snap = ui.snapshot(&app.theme()).expect("render");
+        assert!(snap.matches_image(dir.join("stickers")).expect("write png"));
     }
 
     #[test]
