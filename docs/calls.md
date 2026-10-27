@@ -12,6 +12,8 @@ what RingRTC's audio needs: `cmake`, libpulse, alsa-lib, jack, speexdsp.
 scripts/webrtc.sh                 # once, and again after `cargo clean`
 cargo build --features calls      # or: cargo run --features calls
 cargo test --features calls
+# Optimized: plain `--release` fails to link (LTO vs cubeb's bundled std), so use this profile.
+cargo build --profile release-calls --features calls   # → target/release-calls/signal-rs
 ```
 
 `scripts/webrtc.sh` runs RingRTC's own `bin/fetch-artifact` from cargo's checkout of the pinned

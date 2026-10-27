@@ -64,3 +64,9 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 4
+
+# For `--features calls`: cubeb (via RingRTC) bundles its own Rust std, which clashes with
+# ours once LTO merges std into the binary. `cargo build --profile release-calls --features calls`
+[profile.release-calls]
+inherits = "release"
+lto = false
