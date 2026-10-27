@@ -340,6 +340,38 @@ fn find_close(input: &str, open: usize, delim: &str, prev: Option<char>) -> Opti
     None
 }
 
+/// Byte ranges of the http(s) URLs in `text`. A URL starts at a word boundary and runs over
+/// letters, digits and URL punctuation, so emoji, spaces and mention placeholders end it.
+/// Trailing sentence punctuation and an unbalanced closing `)` aren't part of it.
+pub fn links(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = text[from..].find("http").map(|i| i + from) {
+        let rest = &text[i..];
+        let scheme = if rest.starts_with("https://") { 8 } else if rest.starts_with("http://") { 7 } else { 0 };
+        let word_start = text[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        if scheme == 0 || !word_start {
+            from = i + 4;
+            continue;
+        }
+        let mut end = i + rest.find(|c: char| !(c.is_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c))).unwrap_or(rest.len());
+        loop {
+            let url = &text[i..end];
+            let unbalanced = url.ends_with(')') && url.matches(')').count() > url.matches('(').count();
+            match url.chars().next_back() {
+                Some(c @ ('.' | ',' | ';' | ':' | '!' | '?' | '\'' | '[' | '(')) => end -= c.len_utf8(),
+                Some(')') if unbalanced => end -= 1,
+                _ => break,
+            }
+        }
+        if end > i + scheme {
+            out.push(i..end);
+        }
+        from = end.max(i + scheme);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +658,32 @@ mod tests {
             let (body, ranges) = parse_markup(s);
             let _ = segments(&body, &ranges);
         }
+    }
+
+    fn found(s: &str) -> Vec<&str> {
+        links(s).into_iter().map(|r| &s[r]).collect()
+    }
+
+    #[test]
+    fn links_are_found_without_trailing_punctuation() {
+        assert_eq!(found("see https://signal.org."), ["https://signal.org"]);
+        assert_eq!(found("http://a.b/c?d=1&e=2, then https://x.y/z!"), ["http://a.b/c?d=1&e=2", "https://x.y/z"]);
+        assert_eq!(found("really? https://x.y/?q=a..."), ["https://x.y/?q=a"]);
+        assert_eq!(found("'https://x.y/it's'"), ["https://x.y/it's"]);
+        assert!(found("https:// nothing, http:/x, ftp://x, myhttps://x.y").is_empty());
+    }
+
+    #[test]
+    fn links_balance_parentheses() {
+        assert_eq!(found("(see https://en.wikipedia.org/wiki/Rust_(language))"), ["https://en.wikipedia.org/wiki/Rust_(language)"]);
+        assert_eq!(found("(https://x.y/a)"), ["https://x.y/a"]);
+    }
+
+    #[test]
+    fn links_stop_at_emoji_and_keep_unicode() {
+        assert_eq!(found("🎉https://x.y/a🎉 ok"), ["https://x.y/a"]);
+        assert_eq!(found("https://de.wikipedia.org/wiki/Äpfel。次"), ["https://de.wikipedia.org/wiki/Äpfel"]);
+        assert_eq!(found("hi \u{FFFC}https://x.y"), ["https://x.y"]);
+        assert_eq!(found("a\nhttps://x.y\tb"), ["https://x.y"]);
     }
 }

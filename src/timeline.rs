@@ -5,7 +5,7 @@ use presage::libsignal_service::content::{Content, ContentBody};
 use presage::libsignal_service::prelude::Uuid;
 use presage::proto::data_message::{Flags, Quote as ProtoQuote, Reaction};
 use presage::proto::sync_message::{self, Content as SyncContent};
-use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, receipt_message};
+use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, Preview, receipt_message};
 
 /// Signal's window for editing and deleting for everyone.
 pub const EDIT_WINDOW_MS: u64 = 24 * 3600 * 1000;
@@ -45,6 +45,8 @@ pub struct Message {
     pub ranges: Vec<BodyRange>,
     pub attachments: Vec<AttachmentPointer>,
     pub quote: Option<Quote>,
+    /// Link previews (Signal sends at most one, for the first URL).
+    pub previews: Vec<Preview>,
     /// (reactor, emoji); one reaction per person, like Signal.
     pub reactions: Vec<(Uuid, String)>,
     pub edited: bool,
@@ -65,6 +67,7 @@ impl Message {
             ranges: Vec::new(),
             attachments: Vec::new(),
             quote: None,
+            previews: Vec::new(),
             reactions: Vec::new(),
             edited: false,
             deleted: false,
@@ -85,6 +88,11 @@ impl Message {
     /// Edit: the same window, and only messages with text.
     pub fn can_edit(&self, now: u64) -> bool {
         self.can_delete_for_everyone(now) && !self.body.trim().is_empty()
+    }
+
+    /// Attachments plus link-preview images: everything `FetchAttachment` can download.
+    pub fn pointers(&self) -> impl Iterator<Item = &AttachmentPointer> {
+        self.attachments.iter().chain(self.previews.iter().filter_map(|p| p.image.as_ref()))
     }
 
     /// One-line text for the conversation list and quote previews.
@@ -305,6 +313,7 @@ fn fill(m: &mut Message, dm: &DataMessage) {
         m.attachments.push(sticker);
     }
     m.quote = dm.quote.as_ref().map(quote);
+    m.previews = dm.preview.clone();
     m.expire_timer = dm.expire_timer.unwrap_or(0);
 }
 

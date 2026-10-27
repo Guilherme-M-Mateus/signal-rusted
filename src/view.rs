@@ -8,14 +8,14 @@ use iced::keyboard::{self, key};
 use iced::widget::text::Span;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::widget::{
-    Column, Space, button, center, column, container, image, mouse_area, progress_bar, qr_code, rich_text, row, rule,
-    scrollable, span, text, text_editor, text_input,
+    Column, Space, button, center, column, container, image, mouse_area, opaque, progress_bar, qr_code, rich_text, row,
+    rule, scrollable, span, stack, text, text_editor, text_input,
 };
-use iced::{Alignment, Background, Border, Color, Element, Font, Length, Theme, color};
+use iced::{Alignment, Background, Border, Color, ContentFit, Element, Font, Length, Theme, color, mouse};
 use presage::libsignal_service::prelude::Uuid;
-use presage::proto::{AttachmentPointer, BodyRange};
+use presage::proto::{AttachmentPointer, BodyRange, Preview};
 
-use crate::app::{App, Attach, Message, Open, Screen, TIMERS, display_name};
+use crate::app::{App, Attach, Message, Open, Screen, TIMERS, display_name, is_image};
 use crate::backend::{attachment_key, now_ms};
 use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label, short_duration};
 use crate::{emoji, richtext};
@@ -134,6 +134,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
             }
         ]
         .into(),
+    };
+    let body: Element<_> = match app.open.as_ref().and_then(|o| o.viewer.as_ref()) {
+        Some(key) => stack![body, opaque(lightbox(app, key))].into(),
+        None => body,
     };
     let body: Element<_> = match &app.notice {
         None => body,
@@ -373,10 +377,23 @@ fn rich<'a>(
     if ranges.is_empty() && emoji::is_jumbo(body) {
         return text(body.trim().to_owned()).size(44).into();
     }
-    let spans: Vec<Span<'a, Message>> = richtext::segments(body, ranges)
+    rich_text(spans(body, ranges, names, msg_id, revealed, fg)).on_link_click(|m| m).into()
+}
+
+/// One span per styled segment; visible URLs in plain (non-mention) text become their own
+/// underlined spans that open the link.
+fn spans<'a>(
+    body: &str,
+    ranges: &[BodyRange],
+    names: &HashMap<Uuid, String>,
+    msg_id: u64,
+    revealed: &HashSet<(u64, usize)>,
+    fg: Color,
+) -> Vec<Span<'a, Message>> {
+    richtext::segments(body, ranges)
         .into_iter()
         .enumerate()
-        .map(|(i, seg)| {
+        .flat_map(|(i, seg)| {
             let s = &seg.style;
             let font = Font {
                 weight: if s.bold || seg.mention.is_some() { Weight::Bold } else { Weight::Normal },
@@ -391,16 +408,30 @@ fn rich<'a>(
                 }
                 None => seg.text,
             };
-            let mut sp = span(content).font(font).strikethrough(s.strike);
+            let strike = s.strike;
+            let mk = move |t: String| span(t).font(font).strikethrough(strike);
             if s.spoiler && !revealed.contains(&(msg_id, i)) {
                 // Hidden: text drawn in its own background color until clicked.
                 let hide = Color { a: 1.0, ..fg };
-                sp = sp.color(hide).background(hide).link(Message::Spoiler(msg_id, i));
+                return vec![mk(content).color(hide).background(hide).link(Message::Spoiler(msg_id, i))];
             }
-            sp
+            let links = if seg.mention.is_some() { Vec::new() } else { richtext::links(&content) };
+            let mut out = Vec::new();
+            let mut at = 0;
+            for r in links {
+                if at < r.start {
+                    out.push(mk(content[at..r.start].to_owned()));
+                }
+                let url = content[r.clone()].to_owned();
+                out.push(mk(url.clone()).underline(true).link(Message::OpenUrl(url)));
+                at = r.end;
+            }
+            if at < content.len() || out.is_empty() {
+                out.push(mk(content[at..].to_owned()));
+            }
+            out
         })
-        .collect();
-    rich_text(spans).on_link_click(|m| m).into()
+        .collect()
 }
 
 fn delivery_mark(d: Delivery) -> &'static str {
@@ -458,7 +489,7 @@ fn attachment<'a>(app: &'a App, a: &AttachmentPointer, fg: Color) -> Element<'a,
     }
     let is_image = a.content_type.as_deref().is_some_and(|c| c.starts_with("image/"));
     match app.attachments.get(&key) {
-        Some(Attach::Ready(path)) if is_image => image(image::Handle::from_path(path)).width(Length::Shrink).height(Length::Shrink).into(),
+        Some(Attach::Ready(path)) if is_image => clickable_image(key, path, Length::Shrink, ContentFit::Contain),
         Some(Attach::Ready(_)) => row![
             text(attachment_label(a)).color(fg),
             button(text("Save…")).on_press(Message::SaveAttachment(key)).style(button::secondary),
@@ -485,6 +516,98 @@ fn attachment<'a>(app: &'a App, a: &AttachmentPointer, fg: Color) -> Element<'a,
         .align_y(Alignment::Center)
         .into(),
     }
+}
+
+/// Square thumbnails for messages with several images.
+const THUMB: f32 = 200.0;
+
+/// An inline image that opens the viewer; its container id lets tests click it.
+fn clickable_image<'a>(key: String, path: &std::path::Path, size: Length, fit: ContentFit) -> Element<'a, Message> {
+    mouse_area(container(image(image::Handle::from_path(path)).width(size).height(size).content_fit(fit)).id(format!("image:{key}")))
+        .on_press(Message::ViewImage(key))
+        .interaction(mouse::Interaction::Pointer)
+        .into()
+}
+
+/// Several images in one message: a grid, two per row.
+fn image_grid<'a>(app: &'a App, images: &[&'a AttachmentPointer], fg: Color) -> Element<'a, Message> {
+    images
+        .chunks(2)
+        .fold(Column::new().spacing(4), |c, pair| {
+            c.push(pair.iter().fold(row![].spacing(4), |r, a| {
+                let key = attachment_key(a);
+                r.push(match app.attachments.get(&key) {
+                    Some(Attach::Ready(path)) => clickable_image(key, path, Length::Fixed(THUMB), ContentFit::Cover),
+                    _ => container(attachment(app, a, fg)).center(THUMB).into(),
+                })
+            }))
+        })
+        .into()
+}
+
+/// A received link preview: image (once downloaded), title, description and domain; opens the link.
+fn preview_card<'a>(app: &'a App, p: &'a Preview, fg: Color) -> Option<Element<'a, Message>> {
+    let url = p.url.as_deref()?;
+    let domain = url::Url::parse(url).ok().filter(|u| matches!(u.scheme(), "http" | "https"))?.host_str()?.to_owned();
+    let mut col = Column::new().spacing(2);
+    if let Some(Attach::Ready(path)) = p.image.as_ref().and_then(|i| app.attachments.get(&attachment_key(i))) {
+        col = col.push(image(image::Handle::from_path(path)).width(Length::Fill).height(160).content_fit(ContentFit::Cover));
+    }
+    if let Some(t) = p.title.as_deref().filter(|t| !t.trim().is_empty()) {
+        col = col.push(text(t).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).color(fg));
+    }
+    if let Some(d) = p.description.as_deref().filter(|d| !d.trim().is_empty()) {
+        col = col.push(text(truncate(d, 140)).size(13).color(fg));
+    }
+    col = col.push(text(domain).size(12).color(Color { a: 0.7, ..fg }));
+    let card = container(col).padding([6, 8]).width(320).style(|_| container::Style {
+        background: Some(Color { a: 0.18, ..Color::BLACK }.into()),
+        border: Border { radius: 8.0.into(), ..Default::default() },
+        ..Default::default()
+    });
+    Some(mouse_area(card).on_press(Message::OpenUrl(url.to_owned())).interaction(mouse::Interaction::Pointer).into())
+}
+
+/// White-on-dark buttons for the viewer's backdrop.
+fn on_dark(_: &Theme, status: button::Status) -> button::Style {
+    let a = match status {
+        button::Status::Disabled => 0.3,
+        button::Status::Hovered => 1.0,
+        _ => 0.85,
+    };
+    button::Style { text_color: Color { a, ..Color::WHITE }, ..Default::default() }
+}
+
+/// Full-window image viewer over the app: caption, Save…, ✕, and arrows through the chat's images.
+fn lightbox<'a>(app: &'a App, key: &'a str) -> Element<'a, Message> {
+    let images = app.images();
+    let i = images.iter().position(|(_, a)| attachment_key(a) == key);
+    let caption = i.map_or_else(String::new, |i| {
+        let (m, a) = images[i];
+        let who = if m.author == app.me { "You".into() } else { display_name(&app.names, m.author) };
+        let when = Local.timestamp_millis_opt(m.id as i64).single().map(|t| t.format("%b %-d, %Y %H:%M").to_string());
+        [Some(who), when, a.file_name.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · ")
+    });
+    let mut top = row![text(caption).color(Color::WHITE).width(Length::Fill)].spacing(8).align_y(Alignment::Center);
+    let shown: Element<_> = match app.attachments.get(key) {
+        Some(Attach::Ready(path)) => {
+            top = top.push(button(text("Save…")).on_press(Message::SaveAttachment(key.to_owned())).style(button::secondary));
+            image(image::Handle::from_path(path)).width(Length::Fill).height(Length::Fill).into()
+        }
+        Some(Attach::Failed(e)) => text(format!("Download failed: {e}")).color(Color::WHITE).into(),
+        _ => text("Loading…").color(Color::WHITE).into(),
+    };
+    top = top.push(button(text("✕").size(18)).on_press(Message::CloseViewer).style(on_dark));
+    let arrow = |label, delta: isize, ok: bool| button(text(label).size(32)).on_press_maybe(ok.then_some(Message::ViewerStep(delta))).style(on_dark);
+    let has_prev = i.is_some_and(|i| i > 0);
+    let has_next = i.is_some_and(|i| i + 1 < images.len());
+    let middle = row![arrow("‹", -1, has_prev), center(shown), arrow("›", 1, has_next)].align_y(Alignment::Center).height(Length::Fill);
+    container(column![top, middle].spacing(8))
+        .padding(16)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style { background: Some(Color { a: 0.92, ..Color::BLACK }.into()), ..Default::default() })
+        .into()
 }
 
 fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Element<'a, Message> {
@@ -522,8 +645,15 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
                 }),
             );
         }
-        for a in &m.attachments {
+        let images: Vec<&AttachmentPointer> = m.attachments.iter().filter(|a| is_image(a)).collect();
+        if images.len() > 1 {
+            bubble = bubble.push(image_grid(app, &images, fg));
+        }
+        for a in m.attachments.iter().filter(|a| images.len() < 2 || !is_image(a)) {
             bubble = bubble.push(attachment(app, a, fg));
+        }
+        for card in m.previews.iter().filter_map(|p| preview_card(app, p, fg)) {
+            bubble = bubble.push(card);
         }
         if !m.body.is_empty() {
             bubble = bubble.push(container(rich(&m.body, &m.ranges, &app.names, m.id, &o.spoilers, fg)).style(move |_| container::Style {
@@ -1146,5 +1276,95 @@ mod tests {
         app.update(Message::Backend(Event::LinkUrl("sgnl://linkdevice?uuid=a&pub_key=b".into())));
         let mut ui = simulator(view(&app));
         assert!(ui.find("Waiting for your phone…").is_ok());
+    }
+
+    fn apply(app: &mut App, msgs: Vec<Message>) {
+        for m in msgs {
+            let _ = app.update(m);
+        }
+    }
+
+    #[test]
+    fn clicking_an_image_opens_the_viewer_and_it_steps_and_closes() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let keys = crate::app::tests::photos(&mut app);
+        for k in &keys[..2] {
+            app.attachments.insert(k.clone(), Attach::Ready(format!("/nonexistent/{k}.jpg").into()));
+        }
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Save…").is_err(), "no viewer yet");
+        ui.click(iced::widget::Id::from(format!("image:{}", keys[1]))).expect("grid thumbnail");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        apply(&mut app, msgs.clone());
+        assert!(msgs.iter().any(|m| matches!(m, Message::ViewImage(k) if *k == keys[1])), "{msgs:?}");
+
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Save…").is_ok(), "downloaded: can be saved");
+        let when = Local.timestamp_millis_opt(50).unwrap().format("%b %-d, %Y %H:%M");
+        assert!(ui.find(format!("Alice · {when} · photo178.jpg").as_str()).is_ok(), "caption: sender, date, file name");
+        ui.click("›").expect("next");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        apply(&mut app, msgs);
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Loading…").is_ok(), "the big photo is being fetched");
+        assert!(ui.find("Save…").is_err());
+        ui.click("✕").expect("close");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        apply(&mut app, msgs);
+        assert!(app.open.as_ref().unwrap().viewer.is_none());
+    }
+
+    #[test]
+    fn clicking_a_link_emits_open_url() {
+        let el = rich("https://signal.org/ ok", &[], &HashMap::new(), 7, &HashSet::new(), Color::WHITE);
+        let mut ui = simulator(el);
+        ui.point_at((6.0, 8.0));
+        ui.simulate(iced_test::simulator::click());
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        assert!(matches!(msgs.as_slice(), [Message::OpenUrl(u)] if u == "https://signal.org/"), "{msgs:?}");
+    }
+
+    #[test]
+    fn links_split_segments_but_keep_styles_mentions_and_spoilers() {
+        let (body, mut ranges) = richtext::parse_markup("*see https://a.b/c!* ||https://hidden.x|| ");
+        let body = format!("{body}\u{FFFC}");
+        ranges.push(BodyRange {
+            start: Some(body.encode_utf16().count() as u32 - 1),
+            length: Some(1),
+            associated_value: Some(presage::proto::body_range::AssociatedValue::MentionAci("https://not.a.link".into())),
+        });
+        let sp = spans(&body, &ranges, &HashMap::new(), 1, &HashSet::new(), Color::WHITE);
+        let parts: Vec<(&str, bool, bool)> = sp
+            .iter()
+            .map(|s| (s.text.as_ref(), s.font.is_some_and(|f| f.weight == Weight::Bold), matches!(s.link, Some(Message::OpenUrl(_)))))
+            .collect();
+        assert_eq!(parts[..3], [("see ", true, false), ("https://a.b/c", true, true), ("!", true, false)]);
+        assert!(matches!(sp[4].link, Some(Message::Spoiler(1, _))), "hidden spoiler stays a spoiler: {parts:?}");
+        assert!(sp.iter().filter(|s| matches!(s.link, Some(Message::OpenUrl(_)))).count() == 1, "{parts:?}");
+
+        // Revealed, the spoiler's link works.
+        let sp = spans(&body, &ranges, &HashMap::new(), 1, &HashSet::from([(1, 2)]), Color::WHITE);
+        assert!(sp.iter().any(|s| matches!(&s.link, Some(Message::OpenUrl(u)) if u == "https://hidden.x")));
+    }
+
+    #[test]
+    fn received_link_preview_renders_and_opens() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let preview = presage::proto::Preview {
+            url: Some("https://signal.org/blog/".into()),
+            title: Some("Signal Blog".into()),
+            description: Some("Fake description".into()),
+            ..Default::default()
+        };
+        let dm = presage::proto::DataMessage { preview: vec![preview], ..crate::timeline::tests::text(20, "look https://signal.org/blog/") };
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(2), 20, dm)) }));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Fake description").is_ok());
+        assert!(ui.find("signal.org").is_ok(), "domain");
+        ui.click("Signal Blog").expect("card title");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        assert!(msgs.iter().any(|m| matches!(m, Message::OpenUrl(u) if u == "https://signal.org/blog/")), "{msgs:?}");
     }
 }

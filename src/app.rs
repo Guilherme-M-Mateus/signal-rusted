@@ -69,6 +69,8 @@ pub struct Open {
     pub mentions: Vec<(String, Uuid)>,
     /// When the current voice-note recording started.
     pub recording: Option<Instant>,
+    /// Attachment key of the image shown full-window.
+    pub viewer: Option<String>,
     last_keystroke: Option<Instant>,
     typing_sent: bool,
 }
@@ -100,6 +102,8 @@ pub struct App {
     pub durations: HashMap<String, Duration>,
     /// Audio to start once its download finishes.
     play_when_ready: Option<String>,
+    /// Opens a link in the system browser; tests swap it so nothing is ever launched.
+    pub open_url: fn(&str),
     data_dir: PathBuf,
 }
 
@@ -145,6 +149,12 @@ pub enum Message {
     SendRecording,
     Recorded(Result<PathBuf, String>),
     SaveAttachment(String),
+    /// Shows an image attachment full-window.
+    ViewImage(String),
+    /// Steps the viewer through the conversation's images (-1 back, 1 forward).
+    ViewerStep(isize),
+    CloseViewer,
+    OpenUrl(String),
     Saved(Result<(), String>),
     Theme(iced::theme::Mode),
     Tick,
@@ -178,6 +188,7 @@ impl App {
             playback: None,
             durations: HashMap::new(),
             play_when_ready: None,
+            open_url: open_in_browser,
             data_dir,
         };
         (app, iced::system::theme().map(Message::Theme))
@@ -203,6 +214,9 @@ impl App {
         let typing_active = self.typing.values().any(|m| !m.is_empty());
         let audio_active = self.playback.as_ref().is_some_and(|p| !p.is_paused())
             || self.open.as_ref().is_some_and(|o| o.recording.is_some());
+        if self.open.as_ref().is_some_and(|o| o.viewer.is_some()) {
+            subs.push(iced::keyboard::listen().filter_map(viewer_key));
+        }
         if audio_active {
             subs.push(iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick));
         } else if typing_active || self.open.as_ref().is_some_and(|o| o.typing_sent || !o.expires.is_empty()) {
@@ -289,6 +303,7 @@ impl App {
                     timer_menu: false,
                     mentions: Vec::new(),
                     recording: None,
+                    viewer: None,
                     last_keystroke: None,
                     typing_sent: false,
                 });
@@ -510,6 +525,37 @@ impl App {
                     },
                     Message::Saved,
                 );
+            }
+            Message::ViewImage(key) => {
+                let Some(o) = &mut self.open else { return Task::none() };
+                o.viewer = Some(key.clone());
+                self.fetch(&key);
+                // Unfocus the composer so arrows and Esc reach the viewer.
+                return iced::widget::operation::focus("lightbox");
+            }
+            Message::ViewerStep(delta) => {
+                let images = self.images();
+                let Some(i) = self.open.as_ref().and_then(|o| o.viewer.as_ref()).and_then(|k| images.iter().position(|(_, a)| attachment_key(a) == *k)) else {
+                    return Task::none();
+                };
+                let Some((_, a)) = i.checked_add_signed(delta).and_then(|j| images.get(j)) else { return Task::none() };
+                let key = attachment_key(a);
+                if let Some(o) = &mut self.open {
+                    o.viewer = Some(key.clone());
+                }
+                self.fetch(&key);
+            }
+            Message::CloseViewer => {
+                if let Some(o) = self.open.as_mut().filter(|o| o.viewer.is_some()) {
+                    o.viewer = None;
+                    return iced::widget::operation::focus(crate::view::COMPOSER);
+                }
+            }
+            Message::OpenUrl(url) => {
+                // Only web links: message text is untrusted, never hand other schemes to the OS.
+                if url::Url::parse(&url).is_ok_and(|u| matches!(u.scheme(), "http" | "https")) {
+                    (self.open_url)(&url);
+                }
             }
             Message::Saved(r) => self.error = r.err().map(|e| format!("Save failed: {e}")),
             Message::Theme(mode) => self.dark = mode != iced::theme::Mode::Light,
@@ -835,7 +881,7 @@ impl App {
             .open
             .as_ref()
             .and_then(|o| o.timeline.as_ref())
-            .and_then(|t| t.messages.iter().flat_map(|m| &m.attachments).find(|a| attachment_key(a) == key))
+            .and_then(|t| t.messages.iter().flat_map(Msg::pointers).find(|a| attachment_key(a) == key))
             .cloned();
         if let Some(p) = pointer.filter(|p| p.cdn_number.is_some() || p.attachment_identifier.is_some()) {
             self.attachments.insert(key.to_owned(), Attach::Loading);
@@ -852,7 +898,7 @@ impl App {
             .iter()
             .rev()
             .take(o.shown)
-            .flat_map(|m| &m.attachments)
+            .flat_map(Msg::pointers)
             .filter(|a| {
                 a.content_type.as_deref().is_some_and(|c| c.starts_with("image/"))
                     && a.size.unwrap_or(0) <= AUTO_DOWNLOAD_BYTES
@@ -862,6 +908,16 @@ impl App {
         for k in keys {
             self.fetch(&k);
         }
+    }
+
+    /// Image attachments in the open conversation, oldest first: what the viewer steps through.
+    pub fn images(&self) -> Vec<(&Msg, &presage::proto::AttachmentPointer)> {
+        let Some(t) = self.open.as_ref().and_then(|o| o.timeline.as_ref()) else { return Vec::new() };
+        t.messages
+            .iter()
+            .filter(|m| !m.deleted)
+            .flat_map(|m| m.attachments.iter().filter(|a| is_image(a)).map(move |a| (m, a)))
+            .collect()
     }
 
     /// The thread's disappearing-message timer in seconds (0 = off).
@@ -931,6 +987,26 @@ fn mention_query(before: &str) -> Option<&str> {
     (starts_word && q.chars().all(char::is_alphanumeric)).then_some(q)
 }
 
+pub fn is_image(a: &presage::proto::AttachmentPointer) -> bool {
+    a.content_type.as_deref().is_some_and(|c| c.starts_with("image/"))
+}
+
+fn viewer_key(e: iced::keyboard::Event) -> Option<Message> {
+    use iced::keyboard::{Event, Key, key::Named};
+    match e {
+        Event::KeyPressed { key: Key::Named(Named::ArrowLeft), .. } => Some(Message::ViewerStep(-1)),
+        Event::KeyPressed { key: Key::Named(Named::ArrowRight), .. } => Some(Message::ViewerStep(1)),
+        Event::KeyPressed { key: Key::Named(Named::Escape), .. } => Some(Message::CloseViewer),
+        _ => None,
+    }
+}
+
+fn open_in_browser(url: &str) {
+    if let Err(e) = open::that_detached(url) {
+        tracing::warn!(%e, "failed to open link");
+    }
+}
+
 fn default_device_name() -> String {
     let host = std::fs::read_to_string("/etc/hostname").map(|h| h.trim().to_owned()).unwrap_or_default();
     if host.is_empty() { "signal-rs".into() } else { format!("signal-rs on {host}") }
@@ -955,6 +1031,7 @@ pub(crate) mod tests {
         let (tx, rx) = unbounded_channel();
         let (mut app, _) = App::new(PathBuf::from("/nonexistent"));
         fake_audio(&mut app); // never touch real audio devices from tests
+        app.open_url = record_url; // ...nor launch a browser
         app.update(Message::Backend(Event::Started(tx)));
         app.update(Message::Backend(Event::Ready { me: uuid(ME) }));
         app.update(Message::Backend(Event::Names(HashMap::from([
@@ -1027,6 +1104,14 @@ pub(crate) mod tests {
         let mut t = Timeline::new(uuid(ME));
         t.apply(&content(uuid(ALICE), 10, text(10, "hi there")));
         app.update(Message::Backend(Event::Timeline { thread: alice(), timeline: t }));
+    }
+
+    thread_local! {
+        pub static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_url(url: &str) {
+        OPENED.with(|o| o.borrow_mut().push(url.to_owned()));
     }
 
     pub fn type_text(app: &mut App, s: &str) {
@@ -1539,5 +1624,92 @@ pub(crate) mod tests {
     fn window_title_counts_unread() {
         let (app, _rx) = app();
         assert_eq!(app.title(), "Signal (2)");
+    }
+
+    fn photo(digest: u8, size: u32) -> presage::proto::AttachmentPointer {
+        presage::proto::AttachmentPointer {
+            content_type: Some("image/jpeg".into()),
+            digest: Some(vec![digest]),
+            cdn_number: Some(3),
+            size: Some(size),
+            file_name: Some(format!("photo{digest}.jpg")),
+            ..Default::default()
+        }
+    }
+
+    /// Alice sends two photos in one message (ts 50), then a third too big to auto-download (ts 60).
+    pub fn photos(app: &mut App) -> Vec<String> {
+        let (a, b, c) = (photo(0xb1, 1000), photo(0xb2, 1000), photo(0xb3, AUTO_DOWNLOAD_BYTES + 1));
+        let two = presage::proto::DataMessage { timestamp: Some(50), attachments: vec![a.clone(), b.clone()], ..Default::default() };
+        let big = presage::proto::DataMessage { timestamp: Some(60), attachments: vec![c.clone()], ..Default::default() };
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(ALICE), 50, two)) }));
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(ALICE), 60, big)) }));
+        [a, b, c].iter().map(attachment_key).collect()
+    }
+
+    fn viewing(app: &App) -> Option<&str> {
+        app.open.as_ref().and_then(|o| o.viewer.as_deref())
+    }
+
+    #[test]
+    fn viewer_steps_within_bounds_fetches_and_closes() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let keys = photos(&mut app);
+        let fetches = |rx: &mut UnboundedReceiver<Command>| drain(rx).into_iter().filter(|c| matches!(c, Command::FetchAttachment(_))).count();
+        assert_eq!(fetches(&mut rx), 2, "the big one isn't auto-downloaded");
+
+        app.update(Message::ViewImage(keys[0].clone()));
+        app.update(Message::ViewerStep(-1));
+        assert_eq!(viewing(&app), Some(keys[0].as_str()), "no wrap before the first");
+        app.update(Message::ViewerStep(1));
+        assert_eq!(viewing(&app), Some(keys[1].as_str()));
+        assert_eq!(fetches(&mut rx), 0, "already loading");
+        app.update(Message::ViewerStep(1));
+        assert_eq!(viewing(&app), Some(keys[2].as_str()));
+        assert_eq!(fetches(&mut rx), 1, "stepping onto an undownloaded image fetches it");
+        app.update(Message::ViewerStep(1));
+        assert_eq!(viewing(&app), Some(keys[2].as_str()), "no wrap after the last");
+
+        use iced::keyboard::{Event as Key, Location, Modifiers, key::Named};
+        let press = |named| Key::KeyPressed {
+            key: iced::keyboard::Key::Named(named),
+            modified_key: iced::keyboard::Key::Named(named),
+            physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        assert!(matches!(viewer_key(press(Named::ArrowLeft)), Some(Message::ViewerStep(-1))));
+        assert!(matches!(viewer_key(press(Named::ArrowRight)), Some(Message::ViewerStep(1))));
+        assert!(matches!(viewer_key(press(Named::Enter)), None));
+        let esc = viewer_key(press(Named::Escape)).expect("Esc closes");
+        app.update(esc);
+        assert_eq!(viewing(&app), None);
+    }
+
+    #[test]
+    fn link_preview_images_auto_download() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let preview = presage::proto::Preview {
+            url: Some("https://signal.org".into()),
+            title: Some("Signal".into()),
+            image: Some(photo(0xc1, 1000)),
+            ..Default::default()
+        };
+        let dm = presage::proto::DataMessage { preview: vec![preview], ..text(70, "https://signal.org") };
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(ALICE), 70, dm)) }));
+        assert!(drain(&mut rx).iter().any(|c| matches!(c, Command::FetchAttachment(p) if p.digest.as_deref() == Some(&[0xc1][..]))));
+    }
+
+    #[test]
+    fn only_web_links_are_opened() {
+        let (mut app, _rx) = app();
+        for url in ["https://signal.org/a?b=1", "javascript:alert(1)", "file:///etc/passwd", "not a url", "http://x.y"] {
+            app.update(Message::OpenUrl(url.into()));
+        }
+        assert_eq!(OPENED.with(|o| o.borrow().clone()), ["https://signal.org/a?b=1", "http://x.y"]);
     }
 }
