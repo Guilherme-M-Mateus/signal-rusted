@@ -12,6 +12,7 @@ use presage::store::Thread;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{self, Command, Conversation, Event, QuoteRef, SearchResult, attachment_key, now_ms};
+use crate::groups::{GroupEdit, GroupInfo};
 use crate::timeline::{Delivery, Message as Msg, Timeline};
 use crate::{audio, emoji, richtext};
 
@@ -69,8 +70,25 @@ pub struct Open {
     pub mentions: Vec<(String, Uuid)>,
     /// When the current voice-note recording started.
     pub recording: Option<Instant>,
+    /// The group info panel, shown instead of the timeline.
+    pub info: Option<GroupPanel>,
     last_keystroke: Option<Instant>,
     typing_sent: bool,
+}
+
+/// Edits in progress in the group info panel.
+pub struct GroupPanel {
+    pub title: String,
+    pub description: String,
+    pub add_query: String,
+}
+
+/// The "New group" dialog.
+#[derive(Default)]
+pub struct NewGroup {
+    pub title: String,
+    pub query: String,
+    pub picked: Vec<Uuid>,
 }
 
 pub struct Picker {
@@ -88,6 +106,7 @@ pub struct App {
     /// Message search results for `search`, newest first.
     pub results: Vec<SearchResult>,
     pub open: Option<Open>,
+    pub new_group: Option<NewGroup>,
     pub dark: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
@@ -136,6 +155,17 @@ pub enum Message {
     LoadOlder,
     ToggleTimerMenu,
     SetTimer(u32),
+    ToggleGroupInfo,
+    InfoTitle(String),
+    InfoDescription(String),
+    InfoAddQuery(String),
+    EditGroup(GroupEdit),
+    /// Opens or closes the "New group" dialog.
+    NewGroup,
+    NewGroupTitle(String),
+    NewGroupQuery(String),
+    NewGroupPick(Uuid),
+    CreateGroup,
     FetchAttachment(String),
     PlayPause(String),
     AudioDuration(String, Option<Duration>),
@@ -169,6 +199,7 @@ impl App {
             search: String::new(),
             results: Vec::new(),
             open: None,
+            new_group: None,
             dark: true,
             error: None,
             notice: None,
@@ -270,6 +301,7 @@ impl App {
                     self.audio(audio::Cmd::Finish(None));
                 }
                 self.send(Command::Open(thread.clone()));
+                self.new_group = None;
                 self.open = Some(Open {
                     thread,
                     title,
@@ -289,6 +321,7 @@ impl App {
                     timer_menu: false,
                     mentions: Vec::new(),
                     recording: None,
+                    info: None,
                     last_keystroke: None,
                     typing_sent: false,
                 });
@@ -436,22 +469,94 @@ impl App {
                 }
             }
             Message::ToggleTimerMenu => {
-                if let Some(o) = self.open.as_mut().filter(|o| !o.is_group) {
-                    o.timer_menu = !o.timer_menu;
+                if self.can_set_timer() {
+                    if let Some(o) = &mut self.open {
+                        o.timer_menu = !o.timer_menu;
+                    }
                 }
             }
             Message::SetTimer(seconds) => {
-                // Group timers are a group change (admin APIs); the header is read-only there.
-                let Some(o) = self.open.as_mut().filter(|o| !o.is_group) else { return Task::none() };
+                // In groups it's a group change, so it needs the right to edit the group's details.
+                if !self.can_set_timer() {
+                    return Task::none();
+                }
+                let Some(o) = &mut self.open else { return Task::none() };
                 o.timer_menu = false;
-                let thread = o.thread.clone();
+                let (thread, is_group) = (o.thread.clone(), o.is_group);
                 if self.timer(&thread) == seconds {
                     return Task::none();
                 }
                 if let Some(c) = self.conversations.iter_mut().find(|c| c.thread == thread) {
                     c.expire_timer = seconds;
                 }
-                self.send(Command::SetTimer { thread, seconds });
+                self.send(if is_group {
+                    Command::EditGroup { thread, edit: GroupEdit::Timer(seconds) }
+                } else {
+                    Command::SetTimer { thread, seconds }
+                });
+            }
+            Message::ToggleGroupInfo => {
+                let description = self.group_info().map(|g| g.description.clone()).unwrap_or_default();
+                if let Some(o) = self.open.as_mut().filter(|o| o.is_group) {
+                    o.info = match o.info {
+                        Some(_) => None,
+                        None => Some(GroupPanel { title: o.title.clone(), description, add_query: String::new() }),
+                    };
+                }
+            }
+            Message::InfoTitle(t) => {
+                if let Some(p) = self.open.as_mut().and_then(|o| o.info.as_mut()) {
+                    p.title = t;
+                }
+            }
+            Message::InfoDescription(d) => {
+                if let Some(p) = self.open.as_mut().and_then(|o| o.info.as_mut()) {
+                    p.description = d;
+                }
+            }
+            Message::InfoAddQuery(q) => {
+                if let Some(p) = self.open.as_mut().and_then(|o| o.info.as_mut()) {
+                    p.add_query = q;
+                }
+            }
+            Message::EditGroup(edit) => {
+                let Some(o) = &self.open else { return Task::none() };
+                if !self.group_info().is_some_and(|g| g.allows_edit(self.me, &edit)) {
+                    return Task::none();
+                }
+                let thread = o.thread.clone();
+                if let Some(p) = self.open.as_mut().and_then(|o| o.info.as_mut()).filter(|_| matches!(edit, GroupEdit::AddMembers(_))) {
+                    p.add_query.clear();
+                }
+                self.send(Command::EditGroup { thread, edit });
+            }
+            Message::NewGroup => {
+                self.new_group = match self.new_group {
+                    Some(_) => None,
+                    None => Some(NewGroup::default()),
+                };
+            }
+            Message::NewGroupTitle(t) => {
+                if let Some(g) = &mut self.new_group {
+                    g.title = t;
+                }
+            }
+            Message::NewGroupQuery(q) => {
+                if let Some(g) = &mut self.new_group {
+                    g.query = q;
+                }
+            }
+            Message::NewGroupPick(id) => {
+                if let Some(g) = &mut self.new_group {
+                    match g.picked.iter().position(|p| *p == id) {
+                        Some(i) => drop(g.picked.remove(i)),
+                        None => g.picked.push(id),
+                    }
+                }
+            }
+            Message::CreateGroup => {
+                let Some(g) = self.new_group.take_if(|g| !g.title.trim().is_empty()) else { return Task::none() };
+                self.send(Command::CreateGroup { title: g.title.trim().to_owned(), members: g.picked });
             }
             Message::FetchAttachment(key) => self.fetch(&key),
             Message::PlayPause(key) => self.play_pause(key),
@@ -647,6 +752,7 @@ impl App {
                     }
                 }
             }
+            Event::GroupCreated { thread, title } => return self.update(Message::OpenThread(thread, title, true)),
             Event::Error(e) => self.error = Some(e),
             Event::Notice(n) => self.notice = n,
         }
@@ -869,6 +975,31 @@ impl App {
         self.conversations.iter().find(|c| c.thread == *thread).map_or(0, |c| c.expire_timer)
     }
 
+    /// The open group's details, if it's a group.
+    pub fn group_info(&self) -> Option<&GroupInfo> {
+        let o = self.open.as_ref()?;
+        self.conversations.iter().find(|c| c.thread == o.thread)?.group.as_ref()
+    }
+
+    /// 1:1 timers are always ours to set; a group's needs the right to edit its details.
+    pub fn can_set_timer(&self) -> bool {
+        self.open.as_ref().is_some_and(|o| !o.is_group || self.group_info().is_some_and(|g| g.can_edit_details(self.me)))
+    }
+
+    /// People (not us, not in `exclude`) whose name matches `query`, by name.
+    pub fn people_matching(&self, query: &str, exclude: &[Uuid]) -> Vec<(Uuid, String)> {
+        let q = query.trim().to_lowercase();
+        let mut v: Vec<(Uuid, String)> = self
+            .names
+            .iter()
+            .filter(|(id, n)| **id != self.me && !exclude.contains(id) && n.to_lowercase().contains(&q))
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v.truncate(50);
+        v
+    }
+
     pub fn typing_names(&self, thread: &Thread) -> Vec<String> {
         self.typing
             .get(thread)
@@ -942,6 +1073,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::timeline::tests::{content, text, uuid};
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use presage::libsignal_service::groups_v2::AccessRequired;
 
     pub const ME: u8 = 1;
     pub const ALICE: u8 = 2;
@@ -970,6 +1102,7 @@ pub(crate) mod tests {
             is_group: false,
             expire_timer: 0,
             members: Vec::new(),
+            group: None,
         }])));
         (app, rx)
     }
@@ -992,6 +1125,14 @@ pub(crate) mod tests {
             is_group: true,
             members: vec![uuid(ME), uuid(ALICE), uuid(3), uuid(4)],
             expire_timer: 0,
+            group: Some(GroupInfo {
+                description: "Weekend plans".into(),
+                members: vec![(uuid(ME), false), (uuid(ALICE), true), (uuid(3), false), (uuid(4), false)],
+                pending: 1,
+                requesting: 0,
+                attributes: AccessRequired::Member,
+                add_members: AccessRequired::Member,
+            }),
         });
         app.update(Message::Backend(Event::Conversations(convs)));
         app.update(Message::OpenThread(group(), "Friends".into(), true));
@@ -1539,5 +1680,72 @@ pub(crate) mod tests {
     fn window_title_counts_unread() {
         let (app, _rx) = app();
         assert_eq!(app.title(), "Signal (2)");
+    }
+
+    /// Makes us an admin of `open_group()`'s group.
+    pub fn make_me_admin(app: &mut App) {
+        let mut convs = app.conversations.clone();
+        let g = convs.iter_mut().find_map(|c| c.group.as_mut()).unwrap();
+        g.members[0].1 = true;
+        app.update(Message::Backend(Event::Conversations(convs)));
+    }
+
+    #[test]
+    fn group_info_panel_edits_are_permission_checked() {
+        let (mut app, mut rx) = open_group();
+        app.update(Message::ToggleGroupInfo);
+        let p = app.open.as_ref().unwrap().info.as_ref().expect("panel open");
+        assert_eq!((p.title.as_str(), p.description.as_str()), ("Friends", "Weekend plans"));
+        app.update(Message::InfoTitle("Hikers".into()));
+        app.update(Message::EditGroup(GroupEdit::Title("Hikers".into())));
+        app.update(Message::EditGroup(GroupEdit::Remove(uuid(ALICE))));
+        let cmds = drain(&mut rx);
+        assert!(
+            matches!(cmds.as_slice(), [Command::EditGroup { thread, edit: GroupEdit::Title(t) }] if *thread == group() && t == "Hikers"),
+            "members may rename but not remove: {cmds:?}"
+        );
+        make_me_admin(&mut app);
+        app.update(Message::EditGroup(GroupEdit::Remove(uuid(ALICE))));
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::EditGroup { edit: GroupEdit::Remove(_), .. }]));
+        app.update(Message::InfoAddQuery("bo".into()));
+        app.update(Message::EditGroup(GroupEdit::AddMembers(vec![uuid(9)])));
+        assert!(app.open.as_ref().unwrap().info.as_ref().unwrap().add_query.is_empty(), "adding clears the search");
+        app.update(Message::ToggleGroupInfo);
+        assert!(app.open.as_ref().unwrap().info.is_none());
+    }
+
+    #[test]
+    fn group_timer_is_a_group_change_when_allowed() {
+        let (mut app, mut rx) = open_group();
+        app.update(Message::ToggleTimerMenu);
+        assert!(app.open.as_ref().unwrap().timer_menu);
+        app.update(Message::SetTimer(300));
+        let cmds = drain(&mut rx);
+        assert!(matches!(cmds.as_slice(), [Command::EditGroup { edit: GroupEdit::Timer(300), .. }]), "{cmds:?}");
+        assert_eq!(app.timer(&group()), 300);
+    }
+
+    #[test]
+    fn new_group_dialog_creates_then_opens_the_group() {
+        let (mut app, mut rx) = app();
+        app.update(Message::NewGroup);
+        app.update(Message::CreateGroup);
+        assert!(drain(&mut rx).is_empty(), "a name is required");
+        app.update(Message::NewGroupTitle(" Hikers ".into()));
+        app.update(Message::NewGroupQuery("b".into()));
+        assert_eq!(app.people_matching("b", &[]), vec![(uuid(3), "Bob".to_string())], "never us");
+        for id in [ALICE, 3, 3] {
+            app.update(Message::NewGroupPick(uuid(id)));
+        }
+        app.update(Message::CreateGroup);
+        let cmds = drain(&mut rx);
+        assert!(
+            matches!(cmds.as_slice(), [Command::CreateGroup { title, members }] if title == "Hikers" && *members == vec![uuid(ALICE)]),
+            "{cmds:?}"
+        );
+        assert!(app.new_group.is_none());
+        app.update(Message::Backend(Event::GroupCreated { thread: group(), title: "Hikers".into() }));
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Open(t)] if *t == group()));
+        assert!(app.open.as_ref().is_some_and(|o| o.is_group && o.title == "Hikers"));
     }
 }

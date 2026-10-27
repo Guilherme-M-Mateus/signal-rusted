@@ -125,9 +125,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Screen::Main => row![
             sidebar(app),
             rule::vertical(1),
-            match &app.open {
-                Some(o) => conversation(app, o),
-                None => center(text("Select a conversation to start messaging").style(|t: &Theme| text::Style {
+            match (&app.new_group, &app.open) {
+                (Some(g), _) => new_group(app, g),
+                (None, Some(o)) => conversation(app, o),
+                (None, None) => center(text("Select a conversation to start messaging").style(|t: &Theme| text::Style {
                     color: Some(muted(t))
                 }))
                 .into(),
@@ -283,7 +284,14 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         }
     }
     column![
-        container(text("Signal").size(22).font(Font { weight: Weight::Bold, ..Font::DEFAULT })).padding([12, 16]),
+        container(
+            row![
+                text("Signal").size(22).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill),
+                button(text("New group").size(13)).on_press(Message::NewGroup).style(button::secondary),
+            ]
+            .align_y(Alignment::Center)
+        )
+        .padding([12, 16]),
         container(text_input("Search", &app.search).on_input(Message::Search).padding(8)).padding([0, 12]),
         scrollable(list).height(Length::Fill),
     ]
@@ -294,19 +302,27 @@ fn sidebar(app: &App) -> Element<'_, Message> {
 
 fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     let typing = app.typing_names(&o.thread);
-    let subtitle: Element<_> = if typing.is_empty() {
+    let subtitle: Element<_> = if let (true, Some(g)) = (typing.is_empty(), app.group_info()) {
+        muted_text(format!("{} members", g.members.len())).size(12).into()
+    } else if typing.is_empty() {
         Space::new().into()
     } else {
         text(format!("{} typing…", typing.join(", "))).size(12).style(|t: &Theme| text::Style { color: Some(muted(t)) }).into()
     };
+    let who = row![
+        avatar(&o.title, &crate::state::thread_key(&o.thread), 32.0),
+        column![text(o.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), subtitle],
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    // Like Signal-Desktop, clicking a group's header opens its details.
+    let who: Element<_> = if o.is_group {
+        button(who).on_press(Message::ToggleGroupInfo).padding(0).style(button::text).into()
+    } else {
+        who.into()
+    };
     let header = container(
-        row![
-            avatar(&o.title, &crate::state::thread_key(&o.thread), 32.0),
-            column![text(o.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), subtitle].width(Length::Fill),
-            timer_control(app, o),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
+        row![container(who).width(Length::Fill), timer_control(app, o)].spacing(12).align_y(Alignment::Center),
     )
     .padding([10, 16]);
     let header: Element<_> = if o.timer_menu {
@@ -320,6 +336,9 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         header.into()
     };
 
+    if let Some(p) = &o.info {
+        return column![header, rule::horizontal(1), group_panel(app, o, p)].into();
+    }
     let body: Element<_> = match &o.timeline {
         None => center(text("Loading…")).into(),
         Some(t) => {
@@ -349,17 +368,143 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     column![header, rule::horizontal(1), body, composer(app, o)].into()
 }
 
-/// "⏱ 5m": opens the timer choices in 1:1 chats; read-only in groups (changing it there is a
-/// group change, which needs the group admin APIs).
+/// "⏱ 5m": opens the timer choices; read-only in groups whose details we may not edit.
 fn timer_control<'a>(app: &App, o: &Open) -> Element<'a, Message> {
     let secs = app.timer(&o.thread);
     let label = TIMERS.iter().find(|(s, _)| *s == secs).map_or_else(|| short_duration(secs.into()), |(_, l)| l.to_string());
     let label = text(format!("⏱ {label}")).size(13);
-    if o.is_group {
-        label.style(|t: &Theme| text::Style { color: Some(muted(t)) }).into()
-    } else {
+    if app.can_set_timer() {
         button(label).on_press(Message::ToggleTimerMenu).style(button::text).into()
+    } else {
+        label.style(|t: &Theme| text::Style { color: Some(muted(t)) }).into()
     }
+}
+
+fn muted_text<'a>(s: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
+    text(s).size(13).style(|t: &Theme| text::Style { color: Some(muted(t)) })
+}
+
+fn badge<'a>(s: &'a str) -> Element<'a, Message> {
+    container(text(s).size(11))
+        .padding([1, 6])
+        .style(|t: &Theme| container::Style {
+            background: Some(surface(t).into()),
+            border: Border { radius: 8.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Group details: name, description, members with admin badges and, where our role and the
+/// group's access control allow, the admin actions.
+fn group_panel<'a>(app: &'a App, o: &'a Open, p: &'a crate::app::GroupPanel) -> Element<'a, Message> {
+    use crate::groups::GroupEdit;
+    let me = app.me;
+    let Some(g) = app.group_info() else { return center(text("Loading…")).into() };
+    let bold = Font { weight: Weight::Bold, ..Font::DEFAULT };
+    let mut col = Column::new().spacing(10).padding([16, 24]).max_width(560);
+    col = col.push(row![button(text("← Back")).on_press(Message::ToggleGroupInfo).style(button::text)]);
+
+    if g.can_edit_details(me) {
+        let title = (p.title.trim() != o.title && !p.title.trim().is_empty()).then(|| Message::EditGroup(GroupEdit::Title(p.title.clone())));
+        col = col.push(row![
+            text_input("Group name", &p.title).on_input(Message::InfoTitle).padding(8),
+            button(text("Save name")).on_press_maybe(title),
+        ].spacing(8));
+        let description = (p.description.trim() != g.description).then(|| Message::EditGroup(GroupEdit::Description(p.description.clone())));
+        col = col.push(row![
+            text_input("Description", &p.description).on_input(Message::InfoDescription).padding(8),
+            button(text("Save description")).on_press_maybe(description),
+        ].spacing(8));
+    } else {
+        col = col.push(text(o.title.clone()).size(20).font(bold));
+        if !g.description.is_empty() {
+            col = col.push(text(g.description.clone()));
+        }
+    }
+
+    let role = if g.is_admin(me) { "Admin" } else if g.is_member(me) { "Member" } else { "Not a member" };
+    col = col.push(muted_text(format!("Your role: {role}")));
+    let mut counts = vec![format!("{} members", g.members.len())];
+    if g.pending > 0 {
+        counts.push(format!("{} invited", g.pending));
+    }
+    if g.requesting > 0 {
+        counts.push(format!("{} requesting to join", g.requesting));
+    }
+    col = col.push(text(counts.join(" · ")).font(bold));
+
+    let mut members: Vec<(Uuid, bool, String)> =
+        g.members.iter().map(|(id, admin)| (*id, *admin, if *id == me { "You".into() } else { display_name(&app.names, *id) })).collect();
+    members.sort_by(|a, b| (a.0 != me, &a.2).cmp(&(b.0 != me, &b.2)));
+    for (id, admin, name) in members {
+        let mut r = row![avatar(&name, &id.to_string(), 32.0), text(name).width(Length::Fill)].spacing(10).align_y(Alignment::Center);
+        if admin {
+            r = r.push(badge("Admin"));
+        }
+        let role_edit = GroupEdit::SetAdmin(id, !admin);
+        if g.allows_edit(me, &role_edit) {
+            let label = if admin { "Remove admin" } else { "Make admin" };
+            r = r.push(button(text(label).size(13)).on_press(Message::EditGroup(role_edit)).style(button::text));
+        }
+        let remove = GroupEdit::Remove(id);
+        if g.allows_edit(me, &remove) {
+            r = r.push(button(text("Remove").size(13)).on_press(Message::EditGroup(remove)).style(button::danger));
+        }
+        col = col.push(r);
+    }
+
+    if g.can_add_members(me) {
+        col = col.push(text_input("Add members", &p.add_query).on_input(Message::InfoAddQuery).padding(8));
+        if !p.add_query.trim().is_empty() {
+            let current: Vec<Uuid> = g.members.iter().map(|(id, _)| *id).collect();
+            for (id, name) in app.people_matching(&p.add_query, &current).into_iter().take(8) {
+                col = col.push(
+                    button(row![avatar(&name, &id.to_string(), 28.0), text(format!("Add {name}"))].spacing(10).align_y(Alignment::Center))
+                        .on_press(Message::EditGroup(GroupEdit::AddMembers(vec![id])))
+                        .style(button::text),
+                );
+            }
+        }
+    }
+
+    if g.is_member(me) {
+        col = col.push(if g.must_appoint_admin(me) {
+            Element::from(muted_text("Make another member an admin before leaving."))
+        } else {
+            button(text("Leave group")).on_press(Message::EditGroup(GroupEdit::Leave)).style(button::danger).into()
+        });
+    } else {
+        col = col.push(muted_text("You're no longer a member of this group."));
+    }
+    scrollable(col).height(Length::Fill).into()
+}
+
+/// "New group": name it and pick members from contacts.
+fn new_group<'a>(app: &'a App, g: &'a crate::app::NewGroup) -> Element<'a, Message> {
+    let mut col = Column::new().spacing(10).padding([16, 24]).max_width(560);
+    col = col.push(row![
+        text("New group").size(20).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill),
+        button(text("Cancel")).on_press(Message::NewGroup).style(button::text),
+    ].align_y(Alignment::Center));
+    col = col.push(text_input("Group name (required)", &g.title).on_input(Message::NewGroupTitle).padding(8));
+    if !g.picked.is_empty() {
+        let names: Vec<String> = g.picked.iter().map(|id| display_name(&app.names, *id)).collect();
+        col = col.push(muted_text(format!("Members: {}", names.join(", "))));
+    }
+    col = col.push(text_input("Search contacts", &g.query).on_input(Message::NewGroupQuery).padding(8));
+    for (id, name) in app.people_matching(&g.query, &[]) {
+        let mark = if g.picked.contains(&id) { "☑" } else { "☐" };
+        col = col.push(
+            button(row![text(mark), avatar(&name, &id.to_string(), 28.0), text(name)].spacing(10).align_y(Alignment::Center))
+                .width(Length::Fill)
+                .on_press(Message::NewGroupPick(id))
+                .style(button::text),
+        );
+    }
+    let create = (!g.title.trim().is_empty()).then_some(Message::CreateGroup);
+    col = col.push(button(text("Create")).on_press_maybe(create).style(button::primary));
+    scrollable(col).height(Length::Fill).into()
 }
 
 fn rich<'a>(
@@ -1146,5 +1291,54 @@ mod tests {
         app.update(Message::Backend(Event::LinkUrl("sgnl://linkdevice?uuid=a&pub_key=b".into())));
         let mut ui = simulator(view(&app));
         assert!(ui.find("Waiting for your phone…").is_ok());
+    }
+
+    #[test]
+    fn group_header_opens_the_info_panel() {
+        let (mut app, mut rx) = crate::app::tests::open_group();
+        click(&mut app, "4 members");
+        let mut ui = simulator(view(&app));
+        for s in ["Weekend plans", "Your role: Member", "4 members · 1 invited", "Admin", "Leave group"] {
+            assert!(ui.find(s).is_ok(), "{s}");
+        }
+        assert!(ui.find("Remove").is_err() && ui.find("Make admin").is_err(), "members can't manage others");
+        drop(ui);
+        crate::app::tests::make_me_admin(&mut app);
+        click(&mut app, "Make admin");
+        let cmds = crate::app::tests::drain(&mut rx);
+        assert!(
+            matches!(cmds.as_slice(), [Command::EditGroup { edit: crate::groups::GroupEdit::SetAdmin(_, true), .. }]),
+            "{cmds:?}"
+        );
+        click(&mut app, "← Back");
+        assert!(app.open.as_ref().unwrap().info.is_none());
+    }
+
+    #[test]
+    fn new_group_dialog_emits_create() {
+        let (mut app, mut rx) = app();
+        click(&mut app, "New group");
+        app.update(Message::NewGroupTitle("Hikers".into()));
+        click(&mut app, "Bob");
+        click(&mut app, "Create");
+        let cmds = crate::app::tests::drain(&mut rx);
+        assert!(matches!(cmds.as_slice(), [Command::CreateGroup { title, members }] if title == "Hikers" && *members == vec![uuid(3)]), "{cmds:?}");
+    }
+
+    /// Writes `snapshots/group-info-*.png` for visual review.
+    #[test]
+    fn group_info_snapshot() {
+        let (mut app, _rx) = crate::app::tests::open_group();
+        crate::app::tests::make_me_admin(&mut app);
+        app.update(Message::ToggleGroupInfo);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("group-info") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        let snap = ui.snapshot(&app.theme()).expect("render");
+        assert!(snap.matches_image(dir.join("group-info")).expect("write png"));
     }
 }
