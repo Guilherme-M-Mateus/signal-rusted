@@ -1,0 +1,3 @@
+[env]
+# Where RingRTC's build script finds libwebrtc.a (feature `calls`, made by scripts/webrtc.sh).
+OUTPUT_DIR = { value = "target/webrtc", relative = true }

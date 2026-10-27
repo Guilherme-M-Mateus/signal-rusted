@@ -1,3 +1,4 @@
 /target
 snapshots/
 .claude/
+/third_party/
