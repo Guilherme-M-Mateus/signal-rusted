@@ -11,7 +11,8 @@ use presage::libsignal_service::protocol::ServiceId;
 use presage::store::Thread;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::backend::{self, Command, Conversation, Event, QuoteRef, SearchResult, attachment_key, now_ms};
+use crate::backend::{self, ChatAction, Command, Conversation, Event, QuoteRef, SearchResult, attachment_key, now_ms};
+use crate::state::MAX_PINNED;
 use crate::timeline::{Delivery, Message as Msg, Timeline};
 use crate::{audio, emoji, richtext};
 
@@ -100,6 +101,13 @@ pub struct App {
     pub durations: HashMap<String, Duration>,
     /// Audio to start once its download finishes.
     play_when_ready: Option<String>,
+    /// The sidebar shows archived chats instead of the inbox.
+    pub show_archived: bool,
+    /// The "Message requests" section is expanded.
+    pub requests_open: bool,
+    /// Sidebar row under the mouse (shows its "⋯"), and the row whose menu is open.
+    pub row_hovered: Option<Thread>,
+    pub row_menu: Option<Thread>,
     data_dir: PathBuf,
 }
 
@@ -136,6 +144,11 @@ pub enum Message {
     LoadOlder,
     ToggleTimerMenu,
     SetTimer(u32),
+    ShowArchived(bool),
+    ToggleRequests,
+    RowHover(Option<Thread>),
+    RowMenu(Option<Thread>),
+    Chat(Thread, ChatAction),
     FetchAttachment(String),
     PlayPause(String),
     AudioDuration(String, Option<Duration>),
@@ -178,6 +191,10 @@ impl App {
             playback: None,
             durations: HashMap::new(),
             play_when_ready: None,
+            show_archived: false,
+            requests_open: false,
+            row_hovered: None,
+            row_menu: None,
             data_dir,
         };
         (app, iced::system::theme().map(Message::Theme))
@@ -270,6 +287,10 @@ impl App {
                     self.audio(audio::Cmd::Finish(None));
                 }
                 self.send(Command::Open(thread.clone()));
+                self.row_menu = None;
+                if let Some(c) = self.conversations.iter_mut().find(|c| c.thread == thread) {
+                    c.marked_unread = false; // the backend clears it too
+                }
                 self.open = Some(Open {
                     thread,
                     title,
@@ -302,7 +323,7 @@ impl App {
                 o.composer.perform(action);
                 if edit {
                     o.last_keystroke = Some(Instant::now());
-                    if !o.typing_sent && !o.composer.text().trim().is_empty() {
+                    if !o.typing_sent && !o.composer.text().trim().is_empty() && !self.conversations.iter().any(|c| c.thread == o.thread && c.request) {
                         o.typing_sent = true;
                         let thread = o.thread.clone();
                         self.send(Command::Typing { thread, started: true });
@@ -453,6 +474,14 @@ impl App {
                 }
                 self.send(Command::SetTimer { thread, seconds });
             }
+            Message::ShowArchived(on) => {
+                self.show_archived = on;
+                self.row_menu = None;
+            }
+            Message::ToggleRequests => self.requests_open = !self.requests_open,
+            Message::RowHover(t) => self.row_hovered = t,
+            Message::RowMenu(t) => self.row_menu = if self.row_menu == t { None } else { t },
+            Message::Chat(thread, action) => self.chat(thread, action),
             Message::FetchAttachment(key) => self.fetch(&key),
             Message::PlayPause(key) => self.play_pause(key),
             Message::AudioDuration(key, d) => {
@@ -655,6 +684,9 @@ impl App {
 
     fn send_message(&mut self, voice_note: bool) {
         let me = self.me;
+        if self.open.as_ref().is_some_and(|o| self.is_request(&o.thread)) {
+            return; // accept first, like Signal
+        }
         let Some(o) = &mut self.open else { return };
         let raw = o.composer.text();
         let raw = raw.trim_end_matches('\n');
@@ -733,6 +765,37 @@ impl App {
         o.typing_sent = false; // a sent message implicitly stops typing for recipients
         o.last_keystroke = None;
         self.send(cmd);
+    }
+
+    /// Applies a menu or request-bar choice right away; the backend persists it and refreshes.
+    fn chat(&mut self, thread: Thread, action: ChatAction) {
+        self.row_menu = None;
+        if action == ChatAction::Pin(true) && self.conversations.iter().filter(|c| c.pinned).count() >= MAX_PINNED {
+            self.error = Some(format!("You can only pin up to {MAX_PINNED} chats"));
+            return;
+        }
+        if let Some(c) = self.conversations.iter_mut().find(|c| c.thread == thread) {
+            match action {
+                ChatAction::Archive(on) => c.archived = on,
+                ChatAction::Pin(on) => c.pinned = on,
+                ChatAction::Mute(on) => c.muted = on,
+                ChatAction::MarkUnread(on) => c.marked_unread = on,
+                ChatAction::Accept => c.request = false,
+                ChatAction::Delete | ChatAction::Block => {}
+            }
+        }
+        if matches!(action, ChatAction::Delete | ChatAction::Block) {
+            self.conversations.retain(|c| c.thread != thread);
+            if self.open.as_ref().is_some_and(|o| o.thread == thread) {
+                self.open = None;
+            }
+        }
+        self.send(Command::Chat { thread, action });
+    }
+
+    /// Whether `thread` is an unanswered message request.
+    pub fn is_request(&self, thread: &Thread) -> bool {
+        self.conversations.iter().any(|c| c.thread == *thread && c.request)
     }
 
     fn react(&mut self, author: Uuid, id: u64, emoji: String) {
@@ -970,6 +1033,11 @@ pub(crate) mod tests {
             is_group: false,
             expire_timer: 0,
             members: Vec::new(),
+            request: false,
+            pinned: false,
+            archived: false,
+            muted: false,
+            marked_unread: false,
         }])));
         (app, rx)
     }
@@ -992,6 +1060,11 @@ pub(crate) mod tests {
             is_group: true,
             members: vec![uuid(ME), uuid(ALICE), uuid(3), uuid(4)],
             expire_timer: 0,
+            request: false,
+            pinned: false,
+            archived: false,
+            muted: false,
+            marked_unread: false,
         });
         app.update(Message::Backend(Event::Conversations(convs)));
         app.update(Message::OpenThread(group(), "Friends".into(), true));
@@ -1533,6 +1606,75 @@ pub(crate) mod tests {
         assert_eq!(app.results.len(), 1);
         app.update(Message::Search("".into()));
         assert!(app.results.is_empty());
+    }
+
+    pub fn bob() -> Thread {
+        Thread::Contact(ServiceId::Aci(uuid(3).into()))
+    }
+
+    /// Like `app()`, plus a message request from Bob, a stranger.
+    pub fn with_request() -> (App, UnboundedReceiver<Command>) {
+        let (mut app, rx) = app();
+        let mut convs = app.conversations.clone();
+        let mut c = convs[0].clone();
+        (c.thread, c.title, c.preview, c.last_ts, c.request) = (bob(), "Bob".into(), "hey, it's Bob".into(), 20, true);
+        convs.insert(0, c);
+        app.update(Message::Backend(Event::Conversations(convs)));
+        (app, rx)
+    }
+
+    #[test]
+    fn requests_send_no_typing_or_messages_until_accepted() {
+        let (mut app, mut rx) = with_request();
+        app.update(Message::OpenThread(bob(), "Bob".into(), false));
+        drain(&mut rx);
+        type_text(&mut app, "hi");
+        app.update(Message::Send);
+        assert!(drain(&mut rx).is_empty(), "no typing, no send");
+        app.update(Message::Chat(bob(), ChatAction::Accept));
+        assert!(!app.is_request(&bob()));
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Chat { action: ChatAction::Accept, .. }]));
+        app.update(Message::Send);
+        assert!(drain(&mut rx).iter().any(|c| matches!(c, Command::Send { .. })));
+    }
+
+    #[test]
+    fn deleting_or_blocking_a_request_drops_the_chat() {
+        for action in [ChatAction::Delete, ChatAction::Block] {
+            let (mut app, mut rx) = with_request();
+            app.update(Message::OpenThread(bob(), "Bob".into(), false));
+            drain(&mut rx);
+            app.update(Message::Chat(bob(), action));
+            assert!(app.open.is_none() && !app.conversations.iter().any(|c| c.thread == bob()));
+            assert!(matches!(drain(&mut rx).as_slice(), [Command::Chat { thread, action: a }] if *thread == bob() && *a == action));
+        }
+    }
+
+    #[test]
+    fn menu_actions_apply_locally_and_reach_the_backend() {
+        let (mut app, mut rx) = app();
+        app.update(Message::RowMenu(Some(alice())));
+        assert_eq!(app.row_menu, Some(alice()));
+        for action in [ChatAction::Pin(true), ChatAction::Mute(true), ChatAction::Archive(true), ChatAction::MarkUnread(true)] {
+            app.update(Message::Chat(alice(), action));
+        }
+        assert!(app.row_menu.is_none(), "choosing closes the menu");
+        let c = &app.conversations[0];
+        assert!(c.pinned && c.muted && c.archived && c.marked_unread);
+        assert_eq!(drain(&mut rx).len(), 4);
+        app.update(Message::OpenThread(alice(), "Alice".into(), false));
+        assert!(!app.conversations[0].marked_unread, "opening clears the unread mark");
+    }
+
+    #[test]
+    fn at_most_four_pins() {
+        let (mut app, mut rx) = app();
+        let convs: Vec<Conversation> = (10..15u8)
+            .map(|n| Conversation { thread: Thread::Contact(ServiceId::Aci(uuid(n).into())), pinned: n < 14, ..app.conversations[0].clone() })
+            .collect();
+        app.update(Message::Backend(Event::Conversations(convs)));
+        app.update(Message::Chat(Thread::Contact(ServiceId::Aci(uuid(14).into())), ChatAction::Pin(true)));
+        assert!(drain(&mut rx).is_empty() && app.error.as_deref() == Some("You can only pin up to 4 chats"));
     }
 
     #[test]

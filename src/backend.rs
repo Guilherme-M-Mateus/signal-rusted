@@ -2,7 +2,7 @@
 //! thread (current-thread runtime + `LocalSet`) and talks to the UI over channels,
 //! much like Signal-Desktop's renderer talks to its SQL worker.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,10 @@ use presage::model::messages::Received;
 use presage::proto::addressable_message::Author;
 use presage::proto::conversation_identifier::Identifier;
 use presage::proto::data_message::{Delete, Flags, Quote as ProtoQuote, Reaction};
-use presage::proto::sync_message::{self, Content as SyncContent, DeleteForMe, delete_for_me::MessageDeletes};
+use presage::proto::sync_message::{
+    self, Content as SyncContent, DeleteForMe, MessageRequestResponse, delete_for_me::MessageDeletes,
+    message_request_response::Type as RequestResponse,
+};
 use presage::proto::{
     AddressableMessage, AttachmentPointer, BodyRange, ConversationIdentifier, DataMessage, EditMessage,
     GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage, receipt_message, typing_message,
@@ -36,7 +39,7 @@ use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use tokio::sync::mpsc;
 
-use crate::state::AppState;
+use crate::state::{AppState, MAX_PINNED, thread_key};
 use crate::timeline::{Delivery, Kind, Timeline};
 
 type Mgr = Manager<SqliteStore, Registered>;
@@ -85,6 +88,19 @@ pub enum Command {
     /// Disappearing-message timer in seconds (0 = off); 1:1 chats only.
     SetTimer { thread: Thread, seconds: u32 },
     Search(String),
+    Chat { thread: Thread, action: ChatAction },
+}
+
+/// What the sidebar's "⋯" menu and the message-request bar do to a chat.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChatAction {
+    Archive(bool),
+    Pin(bool),
+    Mute(bool),
+    MarkUnread(bool),
+    Accept,
+    Delete,
+    Block,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +115,20 @@ pub struct Conversation {
     pub expire_timer: u32,
     /// Group members (for @mentions); empty for 1:1 chats.
     pub members: Vec<Uuid>,
+    /// A message request: someone we never accepted.
+    pub request: bool,
+    pub pinned: bool,
+    pub archived: bool,
+    pub muted: bool,
+    pub marked_unread: bool,
+}
+
+/// Pinned chats first (in pin order), then newest first.
+pub fn sort_conversations(convs: &mut [Conversation], pinned: &[String]) {
+    convs.sort_by_cached_key(|c| {
+        let pin = pinned.iter().position(|k| *k == thread_key(&c.thread)).unwrap_or(usize::MAX);
+        (pin, std::cmp::Reverse(c.last_ts))
+    });
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -276,6 +306,39 @@ fn delete_for_me_sync(thread: &Thread, author: Uuid, ts: u64) -> SyncMessage {
         })),
         ..Default::default()
     }
+}
+
+/// Tells our other devices how we answered a message request.
+fn message_request_sync(thread: &Thread, ty: RequestResponse) -> SyncMessage {
+    let (aci, group) = match thread {
+        Thread::Contact(id) => (Some(id.raw_uuid()), None),
+        Thread::Group(key) => (None, Some(group_id(key).to_vec())),
+    };
+    SyncMessage {
+        content: Some(SyncContent::MessageRequestResponse(MessageRequestResponse {
+            thread_aci: aci.map(|a| a.to_string()),
+            thread_aci_binary: aci.map(|a| a.as_bytes().to_vec()),
+            group_id: group,
+            r#type: Some(ty as i32),
+        })),
+        ..Default::default()
+    }
+}
+
+/// Our whole block list, as Signal syncs it to our devices.
+fn blocked_sync(state: &AppState) -> SyncMessage {
+    let mut b = sync_message::Blocked::default();
+    for key in state.flags.iter().filter(|(_, f)| f.blocked).map(|(k, _)| k) {
+        match crate::state::parse_thread_key(key) {
+            Some(Thread::Contact(id @ ServiceId::Aci(_))) => {
+                b.acis.push(id.raw_uuid().to_string());
+                b.acis_binary.push(id.raw_uuid().as_bytes().to_vec());
+            }
+            Some(Thread::Group(k)) => b.group_ids.push(group_id(&k).to_vec()),
+            _ => {}
+        }
+    }
+    SyncMessage { content: Some(SyncContent::Blocked(b)), ..Default::default() }
 }
 
 /// Starts the backend thread; the stream yields `Event::Started` first.
@@ -605,7 +668,7 @@ impl Backend {
                 tracing::warn!(%e, "failed to fetch group from storage service");
             }
         }
-        self.state.set_storage(plan.listed, plan.names);
+        self.state.set_storage(plan.listed, plan.names, plan.flags, plan.pinned);
         Ok(())
     }
 
@@ -623,6 +686,9 @@ impl Backend {
     async fn refresh(&mut self) {
         let names = self.names().await;
         let store = self.manager.store();
+        // Address-book contacts (from contact sync) aren't message requests; presage also saves
+        // a contact "on first sight" of a stranger, but without a phone number.
+        let mut address_book = HashSet::new();
         let mut threads: Vec<(Thread, String, bool, Vec<Uuid>)> = Vec::new();
         if let Ok(groups) = store.groups().await {
             for (key, g) in groups.flatten() {
@@ -633,6 +699,9 @@ impl Backend {
         }
         if let Ok(contacts) = store.contacts().await {
             for c in contacts.flatten() {
+                if c.phone_number.is_some() {
+                    address_book.insert(c.uuid);
+                }
                 let title = names.get(&c.uuid).cloned().unwrap_or_else(|| c.uuid.to_string());
                 threads.push((Thread::Contact(ServiceId::Aci(c.uuid.into())), title, false, Vec::new()));
             }
@@ -651,19 +720,37 @@ impl Backend {
         threads.push((me.clone(), "Note to Self".into(), false, Vec::new()));
 
         let mut out = Vec::new();
+        let now = now_ms();
         for (thread, title, is_group, members) in threads {
+            let f = self.state.flags(&thread);
+            if f.blocked {
+                continue;
+            }
             let expire_timer = self.manager.store().expire_timer(&thread).await.ok().flatten().map_or(0, |(t, _)| t);
-            let Some((last_ts, preview)) = self.last_message(&thread).await else {
+            let (last_ts, preview, unread) = match self.last_message(&thread).await {
+                Some((ts, preview)) => (ts, preview, self.unread(&thread).await),
                 // Groups, Note to Self and chats the storage service lists show even when empty.
-                if is_group || thread == me || self.state.listed.contains(&crate::state::thread_key(&thread)) {
-                    out.push(Conversation { thread, title, last_ts: 0, preview: String::new(), unread: 0, is_group, members, expire_timer });
-                }
-                continue; // contacts without messages live in the "new chat" search
+                None if is_group || thread == me || self.state.listed.contains(&thread_key(&thread)) => (0, String::new(), 0),
+                None => continue, // contacts without messages live in the "new chat" search
             };
-            let unread = self.unread(&thread).await;
-            out.push(Conversation { thread, title, last_ts, preview, unread, is_group, members, expire_timer });
+            let in_contacts = matches!(&thread, Thread::Contact(id) if address_book.contains(&id.raw_uuid()));
+            out.push(Conversation {
+                request: self.state.is_request(&thread, self.me, in_contacts),
+                pinned: self.state.is_pinned(&thread),
+                archived: f.archived,
+                muted: f.muted_until > now,
+                marked_unread: f.marked_unread,
+                thread,
+                title,
+                last_ts,
+                preview,
+                unread,
+                is_group,
+                members,
+                expire_timer,
+            });
         }
-        out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        sort_conversations(&mut out, &self.state.pinned);
         self.threads = out.iter().map(|c| (c.thread.clone(), c.title.clone())).collect();
         self.emit(Event::Names(names));
         self.emit(Event::Conversations(out));
@@ -682,6 +769,51 @@ impl Backend {
         None
     }
 
+    /// `AppState::is_request`, looking the sender up in the address book.
+    async fn is_request(&self, thread: &Thread) -> bool {
+        let in_contacts = match thread {
+            Thread::Contact(id) => {
+                matches!(self.manager.store().contact_by_id(id).await, Ok(Some(c)) if c.phone_number.is_some())
+            }
+            Thread::Group(_) => false,
+        };
+        self.state.is_request(thread, self.me, in_contacts)
+    }
+
+    async fn sync_to_self(&mut self, sync: SyncMessage) -> anyhow::Result<()> {
+        let me = ServiceId::Aci(self.me.into());
+        self.manager.send_message(me, sync, now_ms()).await?;
+        Ok(())
+    }
+
+    async fn chat_action(&mut self, thread: &Thread, action: ChatAction) -> anyhow::Result<()> {
+        match action {
+            ChatAction::Archive(on) => self.state.update_flags(thread, |f| f.archived = on),
+            ChatAction::Mute(on) => self.state.update_flags(thread, |f| f.muted_until = if on { u64::MAX } else { 0 }),
+            ChatAction::MarkUnread(on) => self.state.update_flags(thread, |f| f.marked_unread = on),
+            ChatAction::Pin(on) => anyhow::ensure!(self.state.set_pinned(thread, on), "you can only pin up to {MAX_PINNED} chats"),
+            ChatAction::Accept => {
+                self.state.accept(thread);
+                self.sync_to_self(message_request_sync(thread, RequestResponse::Accept)).await?;
+                if let Thread::Contact(id) = thread {
+                    // Shares our profile key (presage adds it to every DataMessage), as Signal does on accept.
+                    let update = DataMessage { flags: Some(Flags::ProfileKeyUpdate as u32), ..Default::default() };
+                    self.manager.send_message(*id, update, now_ms()).await?;
+                }
+            }
+            ChatAction::Delete => {
+                self.manager.store().clone().clear_thread(thread).await?;
+                self.sync_to_self(message_request_sync(thread, RequestResponse::Delete)).await?;
+            }
+            ChatAction::Block => {
+                self.state.update_flags(thread, |f| f.blocked = true);
+                self.sync_to_self(message_request_sync(thread, RequestResponse::Block)).await?;
+                self.sync_to_self(blocked_sync(&self.state)).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn unread(&self, thread: &Thread) -> usize {
         let since = self.state.last_read(thread) + 1;
         let Ok(rows) = self.manager.store().messages(thread, since..).await else { return 0 };
@@ -697,6 +829,9 @@ impl Backend {
                 let Some(rows) = self.report("load conversation", rows) else { return };
                 let timeline = Timeline::from_newest_first(self.me, rows.flatten(), HISTORY_ROWS);
                 self.open = Some(thread.clone());
+                if self.state.flags(&thread).marked_unread {
+                    self.state.update_flags(&thread, |f| f.marked_unread = false);
+                }
                 self.mark_read(&thread, &timeline).await;
                 self.start_expiries(&thread, &timeline);
                 self.emit(Event::Timeline { thread, timeline });
@@ -767,6 +902,7 @@ impl Backend {
                 let r = self.send_body(&thread, dm, now_ms()).await;
                 self.report("send reaction", r);
             }
+            Command::Typing { thread, .. } if self.is_request(&thread).await => {} // Signal doesn't reveal typing to requests
             Command::Typing { thread, started } => {
                 let action = if started { typing_message::Action::Started } else { typing_message::Action::Stopped };
                 let msg = TypingMessage {
@@ -796,6 +932,11 @@ impl Backend {
                     }
                 }
                 self.emit(Event::SearchResults { query, results });
+            }
+            Command::Chat { thread, action } => {
+                let r = self.chat_action(&thread, action).await;
+                self.report("update chat", r);
+                self.refresh().await;
             }
         }
     }
@@ -909,11 +1050,13 @@ impl Backend {
         if unread.is_empty() {
             return;
         }
+        let request = self.is_request(thread).await;
         let mut by_author: HashMap<Uuid, Vec<u64>> = HashMap::new();
         for (a, ts) in &unread {
             by_author.entry(*a).or_default().push(*ts);
         }
-        for (author, timestamp) in by_author {
+        // Read receipts would tell a stranger we saw their request.
+        for (author, timestamp) in by_author.into_iter().filter(|_| !request) {
             let receipt = ReceiptMessage { r#type: Some(receipt_message::Type::Read as i32), timestamp };
             let r = self.manager.send_message(ServiceId::Aci(author.into()), receipt, now_ms()).await;
             if let Err(e) = r {
@@ -989,6 +1132,14 @@ impl Backend {
 
     async fn content(&mut self, c: Content) {
         let sender = c.metadata.sender.raw_uuid();
+        let ts = c.metadata.client_timestamp.timestamp_millis() as u64;
+        if sender != self.me && self.state.flags(&Thread::Contact(c.metadata.sender)).blocked {
+            // Dropped silently; presage already stored it, so forget it again.
+            if let Ok(thread) = Thread::try_from(&c) {
+                let _ = self.manager.store().clone().delete_message(&thread, ts).await;
+            }
+            return;
+        }
         match &c.body {
             ContentBody::ReceiptMessage(r) => {
                 let level = match r.r#type.and_then(|t| receipt_message::Type::try_from(t).ok()) {
@@ -1028,22 +1179,50 @@ impl Backend {
                 self.refresh().await;
                 return;
             }
+            ContentBody::SynchronizeMessage(SyncMessage { content: Some(SyncContent::MessageRequestResponse(r)), .. })
+                if sender == self.me =>
+            {
+                // Answered on another device.
+                let aci = r.thread_aci_binary.as_deref().and_then(|b| Uuid::from_slice(b).ok());
+                let aci = aci.or_else(|| r.thread_aci.as_deref().and_then(|s| Uuid::parse_str(s).ok()));
+                let Some(thread) = aci.map(|a| Thread::Contact(ServiceId::Aci(a.into()))) else { return };
+                match r.r#type.and_then(|t| RequestResponse::try_from(t).ok()) {
+                    Some(RequestResponse::Accept) => self.state.accept(&thread),
+                    Some(RequestResponse::Delete) => drop(self.manager.store().clone().clear_thread(&thread).await),
+                    Some(RequestResponse::Block | RequestResponse::BlockAndDelete | RequestResponse::BlockAndSpam) => {
+                        self.state.update_flags(&thread, |f| f.blocked = true)
+                    }
+                    _ => {}
+                }
+                self.refresh().await;
+                return;
+            }
             _ => {}
         }
         let Ok(thread) = Thread::try_from(&c) else { return };
+        if sender != self.me && self.state.flags(&thread).blocked {
+            let _ = self.manager.store().clone().delete_message(&thread, ts).await; // a blocked group
+            return;
+        }
 
         let is_visible_incoming = sender != self.me
             && matches!(&c.body, ContentBody::DataMessage(dm)
                 if dm.reaction.is_none() && (dm.body.is_some() || !dm.attachments.is_empty() || dm.sticker.is_some()));
         if is_visible_incoming {
-            // Delivery receipt, as every Signal client does.
-            let ts = match &c.body {
-                ContentBody::DataMessage(dm) => dm.timestamp.unwrap_or(0),
-                _ => 0,
-            };
-            let receipt = ReceiptMessage { r#type: Some(receipt_message::Type::Delivery as i32), timestamp: vec![ts] };
-            if let Err(e) = self.manager.send_message(c.metadata.sender, receipt, now_ms()).await {
-                tracing::debug!(%e, "delivery receipt failed");
+            // Delivery receipt, as every Signal client does, except to message requests.
+            if !self.is_request(&thread).await {
+                let ts = match &c.body {
+                    ContentBody::DataMessage(dm) => dm.timestamp.unwrap_or(0),
+                    _ => 0,
+                };
+                let receipt = ReceiptMessage { r#type: Some(receipt_message::Type::Delivery as i32), timestamp: vec![ts] };
+                if let Err(e) = self.manager.send_message(c.metadata.sender, receipt, now_ms()).await {
+                    tracing::debug!(%e, "delivery receipt failed");
+                }
+            }
+            // A new message brings an archived chat back, unless it's muted (Signal's rule).
+            if self.state.flags(&thread).archived && !self.state.is_muted(&thread, now_ms()) {
+                self.state.update_flags(&thread, |f| f.archived = false);
             }
             if self.open.as_ref() == Some(&thread) {
                 let mut t = Timeline::new(self.me);
@@ -1063,6 +1242,9 @@ impl Backend {
     }
 
     async fn notify(&self, thread: &Thread, c: &Content) {
+        if self.state.is_muted(thread, now_ms()) {
+            return;
+        }
         let mut t = Timeline::new(self.me);
         t.apply(c);
         let Some(m) = t.messages.last() else { return };
@@ -1202,6 +1384,51 @@ mod tests {
             Some(Identifier::ThreadGroupId(group_id(&[1; 32]).to_vec())),
             "groups are addressed by their public id, never the master key"
         );
+    }
+
+    fn conv(n: u8, last_ts: u64) -> Conversation {
+        Conversation {
+            thread: Thread::Contact(ServiceId::Aci(uuid(n).into())),
+            title: String::new(),
+            last_ts,
+            preview: String::new(),
+            unread: 0,
+            is_group: false,
+            expire_timer: 0,
+            members: Vec::new(),
+            request: false,
+            pinned: false,
+            archived: false,
+            muted: false,
+            marked_unread: false,
+        }
+    }
+
+    #[test]
+    fn pinned_chats_sort_first_in_pin_order() {
+        let mut c = vec![conv(1, 10), conv(2, 30), conv(3, 20), conv(4, 5)];
+        let pinned = [thread_key(&conv(4, 0).thread), thread_key(&conv(3, 0).thread)];
+        sort_conversations(&mut c, &pinned);
+        let order: Vec<u64> = c.iter().map(|c| c.last_ts).collect();
+        assert_eq!(order, [5, 20, 30, 10]);
+    }
+
+    #[test]
+    fn request_and_block_syncs() {
+        let alice = Thread::Contact(ServiceId::Aci(uuid(2).into()));
+        let Some(SyncContent::MessageRequestResponse(r)) = message_request_sync(&alice, RequestResponse::Accept).content else { panic!() };
+        assert_eq!((r.thread_aci, r.thread_aci_binary, r.r#type), (Some(uuid(2).to_string()), Some(uuid(2).as_bytes().to_vec()), Some(1)));
+        let Some(SyncContent::MessageRequestResponse(r)) = message_request_sync(&Thread::Group([1; 32]), RequestResponse::Block).content else { panic!() };
+        assert_eq!(r.group_id, Some(group_id(&[1; 32]).to_vec()), "public group id, never the master key");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::load(&dir.path().join("state.json"));
+        state.update_flags(&alice, |f| f.blocked = true);
+        state.update_flags(&Thread::Group([1; 32]), |f| f.blocked = true);
+        state.update_flags(&Thread::Contact(ServiceId::Aci(uuid(3).into())), |f| f.archived = true);
+        let Some(SyncContent::Blocked(b)) = blocked_sync(&state).content else { panic!() };
+        assert_eq!(b.acis, [uuid(2).to_string()]);
+        assert_eq!(b.group_ids, [group_id(&[1; 32]).to_vec()]);
     }
 
     #[test]

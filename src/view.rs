@@ -16,7 +16,7 @@ use presage::libsignal_service::prelude::Uuid;
 use presage::proto::{AttachmentPointer, BodyRange};
 
 use crate::app::{App, Attach, Message, Open, Screen, TIMERS, display_name};
-use crate::backend::{attachment_key, now_ms};
+use crate::backend::{ChatAction, Conversation, attachment_key, now_ms};
 use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label, short_duration};
 use crate::{emoji, richtext};
 
@@ -205,47 +205,108 @@ fn qr_style(_: &Theme) -> qr_code::Style {
     qr_code::Style { cell: Color::BLACK, background: Color::WHITE }
 }
 
-fn sidebar(app: &App) -> Element<'_, Message> {
-    let q = app.search.trim().to_lowercase();
-    let mut list = Column::new();
-    for c in app.conversations.iter().filter(|c| q.is_empty() || c.title.to_lowercase().contains(&q)) {
-        let selected = app.open.as_ref().is_some_and(|o| o.thread == c.thread);
-        let seed = crate::state::thread_key(&c.thread);
-        let mut top = row![text(c.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill)];
-        if c.last_ts > 0 {
-            top = top.push(text(short_time(c.last_ts)).size(12).style(|t: &Theme| text::Style { color: Some(muted(t)) }));
-        }
-        let typing = app.typing_names(&c.thread);
-        let preview = if !typing.is_empty() { "typing…".to_string() } else { truncate(&c.preview, 48) };
-        let mut bottom = row![text(preview).size(13).wrapping(text::Wrapping::None).width(Length::Fill).style(|t: &Theme| text::Style { color: Some(muted(t)) })];
-        if c.unread > 0 {
-            bottom = bottom.push(
-                container(text(c.unread.to_string()).size(12).color(Color::WHITE))
-                    .padding([1, 7])
-                    .style(|_| container::Style {
-                        background: Some(BLUE.into()),
-                        border: Border { radius: 10.0.into(), ..Default::default() },
-                        ..Default::default()
-                    }),
-            );
-        }
-        let item = row![avatar(&c.title, &seed, 44.0), column![top, bottom].spacing(2)]
-            .spacing(12)
-            .align_y(Alignment::Center);
-        list = list.push(
-            button(item)
-                .width(Length::Fill)
-                .padding([10, 12])
-                .on_press(Message::OpenThread(c.thread.clone(), c.title.clone(), c.is_group))
-                .style(move |t: &Theme, status| {
-                    let bg = match (selected, status) {
-                        (true, _) => Some(surface(t).into()),
-                        (_, button::Status::Hovered) => Some(surface(t).scale_alpha(0.5).into()),
-                        _ => None,
-                    };
-                    button::Style { background: bg, text_color: t.palette().text, ..Default::default() }
+fn chat_row<'a>(app: &'a App, c: &'a Conversation) -> Element<'a, Message> {
+    let selected = app.open.as_ref().is_some_and(|o| o.thread == c.thread);
+    let seed = crate::state::thread_key(&c.thread);
+    let dim = |t: &Theme| text::Style { color: Some(muted(t)) };
+    let mut top = row![text(c.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill)].spacing(4);
+    if c.pinned {
+        top = top.push(text("📌").size(12));
+    }
+    if c.muted {
+        top = top.push(text("🔕").size(12));
+    }
+    if c.last_ts > 0 {
+        top = top.push(text(short_time(c.last_ts)).size(12).style(dim));
+    }
+    let typing = app.typing_names(&c.thread);
+    let preview = if !typing.is_empty() { "typing…".to_string() } else { truncate(&c.preview, 48) };
+    let mut bottom = row![text(preview).size(13).wrapping(text::Wrapping::None).width(Length::Fill).style(dim)];
+    if c.unread > 0 {
+        bottom = bottom.push(
+            container(text(c.unread.to_string()).size(12).color(Color::WHITE))
+                .padding([1, 7])
+                .style(|_| container::Style {
+                    background: Some(BLUE.into()),
+                    border: Border { radius: 10.0.into(), ..Default::default() },
+                    ..Default::default()
                 }),
         );
+    } else if c.marked_unread {
+        bottom = bottom.push(container(Space::new()).width(10).height(10).style(|_| container::Style {
+            background: Some(BLUE.into()),
+            border: Border { radius: 5.0.into(), ..Default::default() },
+            ..Default::default()
+        }));
+    }
+    let item = row![avatar(&c.title, &seed, 44.0), column![top, bottom].spacing(2)]
+        .spacing(12)
+        .align_y(Alignment::Center);
+    let open = button(item)
+        .width(Length::Fill)
+        .padding([10, 12])
+        .on_press(Message::OpenThread(c.thread.clone(), c.title.clone(), c.is_group))
+        .style(move |t: &Theme, status| {
+            let bg = match (selected, status) {
+                (true, _) => Some(surface(t).into()),
+                (_, button::Status::Hovered) => Some(surface(t).scale_alpha(0.5).into()),
+                _ => None,
+            };
+            button::Style { background: bg, text_color: t.palette().text, ..Default::default() }
+        });
+    // iced has no context menu: a "⋯" on hover opens the row's actions (not for requests).
+    let menu_open = app.row_menu.as_ref() == Some(&c.thread);
+    let mut line = row![open].align_y(Alignment::Center);
+    if !c.request && (menu_open || app.row_hovered.as_ref() == Some(&c.thread)) {
+        line = line.push(button(text("⋯").size(16)).on_press(Message::RowMenu(Some(c.thread.clone()))).style(button::text));
+    }
+    let mut col = column![line];
+    if menu_open {
+        let item = |label: &'static str, action| {
+            button(text(label).size(13)).on_press(Message::Chat(c.thread.clone(), action)).style(button::secondary)
+        };
+        let menu = row![
+            item(if c.pinned { "Unpin" } else { "Pin" }, ChatAction::Pin(!c.pinned)),
+            item(if c.archived { "Unarchive" } else { "Archive" }, ChatAction::Archive(!c.archived)),
+            item(if c.muted { "Unmute" } else { "Mute" }, ChatAction::Mute(!c.muted)),
+            item(if c.marked_unread { "Mark read" } else { "Mark unread" }, ChatAction::MarkUnread(!c.marked_unread)),
+        ]
+        .spacing(4);
+        col = col.push(container(menu.wrap()).padding([4, 12]));
+    }
+    mouse_area(col).on_enter(Message::RowHover(Some(c.thread.clone()))).on_exit(Message::RowHover(None)).into()
+}
+
+fn sidebar(app: &App) -> Element<'_, Message> {
+    let q = app.search.trim().to_lowercase();
+    let shown = |c: &&Conversation| q.is_empty() || c.title.to_lowercase().contains(&q);
+    let section = |label: String, msg| {
+        button(text(label).size(13)).width(Length::Fill).padding([8, 12]).on_press(msg).style(button::text)
+    };
+    let mut list = Column::new();
+    if app.show_archived {
+        list = list.push(section("← Archived chats".into(), Message::ShowArchived(false)));
+        for c in app.conversations.iter().filter(|c| c.archived && !c.request).filter(shown) {
+            list = list.push(chat_row(app, c));
+        }
+    } else {
+        let requests: Vec<&Conversation> = app.conversations.iter().filter(|c| c.request).filter(shown).collect();
+        if !requests.is_empty() {
+            let arrow = if app.requests_open { "▾" } else { "▸" };
+            list = list.push(section(format!("{arrow} Message requests ({})", requests.len()), Message::ToggleRequests));
+            if app.requests_open {
+                for c in requests {
+                    list = list.push(chat_row(app, c));
+                }
+            }
+        }
+        for c in app.conversations.iter().filter(|c| !c.archived && !c.request).filter(shown) {
+            list = list.push(chat_row(app, c));
+        }
+        let archived = app.conversations.iter().filter(|c| c.archived && !c.request).count();
+        if archived > 0 {
+            list = list.push(section(format!("Archived chats ({archived})"), Message::ShowArchived(true)));
+        }
     }
     let contacts = app.contact_matches();
     if !contacts.is_empty() {
@@ -346,7 +407,37 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         }
     };
 
-    column![header, rule::horizontal(1), body, composer(app, o)].into()
+    let bottom = if app.is_request(&o.thread) { request_bar(o) } else { composer(app, o) };
+    column![header, rule::horizontal(1), body, bottom].into()
+}
+
+/// Shown instead of the composer until a message request is answered.
+fn request_bar(o: &Open) -> Element<'_, Message> {
+    let t = &o.thread;
+    let choice = |label: &'static str, action, style: fn(&Theme, button::Status) -> button::Style| {
+        button(text(label)).on_press(Message::Chat(t.clone(), action)).style(style)
+    };
+    container(
+        column![
+            text(format!(
+                "{} isn't in your contacts. They won't know you've seen their messages until you accept.",
+                o.title
+            ))
+            .size(13)
+            .style(|t: &Theme| text::Style { color: Some(muted(t)) }),
+            row![
+                choice("Block", ChatAction::Block, button::danger),
+                choice("Delete", ChatAction::Delete, button::secondary),
+                choice("Accept", ChatAction::Accept, button::primary),
+            ]
+            .spacing(8),
+        ]
+        .spacing(8)
+        .align_x(Alignment::Center),
+    )
+    .padding([12, 16])
+    .center_x(Length::Fill)
+    .into()
 }
 
 /// "⏱ 5m": opens the timer choices in 1:1 chats; read-only in groups (changing it there is a
@@ -1135,6 +1226,94 @@ mod tests {
         }
         assert!(matches!(rx.try_recv(), Ok(crate::backend::Command::Open(t)) if t == bob));
         assert!(app.results.is_empty(), "search cleared once opened");
+    }
+
+    #[test]
+    fn row_menu_pins_mutes_archives_and_marks_unread() {
+        let (mut app, mut rx) = app();
+        assert!(simulator(view(&app)).find("⋯").is_err(), "only on hover");
+        app.row_hovered = Some(alice());
+        click(&mut app, "⋯");
+        click(&mut app, "Pin");
+        app.row_hovered = Some(alice());
+        click(&mut app, "⋯");
+        click(&mut app, "Mute");
+        {
+            let mut ui = simulator(view(&app));
+            assert!(ui.find("📌").is_ok() && ui.find("🔕").is_ok(), "pinned and muted marks");
+        }
+
+        app.conversations[0].unread = 0;
+        click(&mut app, "⋯");
+        click(&mut app, "Mark unread");
+        assert!(app.conversations[0].marked_unread);
+        click(&mut app, "⋯");
+        assert!(simulator(view(&app)).find("Unpin").is_ok() && simulator(view(&app)).find("Mark read").is_ok());
+        click(&mut app, "Archive");
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Alice").is_err(), "gone from the inbox");
+        ui.click("Archived chats (1)").expect("archived link");
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+        assert!(simulator(view(&app)).find("Alice").is_ok(), "listed under Archived");
+        click(&mut app, "← Archived chats");
+        assert!(!app.show_archived);
+
+        let actions: Vec<ChatAction> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|c| match c {
+                Command::Chat { action, .. } => Some(action),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actions, [ChatAction::Pin(true), ChatAction::Mute(true), ChatAction::MarkUnread(true), ChatAction::Archive(true)]);
+    }
+
+    #[test]
+    fn message_requests_are_collapsed_and_answered_from_the_bar() {
+        let (mut app, mut rx) = crate::app::tests::with_request();
+        let bob = crate::app::tests::bob();
+        assert!(simulator(view(&app)).find("Bob").is_err(), "collapsed");
+        click(&mut app, "▸ Message requests (1)");
+        app.row_hovered = Some(bob.clone());
+        assert!(simulator(view(&app)).find("⋯").is_err(), "no menu on requests");
+        click(&mut app, "Bob");
+        {
+            let mut ui = simulator(view(&app));
+            assert!(ui.find("Accept").is_ok() && ui.find("Block").is_ok() && ui.find("Delete").is_ok());
+            assert!(ui.find(iced::widget::Id::new(COMPOSER)).is_err(), "no composer until accepted");
+        }
+        click(&mut app, "Accept");
+        assert!(simulator(view(&app)).find(iced::widget::Id::new(COMPOSER)).is_ok(), "composer once accepted");
+        assert!(simulator(view(&app)).find("Message requests (1)").is_err());
+        let cmds: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(cmds.iter().any(|c| matches!(c, Command::Chat { thread, action: ChatAction::Accept } if *thread == bob)), "{cmds:?}");
+
+        let (mut app, mut rx) = crate::app::tests::with_request();
+        app.update(Message::OpenThread(bob.clone(), "Bob".into(), false));
+        click(&mut app, "Block");
+        assert!(app.open.is_none());
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|c| matches!(c, Command::Chat { action: ChatAction::Block, .. })));
+    }
+
+    /// Writes `snapshots/sidebar-flags-*.png`: requests, pin, mute and unread-dot marks.
+    #[test]
+    fn sidebar_flags_snapshot() {
+        let (mut app, _rx) = crate::app::tests::with_request();
+        app.requests_open = true;
+        let c = &mut app.conversations[1];
+        (c.pinned, c.muted, c.unread, c.marked_unread) = (true, true, 0, true);
+        app.row_hovered = Some(alice());
+        app.row_menu = Some(alice());
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("sidebar-flags") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        let snap = ui.snapshot(&app.theme()).expect("render");
+        assert!(snap.matches_image(dir.join("sidebar-flags")).expect("write png"));
     }
 
     #[test]

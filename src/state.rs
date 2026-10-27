@@ -22,8 +22,35 @@ pub struct AppState {
     /// Disappearing messages whose countdown has started.
     #[serde(default)]
     pub expiring: Vec<Expiry>,
+    /// Per-chat archive/mute/unread/block flags, as currently in effect here.
+    #[serde(default)]
+    pub flags: HashMap<String, ChatFlags>,
+    /// The flags the storage service had at the last sync: only changes made since on another
+    /// device override ours (we don't write ours back, so a restart mustn't undo them).
+    #[serde(default)]
+    synced_flags: HashMap<String, ChatFlags>,
+    /// Pinned chats in order (at most `MAX_PINNED`).
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    #[serde(default)]
+    synced_pinned: Vec<String>,
+    /// Message requests accepted on this device.
+    #[serde(default)]
+    pub accepted: HashSet<String>,
     #[serde(skip)]
     path: PathBuf,
+}
+
+pub const MAX_PINNED: usize = 4;
+
+#[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(default)]
+pub struct ChatFlags {
+    pub archived: bool,
+    /// Ms timestamp; `u64::MAX` is "until I turn it back on", as in Signal's storage records.
+    pub muted_until: u64,
+    pub marked_unread: bool,
+    pub blocked: bool,
 }
 
 /// One message's countdown; Signal identifies a message by thread + author + sent timestamp.
@@ -86,10 +113,77 @@ impl AppState {
         true
     }
 
-    /// Replaces the storage-service snapshot and saves it.
-    pub fn set_storage(&mut self, listed: HashSet<String>, profile_names: HashMap<String, String>) {
+    /// Replaces the storage-service snapshot and saves it. Flags and pins take the storage
+    /// value only where it changed since the last sync, so local-only changes survive.
+    pub fn set_storage(
+        &mut self,
+        listed: HashSet<String>,
+        profile_names: HashMap<String, String>,
+        flags: HashMap<String, ChatFlags>,
+        pinned: Vec<String>,
+    ) {
         self.listed = listed;
         self.profile_names = profile_names;
+        let keys: HashSet<String> = flags.keys().chain(self.synced_flags.keys()).cloned().collect();
+        for k in keys {
+            let new = flags.get(&k).cloned().unwrap_or_default();
+            if self.synced_flags.get(&k).cloned().unwrap_or_default() != new {
+                self.flags.insert(k, new);
+            }
+        }
+        self.synced_flags = flags;
+        if pinned != self.synced_pinned {
+            self.pinned = pinned.iter().take(MAX_PINNED).cloned().collect();
+            self.synced_pinned = pinned;
+        }
+        self.save();
+    }
+
+    pub fn flags(&self, t: &Thread) -> ChatFlags {
+        self.flags.get(&thread_key(t)).cloned().unwrap_or_default()
+    }
+
+    /// Changes one chat's flags and saves.
+    pub fn update_flags(&mut self, t: &Thread, f: impl FnOnce(&mut ChatFlags)) {
+        f(self.flags.entry(thread_key(t)).or_default());
+        self.save();
+    }
+
+    pub fn is_muted(&self, t: &Thread, now_ms: u64) -> bool {
+        self.flags(t).muted_until > now_ms
+    }
+
+    pub fn is_pinned(&self, t: &Thread) -> bool {
+        self.pinned.contains(&thread_key(t))
+    }
+
+    /// Pins (at the end, like Signal) or unpins; false if already at `MAX_PINNED`.
+    pub fn set_pinned(&mut self, t: &Thread, pin: bool) -> bool {
+        let k = thread_key(t);
+        if pin && !self.pinned.contains(&k) {
+            if self.pinned.len() >= MAX_PINNED {
+                return false;
+            }
+            self.pinned.push(k);
+        } else if !pin {
+            self.pinned.retain(|p| *p != k);
+        }
+        self.save();
+        true
+    }
+
+    /// A 1:1 chat from someone we never accepted: not whitelisted in the storage service, not
+    /// from the address book (`in_contacts`), not accepted here. Groups and Note to Self never are.
+    pub fn is_request(&self, t: &Thread, me: Uuid, in_contacts: bool) -> bool {
+        let k = thread_key(t);
+        matches!(t, Thread::Contact(id) if id.raw_uuid() != me)
+            && !in_contacts
+            && !self.listed.contains(&k)
+            && !self.accepted.contains(&k)
+    }
+
+    pub fn accept(&mut self, t: &Thread) {
+        self.accepted.insert(thread_key(t));
         self.save();
     }
 
@@ -164,10 +258,77 @@ mod tests {
         std::fs::write(&path, br#"{"last_read":{"group:01":5}}"#).unwrap();
         let mut s = AppState::load(&path);
         assert!(s.listed.is_empty(), "files from before this field load fine");
-        s.set_storage(HashSet::from(["x".to_string()]), HashMap::from([("u".to_string(), "Ana".to_string())]));
+        s.set_storage(HashSet::from(["x".to_string()]), HashMap::from([("u".to_string(), "Ana".to_string())]), HashMap::new(), Vec::new());
         let s2 = AppState::load(&path);
         assert!(s2.listed.contains("x"));
         assert_eq!(s2.profile_names["u"], "Ana");
+    }
+
+    fn contact(n: u8) -> Thread {
+        Thread::Contact(ServiceId::Aci(crate::timeline::tests::uuid(n).into()))
+    }
+
+    #[test]
+    fn requests_are_unaccepted_one_to_one_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = AppState::load(&dir.path().join("state.json"));
+        let me = crate::timeline::tests::uuid(1);
+        s.listed.insert(thread_key(&contact(2)));
+        assert!(s.is_request(&contact(3), me, false), "stranger");
+        assert!(!s.is_request(&contact(3), me, true), "address book contact");
+        assert!(!s.is_request(&contact(2), me, false), "whitelisted in storage");
+        assert!(!s.is_request(&contact(1), me, false), "Note to Self");
+        assert!(!s.is_request(&Thread::Group([1; 32]), me, false), "groups");
+        s.accept(&contact(3));
+        assert!(!AppState::load(&dir.path().join("state.json")).is_request(&contact(3), me, false), "accepting persists");
+    }
+
+    #[test]
+    fn pins_keep_order_and_stop_at_four() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = AppState::load(&dir.path().join("state.json"));
+        for n in 2..=5 {
+            assert!(s.set_pinned(&contact(n), true));
+        }
+        assert!(!s.set_pinned(&contact(6), true), "fifth pin refused");
+        assert!(s.set_pinned(&contact(3), false));
+        assert!(s.set_pinned(&contact(6), true));
+        let keys: Vec<String> = [2, 4, 5, 6].map(|n| thread_key(&contact(n))).into();
+        assert_eq!(AppState::load(&dir.path().join("state.json")).pinned, keys);
+    }
+
+    #[test]
+    fn mute_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = AppState::load(&dir.path().join("state.json"));
+        assert!(!s.is_muted(&contact(2), 0));
+        s.update_flags(&contact(2), |f| f.muted_until = 100);
+        assert!(s.is_muted(&contact(2), 99) && !s.is_muted(&contact(2), 100));
+    }
+
+    #[test]
+    fn storage_flags_only_override_what_changed_remotely() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = AppState::load(&dir.path().join("state.json"));
+        let (a, b) = (contact(2), contact(3));
+        let archived = ChatFlags { archived: true, ..Default::default() };
+        let sync = |s: &mut AppState, flags: Vec<(&Thread, ChatFlags)>, pinned: Vec<&Thread>| {
+            let flags = flags.into_iter().map(|(t, f)| (thread_key(t), f)).collect();
+            s.set_storage(HashSet::new(), HashMap::new(), flags, pinned.into_iter().map(thread_key).collect());
+        };
+        sync(&mut s, vec![(&a, archived.clone())], vec![&b]);
+        assert!(s.flags(&a).archived && s.is_pinned(&b), "seeded");
+
+        s.update_flags(&a, |f| f.archived = false); // local-only unarchive
+        s.set_pinned(&a, true);
+        sync(&mut s, vec![(&a, archived.clone())], vec![&b]);
+        assert!(!s.flags(&a).archived && s.is_pinned(&a), "unchanged storage keeps local changes");
+
+        sync(&mut s, vec![(&a, archived.clone()), (&b, ChatFlags { muted_until: u64::MAX, ..Default::default() })], vec![]);
+        assert!(s.is_muted(&b, 0) && !s.is_pinned(&b) && !s.is_pinned(&a), "remote changes win");
+        sync(&mut s, vec![], vec![]);
+        assert!(s.flags(&a) == ChatFlags::default(), "unarchived remotely");
+        assert!(AppState::load(&dir.path().join("state.json")).flags.values().all(|f| *f == ChatFlags::default()));
     }
 
     #[test]

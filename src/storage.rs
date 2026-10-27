@@ -9,7 +9,9 @@ use presage::libsignal_service::proto::StorageRecord;
 use presage::libsignal_service::proto::storage_record::Record;
 use presage::store::Thread;
 
-use crate::state::thread_key;
+use presage::libsignal_service::proto::account_record::pinned_conversation::Identifier;
+
+use crate::state::{ChatFlags, thread_key};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct Plan {
@@ -20,6 +22,15 @@ pub struct Plan {
     /// Group master keys to fetch from the groups server.
     pub groups: Vec<[u8; 32]>,
     pub profile_keys: Vec<(Uuid, [u8; 32])>,
+    /// Thread key -> archive/mute/unread/block flags (only chats with any set).
+    pub flags: HashMap<String, ChatFlags>,
+    /// Pinned thread keys, in order.
+    pub pinned: Vec<String>,
+}
+
+fn flags(archived: bool, muted_until: u64, marked_unread: bool, blocked: bool) -> Option<ChatFlags> {
+    let f = ChatFlags { archived, muted_until, marked_unread, blocked };
+    (f != ChatFlags::default()).then_some(f)
 }
 
 fn join(given: &str, family: &str) -> String {
@@ -47,15 +58,37 @@ pub fn plan(records: &[StorageRecord]) -> Plan {
                 if let Ok(k) = <[u8; 32]>::try_from(c.profile_key.as_slice()) {
                     p.profile_keys.push((aci, k));
                 }
-                if c.whitelisted && !c.blocked && !c.hidden && !c.archived {
-                    p.listed.insert(thread_key(&Thread::Contact(ServiceId::Aci(aci.into()))));
+                let key = thread_key(&Thread::Contact(ServiceId::Aci(aci.into())));
+                if let Some(f) = flags(c.archived, c.muted_until_timestamp, c.marked_unread, c.blocked) {
+                    p.flags.insert(key.clone(), f);
+                }
+                if c.whitelisted && !c.blocked && !c.hidden {
+                    p.listed.insert(key);
                 }
             }
-            Some(Record::GroupV2(g)) if !g.blocked && !g.archived => {
-                if let Ok(k) = <[u8; 32]>::try_from(g.master_key.as_slice()) {
-                    p.groups.push(k);
-                    p.listed.insert(thread_key(&Thread::Group(k)));
+            Some(Record::GroupV2(g)) => {
+                let Ok(k) = <[u8; 32]>::try_from(g.master_key.as_slice()) else { continue };
+                let key = thread_key(&Thread::Group(k));
+                if let Some(f) = flags(g.archived, g.muted_until_timestamp, g.marked_unread, g.blocked) {
+                    p.flags.insert(key.clone(), f);
                 }
+                if !g.blocked {
+                    p.groups.push(k);
+                    p.listed.insert(key);
+                }
+            }
+            Some(Record::Account(a)) => {
+                p.pinned = a
+                    .pinned_conversations
+                    .iter()
+                    .filter_map(|c| match c.identifier.as_ref()? {
+                        Identifier::Contact(c) => ServiceId::parse_from_service_id_binary(&c.service_id_binary)
+                            .or_else(|| ServiceId::parse_from_service_id_string(&c.service_id))
+                            .map(|id| thread_key(&Thread::Contact(id))),
+                        Identifier::GroupMasterKey(k) => Some(thread_key(&Thread::Group(k.as_slice().try_into().ok()?))),
+                        _ => None, // legacy groups and release notes aren't chats here
+                    })
+                    .collect();
             }
             _ => {}
         }
@@ -100,15 +133,52 @@ mod tests {
     }
 
     #[test]
-    fn blocked_hidden_archived_and_unaccepted_are_not_listed() {
+    fn blocked_hidden_and_unaccepted_are_not_listed() {
         let p = plan(&[
             contact(1, |c| c.blocked = true),
             contact(2, |c| c.hidden = true),
             contact(3, |c| c.archived = true),
             contact(4, |c| c.whitelisted = false),
         ]);
-        assert!(p.listed.is_empty());
+        assert_eq!(p.listed, HashSet::from([key(3)]), "archived chats are listed (in the Archived view)");
         assert_eq!(p.profile_keys.len(), 4, "profile keys still help sealed sender");
+    }
+
+    #[test]
+    fn chat_flags_and_pins_are_seeded() {
+        use presage::libsignal_service::proto::AccountRecord;
+        use presage::libsignal_service::proto::account_record::{PinnedConversation, pinned_conversation};
+        let pin = |identifier| PinnedConversation { identifier: Some(identifier) };
+        let account = AccountRecord {
+            pinned_conversations: vec![
+                pin(Identifier::GroupMasterKey(vec![7; 32])),
+                pin(Identifier::Contact(pinned_conversation::Contact { service_id_binary: vec![2; 16], ..Default::default() })),
+                pin(Identifier::Contact(pinned_conversation::Contact {
+                    service_id: Uuid::from_bytes([3; 16]).to_string(),
+                    ..Default::default()
+                })),
+                pin(Identifier::ReleaseNotes(Default::default())),
+            ],
+            ..Default::default()
+        };
+        let p = plan(&[
+            contact(1, |c| (c.archived, c.marked_unread) = (true, true)),
+            contact(2, |c| c.muted_until_timestamp = u64::MAX),
+            contact(3, |c| c.blocked = true),
+            contact(4, |_| {}),
+            StorageRecord {
+                record: Some(Record::GroupV2(GroupV2Record { master_key: vec![7; 32], archived: true, ..Default::default() })),
+            },
+            StorageRecord { record: Some(Record::Account(account)) },
+        ]);
+        let group = thread_key(&Thread::Group([7; 32]));
+        assert_eq!(p.pinned, [group.clone(), key(2), key(3)]);
+        assert_eq!(p.flags[&key(1)], ChatFlags { archived: true, marked_unread: true, ..Default::default() });
+        assert_eq!(p.flags[&key(2)].muted_until, u64::MAX);
+        assert!(p.flags[&key(3)].blocked);
+        assert!(p.flags[&group].archived);
+        assert!(!p.flags.contains_key(&key(4)), "only chats with a flag set");
+        assert_eq!(p.groups, [[7; 32]], "archived groups are still fetched");
     }
 
     #[test]
@@ -129,14 +199,15 @@ mod tests {
     }
 
     #[test]
-    fn groups_are_fetched_unless_blocked_or_archived() {
+    fn groups_are_fetched_unless_blocked() {
         let g = |n: u8, f: fn(&mut GroupV2Record)| {
             let mut r = GroupV2Record { master_key: vec![n; 32], ..Default::default() };
             f(&mut r);
             StorageRecord { record: Some(Record::GroupV2(r)) }
         };
         let p = plan(&[g(1, |_| {}), g(2, |r| r.blocked = true), g(3, |r| r.archived = true), g(4, |r| r.master_key = vec![1])]);
-        assert_eq!(p.groups, vec![[1; 32]]);
+        assert_eq!(p.groups, vec![[1; 32], [3; 32]]);
         assert!(p.listed.contains(&thread_key(&Thread::Group([1; 32]))));
+        assert!(p.flags[&thread_key(&Thread::Group([2; 32]))].blocked, "blocked groups are remembered");
     }
 }
