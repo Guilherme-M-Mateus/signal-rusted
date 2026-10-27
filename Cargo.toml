@@ -37,6 +37,8 @@ open = "5"
 rodio = { version = "0.23", default-features = false, features = ["playback", "recording", "mp3", "mp4", "vorbis"] }
 # Builds its bundled LAME (LGPL) with cc; no system library needed.
 mp3lame-encoder = "0.2"
+# SQLCipher key in the OS keyring: Secret Service (libdbus) on Linux, Keychain, Credential Manager.
+keyring = { version = "3.6", features = ["sync-secret-service", "crypto-rust", "apple-native", "windows-native"] }
 
 [dev-dependencies]
 iced_test = "0.14"

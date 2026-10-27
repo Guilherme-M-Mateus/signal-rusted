@@ -511,24 +511,13 @@ pub fn run(data_dir: PathBuf) -> impl Stream<Item = Event> {
     futures::stream::once(async move { Event::Started(cmd_tx) }).chain(ev_rx)
 }
 
-/// Local DB key, like Signal-Desktop's legacy `config.json` key (owner-only file).
-fn db_passphrase(data_dir: &Path) -> anyhow::Result<String> {
-    let path = data_dir.join("db.key");
-    if let Ok(k) = std::fs::read_to_string(&path) {
-        return Ok(k.trim().to_owned());
-    }
-    let key = hex::encode(rand::random::<[u8; 32]>());
-    write_private(&path, &key)?;
-    Ok(key)
-}
-
 /// Whether any stored row in a chat was sent by us (our messages, reactions or edits).
 pub fn wrote_in(rows: impl IntoIterator<Item = Content>, me: Uuid) -> bool {
     rows.into_iter().any(|c| c.metadata.sender.raw_uuid() == me)
 }
 
 /// Writes a secret readable only by the owner.
-fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)?;
     #[cfg(unix)]
     {
@@ -618,6 +607,7 @@ async fn main(
 ) -> anyhow::Result<()> {
     while session(&data_dir, &mut cmds, &events).await? {
         wipe_local_data(&data_dir)?; // unlinked: start over at the link screen
+        crate::dbkey::OsKeyring::new(&data_dir).forget();
     }
     Ok(())
 }
@@ -631,7 +621,7 @@ async fn session(
     let (data_dir, events) = (data_dir.to_owned(), events.clone());
     std::fs::create_dir_all(attachments_dir(&data_dir))?;
     std::fs::create_dir_all(data_dir.join("avatars"))?;
-    let pass = db_passphrase(&data_dir)?;
+    let pass = crate::dbkey::db_passphrase(&data_dir, &crate::dbkey::OsKeyring::new(&data_dir))?;
     let db = data_dir.join("signal.db3");
     let store =
         SqliteStore::open_with_passphrase(&db.to_string_lossy(), Some(&pass), OnNewIdentity::Trust)
@@ -932,7 +922,7 @@ impl Backend {
                 continue;
             }
             let expire_timer = self.manager.store().expire_timer(&thread).await.ok().flatten().map_or(0, |(t, _)| t);
-            let (last_ts, preview, unread) = match self.last_message(&thread).await {
+            let (last_ts, preview, unread) = match self.last_message(&thread, &names).await {
                 Some((ts, preview)) => (ts, preview, self.unread(&thread).await),
                 // Groups, Note to Self and chats the storage service lists show even when empty.
                 None if is_group || thread == me || self.state.listed.contains(&thread_key(&thread)) => (0, String::new(), 0),
@@ -1037,14 +1027,14 @@ impl Backend {
         }
     }
 
-    async fn last_message(&self, thread: &Thread) -> Option<(u64, String)> {
+    async fn last_message(&self, thread: &Thread, names: &HashMap<Uuid, String>) -> Option<(u64, String)> {
         // Search recent windows first: the sqlite store fetches whole ranges.
         let now = now_ms();
         for since in [now.saturating_sub(7 * 86_400_000), now.saturating_sub(180 * 86_400_000), 0] {
             let rows = self.manager.store().messages(thread, since..).await.ok()?;
             let t = Timeline::from_newest_first(self.me, rows.flatten(), 200);
             if let Some(m) = t.messages.last() {
-                return Some((m.id, m.preview()));
+                return Some((m.id, m.summary(self.me, names)));
             }
         }
         None
@@ -1119,7 +1109,8 @@ impl Backend {
             Command::Open(thread) => {
                 let rows = self.manager.store().messages(&thread, ..).await;
                 let Some(rows) = self.report("load conversation", rows) else { return };
-                let timeline = Timeline::from_newest_first(self.me, rows.flatten(), HISTORY_ROWS);
+                let mut timeline = Timeline::from_newest_first(self.me, rows.flatten(), HISTORY_ROWS);
+                self.state.apply_receipts(&thread, &mut timeline);
                 self.open = Some(thread.clone());
                 if self.state.flags(&thread).marked_unread {
                     self.state.update_flags(&thread, |f| f.marked_unread = false);
@@ -1673,6 +1664,17 @@ impl Backend {
                     Some(_) => Delivery::Read,
                     None => return,
                 };
+                // Group receipts: presage stores them under the sender's 1:1 chat, so keep our own.
+                let me = ServiceId::Aci(self.me.into());
+                let mut by_group: HashMap<Thread, Vec<u64>> = HashMap::new();
+                for ts in &r.timestamp {
+                    if let Ok(Some(t @ Thread::Group(_))) = self.manager.store().thread_for_sender_and_timestamp(&me, *ts).await {
+                        by_group.entry(t).or_default().push(*ts);
+                    }
+                }
+                for (thread, timestamps) in by_group {
+                    self.state.record_receipts(&thread, &timestamps, level);
+                }
                 self.emit(Event::Receipt { timestamps: r.timestamp.clone(), level });
                 return;
             }
@@ -1775,8 +1777,9 @@ impl Backend {
         let mut t = Timeline::new(self.me);
         t.apply(c);
         let Some(m) = t.messages.last() else { return };
-        let Some(body) = self.state.settings.notification_body(m.preview()) else { return };
-        let sender = self.names().await.get(&m.author).cloned().unwrap_or_else(|| "Signal".into());
+        let names = self.names().await;
+        let Some(body) = self.state.settings.notification_body(m.summary(self.me, &names)) else { return };
+        let sender = names.get(&m.author).cloned().unwrap_or_else(|| "Signal".into());
         let title = match thread {
             Thread::Group(k) => match self.manager.store().group(*k).await {
                 Ok(Some(g)) => format!("{sender} in {}", g.title),
@@ -2037,21 +2040,6 @@ mod tests {
         let skipped: TransferArchive = serde_json::from_str(r#"{"error":"CONTINUE_WITHOUT_UPLOAD"}"#).unwrap();
         assert_eq!(skipped, TransferArchive::Skipped { error: "CONTINUE_WITHOUT_UPLOAD".into() });
         assert!(serde_json::from_str::<TransferArchive>("{}").is_err());
-    }
-
-    #[test]
-    fn passphrase_is_created_once_and_private() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = db_passphrase(dir.path()).unwrap();
-        let b = db_passphrase(dir.path()).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 64);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join("db.key")).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
     }
 
     #[test]

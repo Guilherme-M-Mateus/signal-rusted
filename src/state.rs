@@ -9,6 +9,8 @@ use presage::libsignal_service::protocol::ServiceId;
 use presage::store::Thread;
 use serde::{Deserialize, Serialize};
 
+use crate::timeline::{Delivery, Timeline};
+
 #[derive(Default, Serialize, Deserialize, Debug, PartialEq)]
 pub struct AppState {
     /// thread key -> newest sent-timestamp the user has seen.
@@ -48,6 +50,11 @@ pub struct AppState {
     pub fetched_names: HashMap<String, String>,
     #[serde(default)]
     pub settings: Settings,
+    /// Best receipt per own group message: thread key -> sent ts -> level. presage files
+    /// receipts under the sender's 1:1 chat, so group timelines would lose them on restart.
+    // shortcut: entries outlive deleted messages; prune if state.json ever gets large.
+    #[serde(default)]
+    receipts: HashMap<String, HashMap<u64, Delivery>>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -286,6 +293,30 @@ impl AppState {
         due
     }
 
+    /// Remembers receipts for messages in `t`, upgrade-only; saves if anything changed.
+    pub fn record_receipts(&mut self, t: &Thread, timestamps: &[u64], level: Delivery) -> bool {
+        let known = self.receipts.entry(thread_key(t)).or_default();
+        let mut changed = false;
+        for ts in timestamps {
+            let e = known.entry(*ts).or_insert(Delivery::Sent);
+            if level > *e {
+                *e = level;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
+        changed
+    }
+
+    /// Applies the remembered receipts to a freshly loaded timeline of `t`.
+    pub fn apply_receipts(&self, t: &Thread, timeline: &mut Timeline) {
+        for (ts, level) in self.receipts.get(&thread_key(t)).into_iter().flatten() {
+            timeline.receipt(&[*ts], *level);
+        }
+    }
+
     pub fn sent_sticker(&mut self, sticker: (Vec<u8>, u32)) {
         push_recent(&mut self.recent_stickers, sticker);
         self.save();
@@ -334,6 +365,34 @@ impl AppState {
 mod tests {
     use super::*;
     use presage::libsignal_service::protocol::ServiceId;
+
+    #[test]
+    fn group_receipts_persist_upgrade_only_and_apply_on_load() {
+        use crate::timeline::tests::{content, text, uuid};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let group = Thread::Group([9; 32]);
+        let mut s = AppState::load(&path);
+        assert!(s.record_receipts(&group, &[10, 20], Delivery::Delivered));
+        assert!(s.record_receipts(&group, &[10], Delivery::Read));
+        assert!(!s.record_receipts(&group, &[10, 20], Delivery::Delivered), "never downgrades");
+
+        let mut t = Timeline::new(uuid(1));
+        for ts in [10, 20, 30] {
+            t.apply(&content(uuid(1), ts, text(ts, "mine")));
+        }
+        t.apply(&content(uuid(2), 20, text(20, "theirs, same ts")));
+        AppState::load(&path).apply_receipts(&group, &mut t);
+        let got: Vec<_> = t.messages.iter().map(|m| (m.id, m.outgoing, m.delivery)).collect();
+        assert_eq!(
+            got,
+            [(10, true, Delivery::Read), (20, true, Delivery::Delivered), (20, false, Delivery::Delivered), (30, true, Delivery::Sent)]
+        );
+        let mut other = Timeline::new(uuid(1));
+        other.apply(&content(uuid(1), 10, text(10, "other chat")));
+        AppState::load(&path).apply_receipts(&Thread::Group([8; 32]), &mut other);
+        assert_eq!(other.messages[0].delivery, Delivery::Sent, "per chat");
+    }
 
     #[test]
     fn read_markers_persist_and_only_advance() {

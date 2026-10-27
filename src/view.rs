@@ -1137,8 +1137,13 @@ fn lightbox<'a>(app: &'a App, key: &'a str) -> Element<'a, Message> {
 }
 
 fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Element<'a, Message> {
-    if let Kind::System(s) = &m.kind {
-        return center(text(s.clone()).size(13).style(|t: &Theme| text::Style { color: Some(muted(t)) }))
+    let notice = match &m.kind {
+        Kind::Normal => None,
+        Kind::System(s) => Some(s.clone()),
+        Kind::Group(_) => Some(m.notice_lines(app.me, &app.names).join("\n")),
+    };
+    if let Some(s) = notice {
+        return center(text(s).size(13).align_x(Alignment::Center).style(|t: &Theme| text::Style { color: Some(muted(t)) }))
             .height(Length::Shrink)
             .padding(6)
             .into();
@@ -2039,6 +2044,21 @@ mod tests {
         app.update(Message::Backend(Event::LinkUrl("sgnl://linkdevice?uuid=a&pub_key=b".into())));
         let mut ui = simulator(view(&app));
         assert!(ui.find("Waiting for your phone…").is_ok());
+    }
+
+    #[test]
+    fn group_updates_render_with_names() {
+        use crate::groups::GroupEdit;
+        use crate::timeline::tests::{edit, group_update};
+        let (mut app, _rx) = crate::app::tests::open_group();
+        let dm = group_update(uuid(2), 50, |ops, acts| {
+            edit(ops, acts, GroupEdit::SetAdmin(uuid(4), true));
+            edit(ops, acts, GroupEdit::Title("Hikers".into()));
+        });
+        let thread = crate::app::tests::group();
+        app.update(Message::Backend(Event::Incoming { thread, content: Box::new(content(uuid(2), 50, dm)) }));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Alice made Bobby an admin\nAlice changed the group name to “Hikers”").is_ok());
     }
 
     #[test]

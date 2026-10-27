@@ -1,16 +1,22 @@
 //! Folds a thread's raw stored `Content`s (messages, reactions, edits, deletes, receipts)
 //! into the timeline the UI renders. `apply` works both for loading history and live updates.
 
+use std::collections::HashMap;
+
 use presage::libsignal_service::content::{Content, ContentBody};
-use presage::libsignal_service::prelude::Uuid;
+use presage::libsignal_service::groups_v2::{AccessRequired, GroupChange, Role};
+use presage::libsignal_service::prelude::{ProtobufMessage, Uuid};
+use presage::libsignal_service::protocol::ServiceId;
+use presage::libsignal_service::proto::GroupChange as ProtoGroupChange;
 use presage::proto::data_message::{Flags, Quote as ProtoQuote, Reaction, Sticker};
 use presage::proto::sync_message::{self, Content as SyncContent};
-use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, Preview, receipt_message};
+use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, GroupContextV2, Preview, receipt_message};
+use serde::{Deserialize, Serialize};
 
 /// Signal's window for editing and deleting for everyone.
 pub const EDIT_WINDOW_MS: u64 = 24 * 3600 * 1000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Delivery {
     Failed,
     Sending,
@@ -30,8 +36,147 @@ pub struct Quote {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Normal,
-    /// Timeline notices: group changes, timer changes, calls.
+    /// Timeline notices: timer changes, calls, undecodable group changes.
     System(String),
+    /// A decoded group change: (who made it, if known; what changed). The view names people.
+    Group(Vec<(Option<Uuid>, GroupNotice)>),
+}
+
+/// One group change, as Signal's timeline words it (see `describe`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GroupNotice {
+    Created,
+    /// By the editor, or "joined" when the editor is the member.
+    Added(Uuid),
+    /// By the editor, or "left" when the editor is the member.
+    Removed(Uuid),
+    Admin(Uuid, bool),
+    Invited(Uuid),
+    /// "declined" when the editor is the invitee.
+    InviteRevoked(Uuid),
+    InviteAccepted(Uuid),
+    Requested(Uuid),
+    RequestApproved(Uuid),
+    /// "canceled" when the editor is the requester.
+    RequestDenied(Uuid),
+    /// Empty: removed.
+    Title(String),
+    /// false: removed.
+    Description(bool),
+    Avatar(bool),
+    /// Seconds, 0 = off.
+    Timer(u32),
+    LinkReset,
+    /// Any: on; Administrator: on with approval; Unsatisfiable: off.
+    LinkAccess(AccessRequired),
+    InfoAccess(AccessRequired),
+    MembersAccess(AccessRequired),
+    AnnouncementsOnly(bool),
+    Ended,
+}
+
+/// Marks history-imported notices (the backup has them decoded) stored in `group_change`.
+pub const IMPORTED_NOTICES: &[u8] = b"signal-rs:notices:";
+
+pub fn display_name(names: &HashMap<Uuid, String>, id: Uuid) -> String {
+    names.get(&id).cloned().unwrap_or_else(|| {
+        let s = id.to_string();
+        format!("User {}", &s[..8])
+    })
+}
+
+/// One notice as a sentence, in Signal's wording; `me` reads as "You".
+pub fn describe(editor: Option<Uuid>, n: &GroupNotice, me: Uuid, names: &HashMap<Uuid, String>) -> String {
+    use GroupNotice as N;
+    let who = |id: Uuid| if id == me { "You".to_string() } else { display_name(names, id) };
+    let whom = |id: Uuid| if id == me { "you".to_string() } else { display_name(names, id) };
+    let e = editor.map_or_else(|| "Someone".to_string(), who);
+    let by_self = |id: Uuid| editor == Some(id);
+    let access = |a: &AccessRequired| if *a == AccessRequired::Administrator { "Only admins" } else { "All members" };
+    match n {
+        N::Created => format!("{e} created the group"),
+        N::Added(id) if by_self(*id) => format!("{} joined the group", who(*id)),
+        N::Added(id) => format!("{e} added {}", whom(*id)),
+        N::Removed(id) if by_self(*id) => format!("{} left the group", who(*id)),
+        N::Removed(id) => format!("{e} removed {}", whom(*id)),
+        N::Admin(id, true) => format!("{e} made {} an admin", whom(*id)),
+        N::Admin(id, false) => format!("{e} revoked admin privileges from {}", whom(*id)),
+        N::Invited(id) => format!("{e} invited {} to the group", whom(*id)),
+        N::InviteRevoked(id) if by_self(*id) => format!("{} declined the invitation to the group", who(*id)),
+        N::InviteRevoked(id) => format!("{e} revoked the invitation for {}", whom(*id)),
+        N::InviteAccepted(id) => format!("{} accepted an invitation to the group", who(*id)),
+        N::Requested(id) => format!("{} requested to join via the group link", who(*id)),
+        N::RequestApproved(id) => format!("{e} approved a request to join the group from {}", whom(*id)),
+        N::RequestDenied(id) if by_self(*id) => format!("{} canceled their request to join the group", who(*id)),
+        N::RequestDenied(id) => format!("{e} denied a request to join the group from {}", whom(*id)),
+        N::Title(t) if t.is_empty() => format!("{e} removed the group name"),
+        N::Title(t) => format!("{e} changed the group name to “{t}”"),
+        N::Description(true) => format!("{e} changed the group description"),
+        N::Description(false) => format!("{e} removed the group description"),
+        N::Avatar(true) => format!("{e} changed the group avatar"),
+        N::Avatar(false) => format!("{e} removed the group avatar"),
+        N::Timer(0) => format!("{e} disabled disappearing messages"),
+        N::Timer(s) => format!("{e} changed the disappearing message timer to {}", human_duration(*s)),
+        N::LinkReset => format!("{e} reset the group link"),
+        N::LinkAccess(AccessRequired::Any) => format!("{e} turned on the group link with admin approval off"),
+        N::LinkAccess(AccessRequired::Administrator) => format!("{e} turned on the group link with admin approval on"),
+        N::LinkAccess(AccessRequired::Unsatisfiable) => format!("{e} turned off the group link"),
+        N::LinkAccess(_) => format!("{e} changed the group link settings"),
+        N::InfoAccess(a) => format!("{e} changed who can edit group info to “{}”", access(a)),
+        N::MembersAccess(a) => format!("{e} changed who can add members to “{}”", access(a)),
+        N::AnnouncementsOnly(true) => format!("{e} changed the group settings to only allow admins to send messages"),
+        N::AnnouncementsOnly(false) => format!("{e} changed the group settings to allow all members to send messages"),
+        N::Ended => format!("{e} ended the group"),
+    }
+}
+
+/// The notices in a group update: decrypted with the group's master key (which every group
+/// message carries), or as the history import stored them. `None` when undecodable.
+fn group_notices(g: &GroupContextV2) -> Option<Vec<(Option<Uuid>, GroupNotice)>> {
+    let bytes = g.group_change.as_deref()?;
+    if let Some(json) = bytes.strip_prefix(IMPORTED_NOTICES) {
+        return serde_json::from_slice::<Vec<_>>(json).ok().filter(|n| !n.is_empty());
+    }
+    let key: [u8; 32] = g.master_key.as_deref()?.try_into().ok()?;
+    let change = crate::groups::operations(&key).decrypt_group_change(ProtoGroupChange::decode(bytes).ok()?).ok()?;
+    let editor = Some(ServiceId::from(change.editor).raw_uuid());
+    let notices: Vec<GroupNotice> = change.changes.into_iter().filter_map(notice).collect();
+    // Turning the link on also sets its first password: that's not a reset.
+    let enables_link = notices.iter().any(|n| matches!(n, GroupNotice::LinkAccess(_)));
+    Some(notices.into_iter().filter(|n| !(enables_link && *n == GroupNotice::LinkReset)).map(|n| (editor, n)).collect())
+}
+
+fn notice(c: GroupChange) -> Option<GroupNotice> {
+    use GroupNotice as N;
+    let id = |a| ServiceId::from(a).raw_uuid();
+    Some(match c {
+        GroupChange::NewMember(m) => N::Added(id(m.aci)),
+        GroupChange::DeleteMember(a) => N::Removed(id(a)),
+        GroupChange::ModifyMemberRole { aci, role } => N::Admin(id(aci), role == Role::Administrator),
+        GroupChange::NewPendingMember(p) => N::Invited(p.address.raw_uuid()),
+        GroupChange::DeletePendingMember(s) => N::InviteRevoked(s.raw_uuid()),
+        GroupChange::PromotePendingMember { address, .. } => N::InviteAccepted(address.raw_uuid()),
+        GroupChange::PromotePendingPniAciMemberProfileKey(p) => N::InviteAccepted(id(p.aci)),
+        GroupChange::Title(t) => N::Title(t),
+        GroupChange::Avatar(a) => N::Avatar(!a.is_empty()),
+        GroupChange::Timer(t) => N::Timer(t.map_or(0, |t| t.duration)),
+        GroupChange::AttributeAccess(a) => N::InfoAccess(a),
+        GroupChange::MemberAccess(a) => N::MembersAccess(a),
+        GroupChange::InviteLinkAccess(a) => N::LinkAccess(a),
+        GroupChange::NewRequestingMember(r) => N::Requested(id(r.aci)),
+        GroupChange::DeleteRequestingMember(a) => N::RequestDenied(id(a)),
+        GroupChange::PromoteRequestingMember { aci, .. } => N::RequestApproved(id(aci)),
+        GroupChange::InviteLinkPassword(_) => N::LinkReset,
+        GroupChange::Description(d) => N::Description(d.is_some()),
+        GroupChange::AnnouncementOnly(on) => N::AnnouncementsOnly(on),
+        GroupChange::TerminateGroup => N::Ended,
+        // Signal doesn't show these.
+        GroupChange::ModifyMemberProfileKey { .. }
+        | GroupChange::AddBannedMember(_)
+        | GroupChange::DeleteBannedMember(_)
+        | GroupChange::MemberLabel { .. }
+        | GroupChange::MemberLabelAccess(_) => return None,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,8 +251,10 @@ impl Message {
         if self.deleted {
             return "This message was deleted.".into();
         }
-        if let Kind::System(s) = &self.kind {
-            return s.clone();
+        match &self.kind {
+            Kind::System(s) => return s.clone(),
+            Kind::Group(_) => return self.notice_lines(Uuid::nil(), &HashMap::new()).pop().unwrap_or_default(),
+            Kind::Normal => {}
         }
         if let Some(s) = &self.sticker {
             return format!("{} Sticker", s.emoji.as_deref().unwrap_or("")).trim_start().to_owned();
@@ -117,6 +264,24 @@ impl Message {
             (false, _) => text,
             (true, Some(a)) => attachment_label(a),
             (true, None) => String::new(),
+        }
+    }
+}
+
+impl Message {
+    /// Group notices as sentences, one per change (empty for other messages).
+    pub fn notice_lines(&self, me: Uuid, names: &HashMap<Uuid, String>) -> Vec<String> {
+        match &self.kind {
+            Kind::Group(n) => n.iter().map(|(editor, n)| describe(*editor, n, me, names)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `preview`, naming the people in group notices (the latest change, like Signal).
+    pub fn summary(&self, me: Uuid, names: &HashMap<Uuid, String>) -> String {
+        match self.notice_lines(me, names).pop() {
+            Some(line) if !self.deleted => line,
+            _ => self.preview(),
         }
     }
 }
@@ -278,10 +443,13 @@ impl Timeline {
         if flags & Flags::ExpirationTimerUpdate as u32 != 0 {
             m.kind = Kind::System(timer_notice(dm.expire_timer.unwrap_or(0)));
         } else if dm.body.is_none() && dm.attachments.is_empty() && dm.sticker.is_none() {
-            if dm.group_v2.as_ref().is_some_and(|g| g.group_change.is_some()) {
-                m.kind = Kind::System("Group updated".into());
-            } else {
-                return false; // profile key updates and other invisible messages
+            match dm.group_v2.as_ref().filter(|g| g.group_change.is_some()) {
+                Some(g) => match group_notices(g) {
+                    Some(n) if n.is_empty() => return false, // e.g. only profile keys changed
+                    Some(n) => m.kind = Kind::Group(n),
+                    None => m.kind = Kind::System("Group updated".into()),
+                },
+                None => return false, // profile key updates and other invisible messages
             }
         }
         fill(&mut m, dm);
@@ -385,7 +553,11 @@ pub(crate) mod tests {
     use presage::libsignal_service::content::Metadata;
     use presage::libsignal_service::protocol::ServiceId;
     use presage::proto::data_message::Delete;
-    use presage::proto::{GroupContextV2, NullMessage, ReceiptMessage, SyncMessage};
+    use crate::groups::GroupEdit;
+    use presage::libsignal_service::configuration::{ServiceConfiguration, SignalServers};
+    use presage::libsignal_service::groups_v2::GroupOperations;
+    use presage::libsignal_service::proto::group_change::{Actions, actions as a};
+    use presage::proto::{NullMessage, ReceiptMessage, SyncMessage};
 
     pub fn uuid(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])
@@ -408,6 +580,35 @@ pub(crate) mod tests {
                 server_guid: None,
             },
         )
+    }
+
+    /// A group update from `editor`, encrypted with the group key [7; 32] the way the groups
+    /// server signs it; `f` fills in the change actions.
+    pub fn group_update(editor: Uuid, ts: u64, f: impl FnOnce(&GroupOperations, &mut Actions)) -> DataMessage {
+        let key = [7; 32];
+        let ops = crate::groups::operations(&key);
+        let mut actions = Actions::default();
+        f(&ops, &mut actions);
+        actions.source_user_id = encrypted_aci(&ops, editor);
+        actions.group_id = vec![0; 32];
+        let change = ProtoGroupChange { actions: actions.encode_to_vec(), ..Default::default() };
+        let group = GroupContextV2 { master_key: Some(key.to_vec()), revision: Some(1), group_change: Some(change.encode_to_vec()) };
+        DataMessage { group_v2: Some(group), timestamp: Some(ts), ..Default::default() }
+    }
+
+    /// Adds the actions `change_actions` builds for `edit`.
+    pub fn edit(ops: &GroupOperations, actions: &mut Actions, edit: GroupEdit) {
+        let params = ServiceConfiguration::from(SignalServers::Production).zkgroup_server_public_params;
+        let a = crate::groups::change_actions(ops, uuid(1), &edit, &[], &params).unwrap();
+        actions.modify_title = actions.modify_title.take().or(a.modify_title);
+        actions.modify_description = actions.modify_description.take().or(a.modify_description);
+        actions.modify_disappearing_message_timer = actions.modify_disappearing_message_timer.take().or(a.modify_disappearing_message_timer);
+        actions.delete_members.extend(a.delete_members);
+        actions.modify_member_roles.extend(a.modify_member_roles);
+    }
+
+    fn encrypted_aci(ops: &GroupOperations, id: Uuid) -> Vec<u8> {
+        ops.build_remove_member_action(id.into()).unwrap().deleted_user_id
     }
 
     pub fn text(ts: u64, body: &str) -> DataMessage {
@@ -640,6 +841,93 @@ pub(crate) mod tests {
         assert!(!t.apply(&content(uuid(ALICE), 3, profile_key_update)));
         let notices: Vec<_> = t.messages.iter().map(Message::preview).collect();
         assert_eq!(notices, ["Disappearing message time set to 1 hour", "Group updated"]);
+    }
+
+    fn names() -> HashMap<Uuid, String> {
+        HashMap::from([(uuid(ALICE), "Alice".to_string()), (uuid(BOB), "Bob".to_string())])
+    }
+
+    #[test]
+    fn group_changes_decrypt_into_named_notices() {
+        let mut t = tl();
+        let dm = group_update(uuid(ALICE), 5, |ops, acts| {
+            edit(ops, acts, GroupEdit::Title(" Hikers ".into()));
+            edit(ops, acts, GroupEdit::SetAdmin(uuid(BOB), true));
+            edit(ops, acts, GroupEdit::Timer(3600));
+            edit(ops, acts, GroupEdit::Remove(uuid(ME)));
+        });
+        assert!(t.apply(&content(uuid(ALICE), 5, dm)));
+        let m = &t.messages[0];
+        assert!(matches!(&m.kind, Kind::Group(n) if n.iter().all(|(e, _)| *e == Some(uuid(ALICE)))), "{:?}", m.kind);
+        assert_eq!(
+            m.notice_lines(uuid(ME), &names()),
+            [
+                "Alice removed you",
+                "Alice made Bob an admin",
+                "Alice changed the group name to “Hikers”",
+                "Alice changed the disappearing message timer to 1 hour",
+            ]
+        );
+        assert_eq!(m.summary(uuid(ME), &names()), "Alice changed the disappearing message timer to 1 hour");
+
+        let left = group_update(uuid(BOB), 6, |ops, acts| edit(ops, acts, GroupEdit::Remove(uuid(BOB))));
+        t.apply(&content(uuid(BOB), 6, left));
+        assert_eq!(t.messages[1].summary(uuid(ME), &names()), "Bob left the group");
+        let mine = group_update(uuid(ME), 7, |ops, acts| edit(ops, acts, GroupEdit::Description("".into())));
+        t.apply(&content(uuid(ME), 7, mine));
+        assert_eq!(t.messages[2].summary(uuid(ME), &names()), "You removed the group description");
+    }
+
+    #[test]
+    fn invite_link_turned_on_is_not_also_a_reset() {
+        let link = |reset_only: bool| {
+            group_update(uuid(ALICE), 5, move |_, acts| {
+                acts.modify_invite_link_password = Some(a::ModifyInviteLinkPasswordAction { invite_link_password: vec![1; 16] });
+                if !reset_only {
+                    acts.modify_add_from_invite_link_access = Some(a::ModifyAddFromInviteLinkAccessControlAction {
+                        add_from_invite_link_access: presage::libsignal_service::proto::access_control::AccessRequired::Administrator as i32,
+                    });
+                }
+            })
+        };
+        let mut t = tl();
+        t.apply(&content(uuid(ALICE), 5, link(false)));
+        assert_eq!(t.messages[0].notice_lines(uuid(ME), &names()), ["Alice turned on the group link with admin approval on"]);
+        let mut t = tl();
+        t.apply(&content(uuid(ALICE), 5, link(true)));
+        assert_eq!(t.messages[0].notice_lines(uuid(ME), &names()), ["Alice reset the group link"]);
+    }
+
+    #[test]
+    fn invisible_and_undecodable_group_changes() {
+        let mut t = tl();
+        assert!(!t.apply(&content(uuid(ALICE), 5, group_update(uuid(ALICE), 5, |_, _| {}))), "nothing Signal shows");
+        let mut wrong_key = group_update(uuid(ALICE), 6, |ops, acts| edit(ops, acts, GroupEdit::Title("x".into())));
+        wrong_key.group_v2.as_mut().unwrap().master_key = Some(vec![8; 32]);
+        t.apply(&content(uuid(ALICE), 6, wrong_key));
+        assert_eq!(t.messages[0].preview(), "Group updated");
+    }
+
+    #[test]
+    fn notice_wording() {
+        use GroupNotice as N;
+        let n = names();
+        let say = |editor: Option<u8>, notice: N| describe(editor.map(uuid), &notice, uuid(ME), &n);
+        assert_eq!(say(Some(ALICE), N::Added(uuid(BOB))), "Alice added Bob");
+        assert_eq!(say(Some(BOB), N::Added(uuid(BOB))), "Bob joined the group");
+        assert_eq!(say(Some(ME), N::Added(uuid(ALICE))), "You added Alice");
+        assert_eq!(say(Some(ALICE), N::Admin(uuid(ME), false)), "Alice revoked admin privileges from you");
+        assert_eq!(say(Some(ME), N::Title("Hikers".into())), "You changed the group name to “Hikers”");
+        assert_eq!(say(Some(ALICE), N::Timer(0)), "Alice disabled disappearing messages");
+        assert_eq!(say(Some(ALICE), N::Avatar(true)), "Alice changed the group avatar");
+        assert_eq!(say(Some(ALICE), N::Invited(uuid(BOB))), "Alice invited Bob to the group");
+        assert_eq!(say(Some(BOB), N::InviteRevoked(uuid(BOB))), "Bob declined the invitation to the group");
+        assert_eq!(say(Some(BOB), N::RequestDenied(uuid(BOB))), "Bob canceled their request to join the group");
+        assert_eq!(say(Some(ALICE), N::RequestApproved(uuid(BOB))), "Alice approved a request to join the group from Bob");
+        assert_eq!(say(Some(ALICE), N::LinkAccess(AccessRequired::Unsatisfiable)), "Alice turned off the group link");
+        assert_eq!(say(Some(ALICE), N::InfoAccess(AccessRequired::Administrator)), "Alice changed who can edit group info to “Only admins”");
+        assert_eq!(say(None, N::Created), "Someone created the group");
+        assert_eq!(say(Some(9), N::Removed(uuid(BOB))), format!("User {} removed Bob", &uuid(9).to_string()[..8]));
     }
 
     #[test]
