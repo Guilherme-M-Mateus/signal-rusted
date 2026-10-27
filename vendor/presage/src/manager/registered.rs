@@ -16,7 +16,7 @@ use libsignal_service::{
     encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
-    prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
+    prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, ServiceError, Uuid},
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
@@ -222,6 +222,125 @@ impl<S: Store> Manager<S, Registered> {
     pub async fn fetch_group(&self, master_key: &[u8; 32]) -> Result<Option<Group>, Error<S::Error>> {
         let mut groups_manager = self.groups_manager().await?;
         upsert_group(&self.store, &mut groups_manager, master_key, &0).await
+    }
+
+    /// signal-rs: the zkgroup server params, for building group changes.
+    pub fn server_public_params(&self) -> libsignal_service::zkgroup::ServerPublicParams {
+        self.state.service_configuration().zkgroup_server_public_params
+    }
+
+    /// signal-rs: an expiring profile key credential, which proves `aci`'s profile key to the
+    /// groups server when creating a group or adding a member. `None` without a known profile key.
+    pub async fn profile_key_credential(
+        &self,
+        aci: Aci,
+    ) -> Result<Option<libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredential>, Error<S::Error>>
+    {
+        use libsignal_service::zkgroup;
+        let profile_key = if aci == self.state.data.service_ids.aci() {
+            self.state.data.profile_key
+        } else {
+            match self.store.profile_key(&aci.into()).await? {
+                Some(k) => k,
+                None => return Ok(None),
+            }
+        };
+        let params = self.server_public_params();
+        let context =
+            params.create_profile_key_credential_request_context(rand::random(), aci, profile_key);
+        let path = format!(
+            "/v1/profile/{}/{}/{}?credentialType=expiringProfileKey",
+            aci.service_id_string(),
+            profile_key.get_profile_key_version(aci).as_ref(),
+            hex::encode(zkgroup::serialize(&context.get_request())),
+        );
+        let fetch = async {
+            let response: serde_json::Value = self
+                .identified_push_service()
+                .request(
+                    reqwest::Method::GET,
+                    libsignal_service::configuration::Endpoint::service(path),
+                    libsignal_service::push_service::HttpAuthOverride::NoOverride,
+                )?
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let credential = response["credential"]
+                .as_str()
+                .ok_or(ServiceError::InvalidFrame { reason: "profile without credential" })?;
+            let credential = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, credential)?;
+            let response: zkgroup::profiles::ExpiringProfileKeyCredentialResponse =
+                zkgroup::deserialize(&credential)?;
+            let now = zkgroup::Timestamp::from_epoch_seconds(
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            );
+            Ok::<_, ServiceError>(params.receive_expiring_profile_key_credential(&context, &response, now)?)
+        };
+        Ok(Some(fetch.await?))
+    }
+
+    /// signal-rs: uploads a new group (`PUT /v1/groups/`) and stores it.
+    pub async fn create_group(
+        &self,
+        master_key: &[u8; 32],
+        group: libsignal_service::proto::Group,
+    ) -> Result<Option<Group>, Error<S::Error>> {
+        let mut groups_manager = self.groups_manager().await?;
+        self.groups_request(&mut groups_manager, master_key, reqwest::Method::PUT, group.encode_to_vec())
+            .await?;
+        upsert_group(&self.store, &mut groups_manager, master_key, &0).await
+    }
+
+    /// signal-rs: applies a group change (`PATCH /v1/groups/`) on top of the stored revision,
+    /// stores the new group state and returns the new revision and the server-signed
+    /// `GroupChange` to put in `GroupContextV2`.
+    pub async fn modify_group(
+        &self,
+        master_key: &[u8; 32],
+        mut actions: libsignal_service::proto::group_change::Actions,
+    ) -> Result<(u32, Vec<u8>), Error<S::Error>> {
+        let group = self.store.group(*master_key).await?.ok_or(Error::UnknownGroup)?;
+        actions.version = group.revision + 1;
+        let mut groups_manager = self.groups_manager().await?;
+        let body = self
+            .groups_request(&mut groups_manager, master_key, reqwest::Method::PATCH, actions.encode_to_vec())
+            .await?;
+        let response = libsignal_service::proto::GroupChangeResponse::decode(body.as_slice())
+            .map_err(ServiceError::from)?;
+        let change = response.group_change.ok_or(Error::UnknownGroup)?;
+        // After leaving we can't fetch the group anymore; upsert_group only logs that.
+        upsert_group(&self.store, &mut groups_manager, master_key, &actions.version).await?;
+        Ok((actions.version, change.encode_to_vec()))
+    }
+
+    /// signal-rs: an authenticated protobuf request to the groups (storage) server.
+    async fn groups_request(
+        &self,
+        groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+        master_key: &[u8; 32],
+        method: reqwest::Method,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key));
+        let auth = groups_manager.get_authorization_for_today(&mut rand::rng(), secret_params).await?;
+        let request = async {
+            let response = self
+                .identified_push_service()
+                .request(
+                    method,
+                    libsignal_service::configuration::Endpoint::storage("/v1/groups/"),
+                    libsignal_service::push_service::HttpAuthOverride::Identified(auth),
+                )?
+                .header("Content-Type", "application/x-protobuf")
+                .body(body)
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok::<_, ServiceError>(response.bytes().await?.to_vec())
+        };
+        Ok(request.await?)
     }
 
     /// Returns a handle on the [RegistrationData].

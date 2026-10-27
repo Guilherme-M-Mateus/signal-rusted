@@ -14,6 +14,7 @@ use presage::libsignal_service::master_key::{MasterKey, StorageServiceKey};
 use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::StorageService;
 use presage::libsignal_service::configuration::Endpoint;
+use presage::libsignal_service::groups_v2::GroupMemberCandidate;
 use presage::libsignal_service::push_service::HttpAuthOverride;
 use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::libsignal_service::prelude::Uuid;
@@ -39,6 +40,7 @@ use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use tokio::sync::mpsc;
 
+use crate::groups::{GroupEdit, GroupInfo};
 use crate::state::{AppState, MAX_PINNED, thread_key};
 use crate::timeline::{Delivery, Kind, Timeline};
 
@@ -85,8 +87,11 @@ pub enum Command {
     React { thread: Thread, target_author: Uuid, target_ts: u64, emoji: String, remove: bool },
     Typing { thread: Thread, started: bool },
     FetchAttachment(AttachmentPointer),
-    /// Disappearing-message timer in seconds (0 = off); 1:1 chats only.
+    /// Disappearing-message timer in seconds (0 = off); 1:1 chats (groups use `EditGroup`).
     SetTimer { thread: Thread, seconds: u32 },
+    /// Creates a GroupsV2 group with us as admin; replies `Event::GroupCreated`.
+    CreateGroup { title: String, members: Vec<Uuid> },
+    EditGroup { thread: Thread, edit: GroupEdit },
     Search(String),
     Chat { thread: Thread, action: ChatAction },
 }
@@ -121,6 +126,8 @@ pub struct Conversation {
     pub archived: bool,
     pub muted: bool,
     pub marked_unread: bool,
+    /// Group details for the info panel; `None` for 1:1 chats.
+    pub group: Option<GroupInfo>,
 }
 
 /// Pinned chats first (in pin order), then newest first.
@@ -195,6 +202,8 @@ pub enum Event {
     Expiring { thread: Thread, expires: Vec<(Uuid, u64, u64)> },
     /// Disappeared messages, already deleted from the store: (author, sent ts).
     Expired { thread: Thread, ids: Vec<(Uuid, u64)> },
+    /// A group we just created, to open.
+    GroupCreated { thread: Thread, title: String },
     Error(String),
     /// Neutral status banner (e.g. history import in progress); `None` clears it.
     Notice(Option<String>),
@@ -694,12 +703,13 @@ impl Backend {
         // Address-book contacts (from contact sync) aren't message requests; presage also saves
         // a contact "on first sight" of a stranger, but without a phone number.
         let mut address_book = HashSet::new();
-        let mut threads: Vec<(Thread, String, bool, Vec<Uuid>)> = Vec::new();
+        let mut threads: Vec<(Thread, String, Option<GroupInfo>, Vec<Uuid>)> = Vec::new();
         if let Ok(groups) = store.groups().await {
             for (key, g) in groups.flatten() {
                 self.group_ids.insert(group_id(&key), key);
                 let members = g.members.iter().map(|m| ServiceId::from(m.aci).raw_uuid()).collect();
-                threads.push((Thread::Group(key), g.title, true, members));
+                let info = GroupInfo::from_group(&g);
+                threads.push((Thread::Group(key), g.title, Some(info), members));
             }
         }
         if let Ok(contacts) = store.contacts().await {
@@ -708,7 +718,7 @@ impl Backend {
                     address_book.insert(c.uuid);
                 }
                 let title = names.get(&c.uuid).cloned().unwrap_or_else(|| c.uuid.to_string());
-                threads.push((Thread::Contact(ServiceId::Aci(c.uuid.into())), title, false, Vec::new()));
+                threads.push((Thread::Contact(ServiceId::Aci(c.uuid.into())), title, None, Vec::new()));
             }
         }
         // People from the storage service who aren't in the address book.
@@ -717,16 +727,17 @@ impl Backend {
             let thread = Thread::Contact(id);
             if !threads.iter().any(|(t, ..)| *t == thread) {
                 let title = names.get(&id.raw_uuid()).cloned().unwrap_or_else(|| "Unknown".into());
-                threads.push((thread, title, false, Vec::new()));
+                threads.push((thread, title, None, Vec::new()));
             }
         }
         let me = Thread::Contact(ServiceId::Aci(self.me.into()));
         threads.retain(|(t, ..)| *t != me); // titled "Note to Self" below, not by our own contact name
-        threads.push((me.clone(), "Note to Self".into(), false, Vec::new()));
+        threads.push((me.clone(), "Note to Self".into(), None, Vec::new()));
 
         let mut out = Vec::new();
         let now = now_ms();
-        for (thread, title, is_group, members) in threads {
+        for (thread, title, group, members) in threads {
+            let is_group = group.is_some();
             let f = self.state.flags(&thread);
             if f.blocked {
                 continue;
@@ -754,6 +765,7 @@ impl Backend {
                 is_group,
                 members,
                 expire_timer,
+                group,
             });
         }
         sort_conversations(&mut out, &self.state.pinned);
@@ -880,6 +892,25 @@ impl Backend {
                     }
                 }
             }
+            Command::CreateGroup { title, members } => {
+                let r = self.create_group(&title, &members).await;
+                if let Some(key) = self.report("create group", r) {
+                    self.refresh().await;
+                    self.emit(Event::GroupCreated { thread: Thread::Group(key), title });
+                }
+            }
+            Command::EditGroup { thread: Thread::Group(key), edit } => {
+                let ts = now_ms();
+                let r = self.edit_group(&key, &edit, ts).await;
+                if self.report("update group", r).is_some() {
+                    let thread = Thread::Group(key);
+                    if let Ok(Some(c)) = self.manager.store().message(&thread, ts).await {
+                        self.emit(Event::Incoming { thread, content: Box::new(c) });
+                    }
+                }
+                self.refresh().await;
+            }
+            Command::EditGroup { .. } => {}
             Command::Edit { thread, target_ts, ts, body, ranges, attachments, quote } => {
                 let edit = EditMessage {
                     target_sent_timestamp: Some(target_ts),
@@ -1028,6 +1059,73 @@ impl Backend {
         }
         let me = ServiceId::Aci(self.me.into());
         self.manager.send_message(me, delete_for_me_sync(thread, author, ts), now_ms()).await?;
+        Ok(())
+    }
+
+    /// Unverified against the live servers (tests can't reach them): uploads the group with
+    /// us as admin, contacts with a known profile key as members and the rest as invitees,
+    /// then sends the first group update so members see it.
+    async fn create_group(&mut self, title: &str, members: &[Uuid]) -> anyhow::Result<[u8; 32]> {
+        let title = title.trim();
+        anyhow::ensure!(!title.is_empty(), "the group needs a name");
+        let key: [u8; 32] = rand::random();
+        let me = self.manager.profile_key_credential(self.me.into()).await?;
+        let me = me.ok_or_else(|| anyhow::anyhow!("our profile key is unknown"))?;
+        let candidates = self.candidates(members).await?;
+        let params = self.manager.server_public_params();
+        let group = crate::groups::operations(&key).encrypt_group_with_credentials(
+            title,
+            None,
+            None,
+            Some(&crate::groups::new_group_access()),
+            &me,
+            &candidates,
+            &params,
+            String::new(),
+            &mut rand::rng(),
+        )?;
+        self.manager.create_group(&key, group).await?;
+        self.send_body(&Thread::Group(key), DataMessage::default(), now_ms()).await?;
+        Ok(key)
+    }
+
+    /// Profile key credentials, where we know the profile key (others get invited).
+    async fn candidates(&self, members: &[Uuid]) -> anyhow::Result<Vec<GroupMemberCandidate>> {
+        let mut out = Vec::new();
+        for id in members.iter().filter(|id| **id != self.me) {
+            let credential = self.manager.profile_key_credential((*id).into()).await?;
+            out.push(GroupMemberCandidate { service_id: ServiceId::Aci((*id).into()), credential });
+        }
+        Ok(out)
+    }
+
+    /// Unverified against the live servers: applies the change, then sends the signed change
+    /// to the (new) members so their clients apply it too. Members removed by the change
+    /// aren't told; their clients notice on the next group fetch.
+    async fn edit_group(&mut self, key: &[u8; 32], edit: &GroupEdit, ts: u64) -> anyhow::Result<()> {
+        let group = self.manager.store().group(*key).await?.ok_or_else(|| anyhow::anyhow!("unknown group"))?;
+        anyhow::ensure!(GroupInfo::from_group(&group).allows_edit(self.me, edit), "not allowed in this group");
+        let adds = match edit {
+            GroupEdit::AddMembers(ids) => self.candidates(ids).await?,
+            _ => Vec::new(),
+        };
+        let params = self.manager.server_public_params();
+        let actions = crate::groups::change_actions(&crate::groups::operations(key), self.me, edit, &adds, &params)?;
+        let (revision, change) = self.manager.modify_group(key, actions).await?;
+        let dm = DataMessage {
+            timestamp: Some(ts),
+            group_v2: Some(GroupContextV2 { master_key: Some(key.to_vec()), revision: Some(revision), group_change: Some(change) }),
+            ..Default::default()
+        };
+        self.manager.send_message_to_group(key, dm, ts).await?;
+        if *edit == GroupEdit::Leave {
+            // We can't fetch the group anymore: keep it, listed without us.
+            if let Some(mut g) = self.manager.store().group(*key).await? {
+                g.members.retain(|m| ServiceId::from(m.aci).raw_uuid() != self.me);
+                g.revision = revision;
+                self.manager.store().save_group(*key, g).await?;
+            }
+        }
         Ok(())
     }
 
@@ -1418,6 +1516,7 @@ mod tests {
             archived: false,
             muted: false,
             marked_unread: false,
+            group: None,
         }
     }
 
