@@ -674,7 +674,15 @@ impl<S: Store> Manager<S, Registered> {
         let Some(avatar) = profile.avatar.as_ref() else {
             return Ok(None);
         };
+        Ok(Some(self.download_profile_avatar(uuid, profile_key, avatar).await?))
+    }
 
+    async fn download_profile_avatar(
+        &mut self,
+        uuid: Uuid,
+        profile_key: ProfileKey,
+        avatar: &str,
+    ) -> Result<AvatarBytes, Error<S::Error>> {
         let mut websocket = self.unidentified_websocket().await?;
 
         let mut avatar_stream = websocket.retrieve_profile_avatar(avatar).await?;
@@ -690,7 +698,56 @@ impl<S: Store> Manager<S, Registered> {
             .store
             .save_profile_avatar(uuid, profile_key, &avatar)
             .await;
-        Ok(Some(avatar))
+        Ok(avatar)
+    }
+
+    /// signal-rs: fetches a profile and its avatar from the server, bypassing (and updating)
+    /// the cache, which never expires on its own.
+    pub async fn refresh_profile(
+        &mut self,
+        uuid: Uuid,
+        profile_key: ProfileKey,
+    ) -> Result<(Profile, Option<AvatarBytes>), Error<S::Error>> {
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(profile_key),
+        );
+        let profile = account_manager.retrieve_profile(uuid.into()).await?;
+        let _ = self
+            .store
+            .save_profile(uuid, profile_key, profile.clone())
+            .await;
+        let avatar = match profile.avatar.clone() {
+            Some(path) => Some(self.download_profile_avatar(uuid, profile_key, &path).await?),
+            None => None,
+        };
+        Ok((profile, avatar))
+    }
+
+    /// signal-rs: downloads the stored group's current avatar, bypassing the cache (keyed by
+    /// group only, so it never notices a new avatar). `None` if the group has none.
+    pub async fn refresh_group_avatar(
+        &mut self,
+        master_key: [u8; 32],
+    ) -> Result<Option<AvatarBytes>, Error<S::Error>> {
+        let Some(group) = self.store.group(master_key).await? else {
+            return Ok(None);
+        };
+        if group.avatar.is_empty() {
+            return Ok(None);
+        }
+        let mut gm = Box::pin(self.groups_manager()).await?;
+        let avatar = gm
+            .retrieve_avatar(
+                &group.avatar,
+                GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key)),
+            )
+            .await?;
+        if let Some(avatar) = &avatar {
+            let _ = self.store.save_group_avatar(master_key, avatar).await;
+        }
+        Ok(avatar)
     }
 
     async fn groups_manager(

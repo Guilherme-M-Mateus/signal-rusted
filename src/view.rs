@@ -8,7 +8,7 @@ use iced::keyboard::{self, key};
 use iced::widget::text::Span;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::widget::{
-    Column, Space, button, center, column, container, image, mouse_area, opaque, progress_bar, qr_code, rich_text, row,
+    Column, Space, button, center, checkbox, column, container, image, mouse_area, opaque, progress_bar, qr_code, rich_text, row,
     rule, scrollable, span, stack, text, text_editor, text_input,
 };
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Font, Length, Theme, color, mouse};
@@ -71,7 +71,11 @@ const AVATAR_COLORS: [Color; 8] = [
     color!(0xf5d7d7),
 ];
 
-fn avatar<'a>(title: &str, seed: &str, size: f32) -> Element<'a, Message> {
+/// The chat's downloaded avatar (`seed` is its thread key), cropped round; else its initial.
+fn avatar<'a>(app: &App, title: &str, seed: &str, size: f32) -> Element<'a, Message> {
+    if let Some(h) = app.avatars.get(seed) {
+        return image(h.clone()).width(size).height(size).content_fit(ContentFit::Cover).border_radius(size / 2.0).into();
+    }
     let initial = title.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string());
     let h = seed.bytes().fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize));
     let bg = AVATAR_COLORS[h % AVATAR_COLORS.len()];
@@ -126,10 +130,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Screen::Main => row![
             sidebar(app),
             rule::vertical(1),
-            match (&app.new_group, &app.open) {
-                (Some(g), _) => new_group(app, g),
-                (None, Some(o)) => conversation(app, o),
-                (None, None) => center(text("Select a conversation to start messaging").style(|t: &Theme| text::Style {
+            match (&app.settings_panel, &app.new_group, &app.open) {
+                (Some(s), ..) => settings(app, s),
+                (None, Some(g), _) => new_group(app, g),
+                (None, None, Some(o)) => conversation(app, o),
+                (None, None, None) => center(text("Select a conversation to start messaging").style(|t: &Theme| text::Style {
                     color: Some(muted(t))
                 }))
                 .into(),
@@ -245,7 +250,7 @@ fn chat_row<'a>(app: &'a App, c: &'a Conversation) -> Element<'a, Message> {
             ..Default::default()
         }));
     }
-    let item = row![avatar(&c.title, &seed, 44.0), column![top, bottom].spacing(2)]
+    let item = row![avatar(app, &c.title, &seed, 44.0), column![top, bottom].spacing(2)]
         .spacing(12)
         .align_y(Alignment::Center);
     let open = button(item)
@@ -320,7 +325,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         for (id, name) in contacts {
             let thread = presage::store::Thread::Contact(presage::libsignal_service::protocol::ServiceId::Aci(id.into()));
             list = list.push(
-                button(row![avatar(&name, &id.to_string(), 36.0), text(name.clone())].spacing(12).align_y(Alignment::Center))
+                button(row![avatar(app, &name, &id.to_string(), 36.0), text(name.clone())].spacing(12).align_y(Alignment::Center))
                     .width(Length::Fill)
                     .padding([6, 12])
                     .on_press(Message::OpenThread(thread, name, false))
@@ -354,7 +359,9 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             row![
                 text("Signal").size(22).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill),
                 button(text("New group").size(13)).on_press(Message::NewGroup).style(button::secondary),
+                button(text("⚙").size(18)).on_press(Message::ToggleSettings).style(button::text),
             ]
+            .spacing(4)
             .align_y(Alignment::Center)
         )
         .padding([12, 16]),
@@ -376,7 +383,7 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         text(format!("{} typing…", typing.join(", "))).size(12).style(|t: &Theme| text::Style { color: Some(muted(t)) }).into()
     };
     let who = row![
-        avatar(&o.title, &crate::state::thread_key(&o.thread), 32.0),
+        avatar(app, &o.title, &crate::state::thread_key(&o.thread), 32.0),
         column![text(o.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), subtitle],
     ]
     .spacing(12)
@@ -534,7 +541,7 @@ fn group_panel<'a>(app: &'a App, o: &'a Open, p: &'a crate::app::GroupPanel) -> 
         g.members.iter().map(|(id, admin)| (*id, *admin, if *id == me { "You".into() } else { display_name(&app.names, *id) })).collect();
     members.sort_by(|a, b| (a.0 != me, &a.2).cmp(&(b.0 != me, &b.2)));
     for (id, admin, name) in members {
-        let mut r = row![avatar(&name, &id.to_string(), 32.0), text(name).width(Length::Fill)].spacing(10).align_y(Alignment::Center);
+        let mut r = row![avatar(app, &name, &id.to_string(), 32.0), text(name).width(Length::Fill)].spacing(10).align_y(Alignment::Center);
         if admin {
             r = r.push(badge("Admin"));
         }
@@ -556,7 +563,7 @@ fn group_panel<'a>(app: &'a App, o: &'a Open, p: &'a crate::app::GroupPanel) -> 
             let current: Vec<Uuid> = g.members.iter().map(|(id, _)| *id).collect();
             for (id, name) in app.people_matching(&p.add_query, &current).into_iter().take(8) {
                 col = col.push(
-                    button(row![avatar(&name, &id.to_string(), 28.0), text(format!("Add {name}"))].spacing(10).align_y(Alignment::Center))
+                    button(row![avatar(app, &name, &id.to_string(), 28.0), text(format!("Add {name}"))].spacing(10).align_y(Alignment::Center))
                         .on_press(Message::EditGroup(GroupEdit::AddMembers(vec![id])))
                         .style(button::text),
                 );
@@ -576,6 +583,86 @@ fn group_panel<'a>(app: &'a App, o: &'a Open, p: &'a crate::app::GroupPanel) -> 
     scrollable(col).height(Length::Fill).into()
 }
 
+/// Profile, appearance, notifications and linked devices.
+fn settings<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, Message> {
+    use crate::state::ThemeChoice;
+    let bold = Font { weight: Weight::Bold, ..Font::DEFAULT };
+    let heading = |t: &'static str| text(t).size(16).font(bold);
+    let p = &s.profile;
+    let edit = |f: fn(&mut crate::backend::OwnProfile, String)| {
+        move |v: String| {
+            let mut p = p.clone();
+            f(&mut p, v);
+            Message::EditProfile(p)
+        }
+    };
+    let mut col = Column::new().spacing(10).padding([16, 24]).max_width(560);
+    col = col.push(row![
+        text("Settings").size(20).font(bold).width(Length::Fill),
+        button(text("Close")).on_press(Message::ToggleSettings).style(button::text),
+    ].align_y(Alignment::Center));
+
+    col = col.push(heading("Profile"));
+    col = col.push(row![
+        avatar(app, &p.given, &app.me.to_string(), 56.0),
+        column![
+            text(if app.phone.is_empty() { "…".to_string() } else { app.phone.clone() }),
+            muted_text(format!("ACI {}", app.me)),
+        ].spacing(2),
+    ].spacing(12).align_y(Alignment::Center));
+    col = col.push(row![
+        text_input("First name (required)", &p.given).id("profile-given").on_input(edit(|p, v| p.given = v)).padding(8),
+        text_input("Last name", &p.family).on_input(edit(|p, v| p.family = v)).padding(8),
+    ].spacing(8));
+    col = col.push(row![
+        text_input("😀", &p.emoji).on_input(edit(|p, v| p.emoji = v)).padding(8).width(64),
+        text_input("About", &p.about).on_input(edit(|p, v| p.about = v)).padding(8),
+    ].spacing(8));
+    col = col.push(row![
+        button(text("Save profile")).on_press_maybe(app.can_save_profile(p).then_some(Message::SaveProfile)).style(button::primary),
+        muted_text("Change your photo on your phone: signal-rs can't upload one yet."),
+    ].spacing(12).align_y(Alignment::Center));
+
+    col = col.push(heading("Appearance"));
+    let theme = [(ThemeChoice::System, "System"), (ThemeChoice::Light, "Light"), (ThemeChoice::Dark, "Dark")]
+        .into_iter()
+        .fold(row![].spacing(6), |r, (choice, label)| {
+            let style = if app.settings.theme == choice { button::primary } else { button::secondary };
+            r.push(button(text(label)).on_press(Message::SetTheme(choice)).style(style))
+        });
+    col = col.push(theme);
+
+    col = col.push(heading("Notifications"));
+    col = col.push(checkbox(app.settings.notifications).label("Show notifications").on_toggle(Message::SetNotifications));
+    let text_toggle = checkbox(app.settings.notification_text).label("Show message text in notifications");
+    col = col.push(if app.settings.notifications { text_toggle.on_toggle(Message::SetNotificationText) } else { text_toggle });
+
+    col = col.push(heading("Linked devices"));
+    if app.devices.is_empty() {
+        col = col.push(muted_text("Loading…"));
+    }
+    for d in &app.devices {
+        let mut r = row![text(d.name.clone()).width(Length::Fill)].spacing(8).align_y(Alignment::Center);
+        if d.this {
+            r = r.push(badge("This device"));
+        }
+        col = col.push(r);
+    }
+    col = col.push(if s.confirm_unlink {
+        Element::from(column![
+            text("Unlink this device? It stops receiving messages, and all its local data (messages, attachments, keys) is deleted.")
+                .style(text::danger),
+            row![
+                button(text("Cancel")).on_press(Message::AskUnlink(false)).style(button::secondary),
+                button(text("Unlink and delete data")).on_press(Message::ConfirmUnlink).style(button::danger),
+            ].spacing(8),
+        ].spacing(8))
+    } else {
+        button(text("Unlink this device")).on_press(Message::AskUnlink(true)).style(button::danger).into()
+    });
+    scrollable(col).height(Length::Fill).into()
+}
+
 /// "New group": name it and pick members from contacts.
 fn new_group<'a>(app: &'a App, g: &'a crate::app::NewGroup) -> Element<'a, Message> {
     let mut col = Column::new().spacing(10).padding([16, 24]).max_width(560);
@@ -592,7 +679,7 @@ fn new_group<'a>(app: &'a App, g: &'a crate::app::NewGroup) -> Element<'a, Messa
     for (id, name) in app.people_matching(&g.query, &[]) {
         let mark = if g.picked.contains(&id) { "☑" } else { "☐" };
         col = col.push(
-            button(row![text(mark), avatar(&name, &id.to_string(), 28.0), text(name)].spacing(10).align_y(Alignment::Center))
+            button(row![text(mark), avatar(app, &name, &id.to_string(), 28.0), text(name)].spacing(10).align_y(Alignment::Center))
                 .width(Length::Fill)
                 .on_press(Message::NewGroupPick(id))
                 .style(button::text),
@@ -1079,7 +1166,7 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     if !matches.is_empty() {
         let list = matches.into_iter().fold(Column::new(), |c, (id, name)| {
             c.push(
-                button(row![avatar(&name, &id.to_string(), 24.0), text(name.clone())].spacing(8).align_y(Alignment::Center))
+                button(row![avatar(app, &name, &id.to_string(), 24.0), text(name.clone())].spacing(8).align_y(Alignment::Center))
                     .width(Length::Fill)
                     .padding([4, 8])
                     .on_press(Message::Mention(id))
@@ -1910,5 +1997,105 @@ mod tests {
         ui.click("Signal Blog").expect("card title");
         let msgs: Vec<Message> = ui.into_messages().collect();
         assert!(msgs.iter().any(|m| matches!(m, Message::OpenUrl(u) if u == "https://signal.org/blog/")), "{msgs:?}");
+    }
+
+    /// Settings open with a fake profile and two fake devices.
+    fn settings_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let (mut app, mut rx) = app();
+        click(&mut app, "⚙");
+        assert!(matches!(crate::app::tests::drain(&mut rx).as_slice(), [Command::LoadSettings]));
+        let profile = crate::backend::OwnProfile { given: "Fake".into(), family: "Person".into(), about: "Testing".into(), emoji: "🧪".into() };
+        app.update(Message::Backend(Event::Profile(profile)));
+        app.update(Message::Backend(Event::Account { phone: "+15550100".into() }));
+        app.update(Message::Backend(Event::Devices(vec![
+            crate::backend::Device { id: 1, name: "Fake Phone".into(), this: false },
+            crate::backend::Device { id: 2, name: "signal-rs on desk".into(), this: true },
+        ])));
+        (app, rx)
+    }
+
+    #[test]
+    fn settings_screen_switches_theme_and_toggles_notifications() {
+        let (mut app, mut rx) = settings_app();
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("+15550100").is_ok() && ui.find("This device").is_ok(), "number and this device marked");
+        drop(ui);
+        app.system_dark = true;
+        click(&mut app, "Light");
+        assert!(!app.dark, "overrides the dark system theme");
+        let cmds = crate::app::tests::drain(&mut rx);
+        assert!(matches!(cmds.as_slice(), [Command::SaveSettings(s)] if s.theme == crate::state::ThemeChoice::Light), "{cmds:?}");
+        click(&mut app, "Show message text in notifications");
+        assert!(!app.settings.notification_text);
+        click(&mut app, "Show notifications");
+        assert!(!app.settings.notifications);
+        let cmds = crate::app::tests::drain(&mut rx);
+        assert!(matches!(cmds.last(), Some(Command::SaveSettings(s)) if !s.notifications && !s.notification_text), "{cmds:?}");
+        click(&mut app, "System");
+        app.update(Message::Theme(iced::theme::Mode::Light));
+        assert!(!app.dark, "follows the system again");
+    }
+
+    #[test]
+    fn editing_the_profile_name_emits_update_profile() {
+        let (mut app, mut rx) = settings_app();
+        let mut ui = simulator(view(&app));
+        assert!(ui.click("Save profile").is_ok());
+        assert_eq!(ui.into_messages().count(), 0, "nothing changed yet");
+        let mut ui = simulator(view(&app));
+        ui.click(iced::widget::Id::new("profile-given")).expect("name field");
+        let _ = ui.typewrite("r");
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            app.update(m);
+        }
+        click(&mut app, "Save profile");
+        let cmds = crate::app::tests::drain(&mut rx);
+        assert!(
+            matches!(cmds.as_slice(), [Command::UpdateProfile { given, family, about, emoji }]
+                if given == "Faker" && family == "Person" && about == "Testing" && emoji == "🧪"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn unlinking_needs_confirmation() {
+        let (mut app, mut rx) = settings_app();
+        click(&mut app, "Unlink this device");
+        assert!(crate::app::tests::drain(&mut rx).is_empty(), "the first click only asks");
+        click(&mut app, "Cancel");
+        assert!(simulator(view(&app)).find("Unlink and delete data").is_err());
+        click(&mut app, "Unlink this device");
+        click(&mut app, "Unlink and delete data");
+        assert!(matches!(crate::app::tests::drain(&mut rx).as_slice(), [Command::Unlink]));
+        app.update(Message::Backend(Event::NeedsLink));
+        assert!(matches!(app.screen, Screen::Link { .. }) && app.conversations.is_empty(), "back to linking, old chats gone");
+    }
+
+    #[test]
+    fn avatars_replace_the_initial() {
+        let (mut app, _rx) = app();
+        assert!(simulator(view(&app)).find("A").is_ok(), "Alice's initial");
+        let key = crate::state::thread_key(&alice());
+        app.update(Message::Backend(Event::Avatars(HashMap::from([(key, image::Handle::from_bytes(crate::app::tests::PNG.to_vec()))]))));
+        assert!(simulator(view(&app)).find("A").is_err(), "her photo instead");
+    }
+
+    /// Writes `snapshots/settings-*.png` for visual review (light theme, avatar shown).
+    #[test]
+    fn settings_snapshot() {
+        let (mut app, _rx) = settings_app();
+        app.update(Message::AskUnlink(true));
+        app.update(Message::SetTheme(crate::state::ThemeChoice::Light));
+        let png = image::Handle::from_bytes(crate::app::tests::PNG.to_vec());
+        app.avatars = HashMap::from([(crate::state::thread_key(&alice()), png)]);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("settings") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        let snap = ui.snapshot(&app.theme()).expect("render");
+        assert!(snap.matches_image(dir.join("settings")).expect("write png"));
     }
 }

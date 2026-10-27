@@ -40,11 +40,66 @@ pub struct AppState {
     /// Recently sent stickers, newest first: (pack id, sticker id).
     #[serde(default)]
     pub recent_stickers: Vec<(Vec<u8>, u32)>,
+    /// thread key -> when we last fetched its avatar (and, for contacts, profile), in ms.
+    #[serde(default)]
+    pub avatars_checked: HashMap<String, u64>,
+    /// ACI -> name from the person's own profile: the fallback when nothing else names them.
+    #[serde(default)]
+    pub fetched_names: HashMap<String, String>,
+    #[serde(default)]
+    pub settings: Settings,
     #[serde(skip)]
     path: PathBuf,
 }
 
 pub const MAX_PINNED: usize = 4;
+
+/// Profiles and avatars are fetched again at most this often (ms).
+pub const AVATAR_TTL: u64 = 86_400_000;
+
+/// Whether an avatar last fetched at `last` (ms) is due for another fetch.
+pub fn avatar_due(last: Option<u64>, now_ms: u64) -> bool {
+    last.is_none_or(|t| now_ms.saturating_sub(t) >= AVATAR_TTL)
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize, Debug, PartialEq)]
+pub enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// The settings screen's choices.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(default)]
+pub struct Settings {
+    pub theme: ThemeChoice,
+    pub notifications: bool,
+    /// Show the message text in notifications (else just who it's from).
+    pub notification_text: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { theme: ThemeChoice::System, notifications: true, notification_text: true }
+    }
+}
+
+impl Settings {
+    pub fn dark(&self, system_dark: bool) -> bool {
+        match self.theme {
+            ThemeChoice::System => system_dark,
+            ThemeChoice::Light => false,
+            ThemeChoice::Dark => true,
+        }
+    }
+
+    /// A notification's body for `preview`, or `None` if notifications are off.
+    pub fn notification_body(&self, preview: String) -> Option<String> {
+        self.notifications.then(|| if self.notification_text { preview } else { "New message".into() })
+    }
+}
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default)]
@@ -236,6 +291,34 @@ impl AppState {
         self.save();
     }
 
+    pub fn set_settings(&mut self, s: Settings) {
+        self.settings = s;
+        self.save();
+    }
+
+    /// Takes the threads whose avatar is due out of `keys`, marking them fetched now (and saving).
+    pub fn take_due_avatars(&mut self, keys: impl IntoIterator<Item = String>, now_ms: u64) -> Vec<String> {
+        let due: Vec<String> = keys.into_iter().filter(|k| avatar_due(self.avatars_checked.get(k).copied(), now_ms)).collect();
+        if !due.is_empty() {
+            for k in &due {
+                self.avatars_checked.insert(k.clone(), now_ms);
+            }
+            self.save();
+        }
+        due
+    }
+
+    pub fn set_fetched_name(&mut self, aci: Uuid, name: Option<String>) {
+        let k = aci.to_string();
+        let changed = match name.filter(|n| !n.trim().is_empty()) {
+            Some(n) => self.fetched_names.insert(k, n.clone()).as_ref() != Some(&n),
+            None => self.fetched_names.remove(&k).is_some(),
+        };
+        if changed {
+            self.save();
+        }
+    }
+
     fn save(&self) {
         let tmp = self.path.with_extension("tmp");
         let ok = serde_json::to_vec(self)
@@ -365,6 +448,63 @@ mod tests {
         }
         assert_eq!(s.recent_stickers.len(), RECENT_STICKERS);
         assert_eq!(s.recent_stickers[0], (vec![2], 29));
+    }
+
+    #[test]
+    fn avatars_are_due_once_a_day() {
+        assert!(avatar_due(None, 0), "never fetched");
+        assert!(!avatar_due(Some(1_000), 1_000 + AVATAR_TTL - 1));
+        assert!(avatar_due(Some(1_000), 1_000 + AVATAR_TTL));
+        assert!(!avatar_due(Some(5_000), 1_000), "a clock that went back doesn't refetch");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut s = AppState::load(&path);
+        let keys = || ["a".to_string(), "b".to_string()];
+        assert_eq!(s.take_due_avatars(keys(), 10), keys());
+        assert!(s.take_due_avatars(keys(), 20).is_empty(), "marked as fetched");
+        let mut s = AppState::load(&path);
+        assert!(s.take_due_avatars(keys(), 10 + AVATAR_TTL - 1).is_empty(), "survives a restart");
+        assert_eq!(s.take_due_avatars(["a".to_string(), "c".to_string()], 10 + AVATAR_TTL), ["a", "c"]);
+    }
+
+    #[test]
+    fn settings_persist_and_override_the_system_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, br#"{"last_read":{}}"#).unwrap();
+        let mut s = AppState::load(&path);
+        assert_eq!(s.settings, Settings::default(), "older files get the defaults");
+        assert!(s.settings.notifications && s.settings.notification_text);
+        assert!(s.settings.dark(true) && !s.settings.dark(false), "follows the system by default");
+        s.set_settings(Settings { theme: ThemeChoice::Light, notifications: false, ..Settings::default() });
+        let s = AppState::load(&path);
+        assert_eq!(s.settings.theme, ThemeChoice::Light);
+        assert!(!s.settings.notifications);
+        assert!(!s.settings.dark(true), "light wins over a dark system");
+        assert!(Settings { theme: ThemeChoice::Dark, ..Settings::default() }.dark(false));
+    }
+
+    #[test]
+    fn notification_text_can_be_hidden() {
+        let mut s = Settings::default();
+        assert_eq!(s.notification_body("see you at 5".into()).as_deref(), Some("see you at 5"));
+        s.notification_text = false;
+        assert_eq!(s.notification_body("see you at 5".into()).as_deref(), Some("New message"));
+        s.notifications = false;
+        assert_eq!(s.notification_body("see you at 5".into()), None);
+    }
+
+    #[test]
+    fn fetched_names_persist_and_blank_ones_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let a = crate::timeline::tests::uuid(2);
+        let mut s = AppState::load(&path);
+        s.set_fetched_name(a, Some("Ana P".into()));
+        assert_eq!(AppState::load(&path).fetched_names[&a.to_string()], "Ana P");
+        s.set_fetched_name(a, Some("  ".into()));
+        assert!(AppState::load(&path).fetched_names.is_empty());
     }
 
     #[test]

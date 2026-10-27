@@ -41,7 +41,7 @@ use presage_store_sqlite::SqliteStore;
 use tokio::sync::mpsc;
 
 use crate::groups::{GroupEdit, GroupInfo};
-use crate::state::{AppState, MAX_PINNED, thread_key};
+use crate::state::{AppState, MAX_PINNED, Settings, avatar_due, thread_key};
 use crate::timeline::{Delivery, Kind, Timeline};
 
 type Mgr = Manager<SqliteStore, Registered>;
@@ -99,6 +99,36 @@ pub enum Command {
     /// `sticker` has no `data`: the backend uploads the pack's stored image as it.
     SendSticker { thread: Thread, ts: u64, sticker: Sticker },
     InstallStickerPack { id: Vec<u8>, key: Vec<u8> },
+    /// Fetches our profile and linked devices for the settings screen.
+    LoadSettings,
+    UpdateProfile { given: String, family: String, about: String, emoji: String },
+    SaveSettings(Settings),
+    /// Unlinks this device, then deletes all local data and returns to the link screen.
+    Unlink,
+}
+
+/// Our profile as the settings screen edits it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OwnProfile {
+    pub given: String,
+    pub family: String,
+    pub about: String,
+    pub emoji: String,
+}
+
+impl OwnProfile {
+    fn from_profile(p: presage::libsignal_service::Profile) -> Self {
+        let (given, family) = p.name.map_or_else(Default::default, |n| (n.given_name, n.family_name.unwrap_or_default()));
+        OwnProfile { given, family, about: p.about.unwrap_or_default(), emoji: p.about_emoji.unwrap_or_default() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Device {
+    pub id: u32,
+    pub name: String,
+    /// This device.
+    pub this: bool,
 }
 
 /// What the sidebar's "⋯" menu and the message-request bar do to a chat.
@@ -255,6 +285,13 @@ pub enum Event {
     /// A group we just created, to open.
     GroupCreated { thread: Thread, title: String },
     Stickers { packs: Vec<Pack>, recent: Vec<(Vec<u8>, u32)> },
+    Settings(Settings),
+    /// Our phone number.
+    Account { phone: String },
+    Profile(OwnProfile),
+    Devices(Vec<Device>),
+    /// Downloaded avatars by thread key (for contacts, the ACI).
+    Avatars(HashMap<String, iced::widget::image::Handle>),
     Error(String),
     /// Neutral status banner (e.g. history import in progress); `None` clears it.
     Notice(Option<String>),
@@ -267,6 +304,50 @@ pub fn now_ms() -> u64 {
 /// Attachment cache; also where voice notes are recorded before sending.
 pub fn attachments_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("attachments")
+}
+
+/// Where a thread's avatar is cached.
+pub fn avatar_path(data_dir: &Path, key: &str) -> PathBuf {
+    data_dir.join("avatars").join(key.replace(':', "_"))
+}
+
+/// Who someone is called, best first: their address-book name, the profile name the storage
+/// service has, the name from their own profile, their phone number.
+pub fn merge_names(
+    storage: &HashMap<String, String>,
+    fetched: &HashMap<String, String>,
+    contacts: impl IntoIterator<Item = (Uuid, String, Option<String>)>,
+) -> HashMap<Uuid, String> {
+    let parse = |m: &HashMap<String, String>| {
+        m.iter().filter_map(|(id, n)| Some((Uuid::parse_str(id).ok()?, n.clone()))).collect::<Vec<_>>()
+    };
+    let mut names: HashMap<Uuid, String> = parse(fetched).into_iter().collect();
+    names.extend(parse(storage));
+    for (id, name, phone) in contacts {
+        if !name.is_empty() {
+            names.insert(id, name);
+        } else if let Some(p) = phone {
+            names.entry(id).or_insert(p);
+        }
+    }
+    names
+}
+
+/// Everything this device keeps about the account, deleted after unlinking.
+fn wipe_local_data(data_dir: &Path) -> std::io::Result<()> {
+    let names = [
+        "signal.db3", "signal.db3-wal", "signal.db3-shm", "db.key", "state.json", "state.tmp", "transfer.key", "transfer.bin",
+        "attachments", "avatars",
+    ];
+    for name in names {
+        let p = data_dir.join(name);
+        let r = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        match r {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Stable cache key for an attachment (digest is unique per upload).
@@ -528,7 +609,21 @@ async fn main(
     mut cmds: mpsc::UnboundedReceiver<Command>,
     events: fmpsc::UnboundedSender<Event>,
 ) -> anyhow::Result<()> {
+    while session(&data_dir, &mut cmds, &events).await? {
+        wipe_local_data(&data_dir)?; // unlinked: start over at the link screen
+    }
+    Ok(())
+}
+
+/// Runs one linked device; true once it's unlinked (its tasks stopped, its data still there).
+async fn session(
+    data_dir: &Path,
+    cmds: &mut mpsc::UnboundedReceiver<Command>,
+    events: &fmpsc::UnboundedSender<Event>,
+) -> anyhow::Result<bool> {
+    let (data_dir, events) = (data_dir.to_owned(), events.clone());
     std::fs::create_dir_all(attachments_dir(&data_dir))?;
+    std::fs::create_dir_all(data_dir.join("avatars"))?;
     let pass = db_passphrase(&data_dir)?;
     let db = data_dir.join("signal.db3");
     let store =
@@ -538,8 +633,9 @@ async fn main(
     let manager = if store.is_registered().await {
         Manager::load_registered(store).await?
     } else {
-        link(store, &data_dir, &mut cmds, &events).await?
+        link(store, &data_dir, cmds, &events).await?
     };
+    let (avatar_tx, mut avatar_rx) = mpsc::unbounded_channel();
 
     let mut b = Backend {
         me: ServiceId::from(manager.registration_data().service_ids.aci()).raw_uuid(),
@@ -551,8 +647,20 @@ async fn main(
         group_ids: HashMap::new(),
         storage_synced: false,
         threads: Vec::new(),
+        avatars: HashMap::new(),
+        avatar_tx,
+        data_dir: data_dir.clone(),
+        unlinked: false,
     };
+    for key in b.state.avatars_checked.keys() {
+        if let Ok(bytes) = std::fs::read(avatar_path(&data_dir, key)) {
+            b.avatars.insert(key.clone(), iced::widget::image::Handle::from_bytes(bytes));
+        }
+    }
+    b.emit(Event::Settings(b.state.settings.clone()));
     b.emit(Event::Ready { me: b.me });
+    b.emit(Event::Account { phone: b.manager.registration_data().phone_number.to_string() });
+    b.emit(Event::Avatars(b.avatars.clone()));
     b.emit_stickers().await;
     b.refresh().await;
     b.try_sync_storage().await;
@@ -561,7 +669,7 @@ async fn main(
     // all state (read markers, open thread) stays on one task.
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Received>();
     let mut rx_manager = b.manager.clone();
-    tokio::task::spawn_local(async move {
+    let receiver = tokio::task::spawn_local(async move {
         loop {
             match rx_manager.receive_messages().await {
                 Ok(stream) => {
@@ -579,6 +687,7 @@ async fn main(
         }
     });
 
+    let mut tasks = vec![receiver];
     let (done_tx, mut done_rx) = mpsc::unbounded_channel();
     let transfer_key = std::fs::read_to_string(data_dir.join("transfer.key"))
         .ok()
@@ -586,21 +695,22 @@ async fn main(
     if let Some(key) = transfer_key {
         b.emit(Event::Notice(Some("Importing your message history from your phone…".into())));
         let (m, dir, me) = (b.manager.clone(), data_dir.clone(), b.me);
-        tokio::task::spawn_local(async move {
+        tasks.push(tokio::task::spawn_local(async move {
             let _ = done_tx.send(import_history(m, dir, key, me).await);
-        });
+        }));
     }
 
-    loop {
+    while !b.unlinked {
         // Capped so a suspended machine (monotonic clock paused) still catches up within a minute.
         let next = b.state.next_expiry().map(|at| Duration::from_millis(at.saturating_sub(now_ms())).min(Duration::from_secs(60)));
         tokio::select! {
             _ = async { match next { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => b.expire().await,
             cmd = cmds.recv() => match cmd {
                 Some(cmd) => b.command(cmd).await,
-                None => return Ok(()), // UI gone
+                None => return Ok(false), // UI gone
             },
             Some(r) = in_rx.recv() => b.received(r).await,
+            Some((key, r)) = avatar_rx.recv() => b.avatar_fetched(key, r).await,
             Some(result) = done_rx.recv() => {
                 b.emit(Event::Notice(None));
                 match result {
@@ -616,6 +726,10 @@ async fn main(
             }
         }
     }
+    for t in tasks {
+        t.abort();
+    }
+    Ok(true)
 }
 
 async fn link(
@@ -674,6 +788,22 @@ struct Backend {
     storage_synced: bool,
     /// The listed chats (thread, title), searched by `Command::Search`.
     threads: Vec<(Thread, String)>,
+    /// Downloaded avatars by thread key.
+    avatars: HashMap<String, iced::widget::image::Handle>,
+    avatar_tx: mpsc::UnboundedSender<(String, Result<Fetched, String>)>,
+    data_dir: PathBuf,
+    unlinked: bool,
+}
+
+enum AvatarJob {
+    Profile(Uuid, ProfileKey),
+    Group([u8; 32]),
+}
+
+/// A fetched avatar and, for contacts, their profile name (`None` for groups).
+struct Fetched {
+    name: Option<(Uuid, Option<String>)>,
+    avatar: Option<Vec<u8>>,
 }
 
 impl Backend {
@@ -690,21 +820,11 @@ impl Backend {
     }
 
     async fn names(&self) -> HashMap<Uuid, String> {
-        let mut names: HashMap<Uuid, String> = self
-            .state
-            .profile_names
-            .iter()
-            .filter_map(|(id, n)| Some((Uuid::parse_str(id).ok()?, n.clone())))
-            .collect();
-        if let Ok(contacts) = self.manager.store().contacts().await {
-            for c in contacts.flatten() {
-                if !c.name.is_empty() {
-                    names.insert(c.uuid, c.name);
-                } else if let Some(p) = c.phone_number {
-                    names.entry(c.uuid).or_insert_with(|| p.to_string());
-                }
-            }
-        }
+        let contacts = match self.manager.store().contacts().await {
+            Ok(c) => c.flatten().map(|c| (c.uuid, c.name, c.phone_number.map(|p| p.to_string()))).collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut names = merge_names(&self.state.profile_names, &self.state.fetched_names, contacts);
         names.insert(self.me, "Note to Self".into());
         names
     }
@@ -830,6 +950,80 @@ impl Backend {
         self.threads = out.iter().map(|c| (c.thread.clone(), c.title.clone())).collect();
         self.emit(Event::Names(names));
         self.emit(Event::Conversations(out));
+        let listed: Vec<Thread> = self.threads.iter().map(|(t, _)| t.clone()).filter(|t| *t != me).collect();
+        self.fetch_avatars(listed).await;
+    }
+
+    /// Fetches, in the background, the avatars (and contacts' profiles) of listed chats not
+    /// fetched in the last day. Contacts whose profile key we don't know yet are skipped.
+    async fn fetch_avatars(&mut self, threads: Vec<Thread>) {
+        let now = now_ms();
+        let mut jobs = HashMap::new();
+        for t in threads {
+            let key = thread_key(&t);
+            if !avatar_due(self.state.avatars_checked.get(&key).copied(), now) {
+                continue;
+            }
+            let job = match t {
+                Thread::Contact(id @ ServiceId::Aci(_)) => match self.manager.store().profile_key(&id).await {
+                    Ok(Some(pk)) => AvatarJob::Profile(id.raw_uuid(), pk),
+                    _ => continue,
+                },
+                Thread::Contact(_) => continue,
+                Thread::Group(k) => AvatarJob::Group(k),
+            };
+            jobs.insert(key, job);
+        }
+        let due = self.state.take_due_avatars(jobs.keys().cloned().collect::<Vec<_>>(), now);
+        if due.is_empty() {
+            return;
+        }
+        // shortcut: one request after another, and a failure waits a day; batch or back off if rate limits bite.
+        let (mut m, tx) = (self.manager.clone(), self.avatar_tx.clone());
+        tokio::task::spawn_local(async move {
+            for key in due {
+                let Some(job) = jobs.remove(&key) else { continue };
+                let r = match job {
+                    AvatarJob::Profile(id, pk) => m
+                        .refresh_profile(id, pk)
+                        .await
+                        .map(|(p, avatar)| Fetched { name: Some((id, p.name.map(|n| n.to_string()))), avatar }),
+                    AvatarJob::Group(k) => m.refresh_group_avatar(k).await.map(|avatar| Fetched { name: None, avatar }),
+                };
+                if tx.send((key, r.map_err(|e| e.to_string()))).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Caches a fetched avatar on disk and shows it; a new profile name refreshes the list.
+    async fn avatar_fetched(&mut self, key: String, r: Result<Fetched, String>) {
+        let f = match r {
+            Ok(f) => f,
+            Err(e) => return tracing::warn!(%e, key, "avatar fetch failed"),
+        };
+        let path = avatar_path(&self.data_dir, &key);
+        match &f.avatar {
+            Some(bytes) => {
+                if let Err(e) = std::fs::write(&path, bytes) {
+                    tracing::warn!(%e, "failed to cache avatar");
+                }
+                self.avatars.insert(key, iced::widget::image::Handle::from_bytes(bytes.clone()));
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+                self.avatars.remove(&key);
+            }
+        }
+        self.emit(Event::Avatars(self.avatars.clone()));
+        if let Some((id, name)) = f.name {
+            let before = self.state.fetched_names.get(&id.to_string()).cloned();
+            self.state.set_fetched_name(id, name);
+            if self.state.fetched_names.get(&id.to_string()) != before.as_ref() {
+                self.refresh().await;
+            }
+        }
     }
 
     async fn last_message(&self, thread: &Thread) -> Option<(u64, String)> {
@@ -1045,7 +1239,50 @@ impl Backend {
                 self.report("update chat", r);
                 self.refresh().await;
             }
+            Command::LoadSettings => {
+                let key = self.manager.registration_data().profile_key();
+                let r = self.manager.refresh_profile(self.me, key).await;
+                if let Some((p, _)) = self.report("load your profile", r) {
+                    self.emit(Event::Profile(OwnProfile::from_profile(p)));
+                }
+                let r = self.manager.devices().await;
+                if let Some(devices) = self.report("load linked devices", r) {
+                    let this = self.manager.device_id();
+                    let devices = devices
+                        .into_iter()
+                        .map(|d| Device {
+                            id: u32::from(d.id),
+                            name: d.name.filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Device {}", u32::from(d.id))),
+                            this: d.id == this,
+                        })
+                        .collect();
+                    self.emit(Event::Devices(devices));
+                }
+            }
+            Command::UpdateProfile { given, family, about, emoji } => {
+                let r = self.update_profile(given, family, about, emoji).await;
+                if let Some(p) = self.report("update profile", r) {
+                    self.emit(Event::Profile(p));
+                }
+            }
+            Command::SaveSettings(s) => self.state.set_settings(s),
+            Command::Unlink => {
+                let r = self.manager.unlink_self().await;
+                self.unlinked = self.report("unlink this device", r).is_some();
+            }
         }
+    }
+
+    /// Uploads our new profile (keeping the avatar) and asks our other devices to fetch it.
+    async fn update_profile(&mut self, given: String, family: String, about: String, emoji: String) -> anyhow::Result<OwnProfile> {
+        let opt = |s: String| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
+        let given = given.trim().to_owned();
+        anyhow::ensure!(!given.is_empty(), "your profile needs a first name");
+        let name = presage::libsignal_service::profile_name::ProfileName { given_name: given, family_name: opt(family) };
+        self.manager.update_profile(name, opt(about), opt(emoji)).await?;
+        let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::LocalProfile as i32) };
+        self.sync_to_self(SyncMessage { content: Some(SyncContent::FetchLatest(fetch)), ..Default::default() }).await?;
+        Ok(OwnProfile::from_profile(self.manager.retrieve_profile().await?))
     }
 
     async fn sent(&mut self, thread: Thread, ts: u64, r: anyhow::Result<Vec<AttachmentPointer>>) {
@@ -1473,6 +1710,7 @@ impl Backend {
         let mut t = Timeline::new(self.me);
         t.apply(c);
         let Some(m) = t.messages.last() else { return };
+        let Some(body) = self.state.settings.notification_body(m.preview()) else { return };
         let sender = self.names().await.get(&m.author).cloned().unwrap_or_else(|| "Signal".into());
         let title = match thread {
             Thread::Group(k) => match self.manager.store().group(*k).await {
@@ -1481,7 +1719,6 @@ impl Backend {
             },
             Thread::Contact(_) => sender,
         };
-        let body = m.preview();
         // notify-rust blocks on D-Bus; keep it off the protocol task.
         std::thread::spawn(move || {
             let _ = notify_rust::Notification::new().appname("Signal").summary(&title).body(&body).show();
@@ -1750,5 +1987,45 @@ mod tests {
             let mode = std::fs::metadata(dir.path().join("db.key")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn names_prefer_address_book_then_storage_then_own_profile_then_phone() {
+        let id = |n: u8| uuid(n).to_string();
+        let storage = HashMap::from([(id(2), "Storage Two".to_string()), (id(3), "Storage Three".to_string())]);
+        let fetched = HashMap::from([(id(2), "Profile Two".to_string()), (id(4), "Profile Four".to_string()), (id(5), "Profile Five".to_string())]);
+        let contacts = vec![
+            (uuid(2), "Book Two".to_string(), Some("+1".to_string())),
+            (uuid(3), String::new(), Some("+3".to_string())),
+            (uuid(4), String::new(), Some("+4".to_string())),
+            (uuid(6), String::new(), Some("+6".to_string())),
+        ];
+        let names = merge_names(&storage, &fetched, contacts);
+        assert_eq!(names[&uuid(2)], "Book Two");
+        assert_eq!(names[&uuid(3)], "Storage Three");
+        assert_eq!(names[&uuid(4)], "Profile Four", "their own profile name beats a bare number");
+        assert_eq!(names[&uuid(5)], "Profile Five", "people outside the address book too");
+        assert_eq!(names[&uuid(6)], "+6");
+    }
+
+    #[test]
+    fn avatar_files_are_named_by_thread() {
+        let p = avatar_path(Path::new("/d"), &thread_key(&Thread::Group([1; 32])));
+        assert_eq!(p.parent(), Some(Path::new("/d/avatars")));
+        assert!(!p.file_name().unwrap().to_string_lossy().contains(':'));
+    }
+
+    #[test]
+    fn wiping_removes_account_data_but_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["signal.db3", "db.key", "state.json", "transfer.key", "unrelated.txt"] {
+            std::fs::write(dir.path().join(f), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("attachments")).unwrap();
+        std::fs::write(dir.path().join("attachments/a.jpg"), b"x").unwrap();
+        wipe_local_data(dir.path()).unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["unrelated.txt"]);
+        wipe_local_data(dir.path()).unwrap(); // already gone is fine
     }
 }

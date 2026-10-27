@@ -11,8 +11,10 @@ use presage::libsignal_service::protocol::ServiceId;
 use presage::store::Thread;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::backend::{self, ChatAction, Command, Conversation, Event, Pack, QuoteRef, SearchResult, attachment_key, now_ms};
-use crate::state::MAX_PINNED;
+use crate::backend::{
+    self, ChatAction, Command, Conversation, Device, Event, OwnProfile, Pack, QuoteRef, SearchResult, attachment_key, now_ms,
+};
+use crate::state::{MAX_PINNED, Settings, ThemeChoice};
 use crate::groups::{GroupEdit, GroupInfo};
 use crate::timeline::{Delivery, Message as Msg, Timeline};
 use crate::{audio, emoji, richtext};
@@ -88,6 +90,13 @@ pub struct GroupPanel {
     pub add_query: String,
 }
 
+/// The settings screen's profile edits and the unlink confirmation.
+#[derive(Default)]
+pub struct SettingsPanel {
+    pub profile: OwnProfile,
+    pub confirm_unlink: bool,
+}
+
 /// The "New group" dialog.
 #[derive(Default)]
 pub struct NewGroup {
@@ -119,7 +128,17 @@ pub struct App {
     pub results: Vec<SearchResult>,
     pub open: Option<Open>,
     pub new_group: Option<NewGroup>,
+    pub settings_panel: Option<SettingsPanel>,
+    pub settings: Settings,
+    /// Our profile as last fetched, our phone number and linked devices (settings screen).
+    pub profile: Option<OwnProfile>,
+    pub phone: String,
+    pub devices: Vec<Device>,
+    /// Downloaded avatars by thread key (for contacts, the ACI).
+    pub avatars: HashMap<String, iced::widget::image::Handle>,
+    /// The effective theme: `settings.theme`, or the system's (`system_dark`) when that's "System".
     pub dark: bool,
+    pub system_dark: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
     pub attachments: HashMap<String, Attach>,
@@ -219,6 +238,16 @@ pub enum Message {
     OpenUrl(String),
     Saved(Result<(), String>),
     Theme(iced::theme::Mode),
+    /// Opens or closes the settings screen.
+    ToggleSettings,
+    EditProfile(OwnProfile),
+    SaveProfile,
+    SetTheme(ThemeChoice),
+    SetNotifications(bool),
+    SetNotificationText(bool),
+    /// Asks for confirmation (`true`) or cancels (`false`).
+    AskUnlink(bool),
+    ConfirmUnlink,
     Tick,
     DismissError,
 }
@@ -242,7 +271,14 @@ impl App {
             results: Vec::new(),
             open: None,
             new_group: None,
+            settings_panel: None,
+            settings: Settings::default(),
+            profile: None,
+            phone: String::new(),
+            devices: Vec::new(),
+            avatars: HashMap::new(),
             dark: true,
+            system_dark: true,
             error: None,
             notice: None,
             attachments: HashMap::new(),
@@ -358,6 +394,7 @@ impl App {
                     c.marked_unread = false; // the backend clears it too
                 }
                 self.new_group = None;
+                self.settings_panel = None;
                 self.open = Some(Open {
                     thread,
                     title,
@@ -609,6 +646,7 @@ impl App {
                 self.send(Command::EditGroup { thread, edit });
             }
             Message::NewGroup => {
+                self.settings_panel = None;
                 self.new_group = match self.new_group {
                     Some(_) => None,
                     None => Some(NewGroup::default()),
@@ -734,7 +772,44 @@ impl App {
                 }
             }
             Message::Saved(r) => self.error = r.err().map(|e| format!("Save failed: {e}")),
-            Message::Theme(mode) => self.dark = mode != iced::theme::Mode::Light,
+            Message::Theme(mode) => {
+                self.system_dark = mode != iced::theme::Mode::Light;
+                self.dark = self.settings.dark(self.system_dark);
+            }
+            Message::ToggleSettings => {
+                if self.settings_panel.take().is_none() {
+                    self.new_group = None;
+                    self.settings_panel = Some(SettingsPanel { profile: self.profile.clone().unwrap_or_default(), confirm_unlink: false });
+                    self.send(Command::LoadSettings);
+                }
+            }
+            Message::EditProfile(p) => {
+                if let Some(s) = &mut self.settings_panel {
+                    s.profile = p;
+                }
+            }
+            Message::SaveProfile => {
+                if let Some(p) = self.settings_panel.as_ref().map(|s| s.profile.clone()).filter(|p| self.can_save_profile(p)) {
+                    self.send(Command::UpdateProfile { given: p.given, family: p.family, about: p.about, emoji: p.emoji });
+                }
+            }
+            Message::SetTheme(theme) => self.save_settings(Settings { theme, ..self.settings.clone() }),
+            Message::SetNotifications(notifications) => self.save_settings(Settings { notifications, ..self.settings.clone() }),
+            Message::SetNotificationText(notification_text) => {
+                self.save_settings(Settings { notification_text, ..self.settings.clone() })
+            }
+            Message::AskUnlink(ask) => {
+                if let Some(s) = &mut self.settings_panel {
+                    s.confirm_unlink = ask;
+                }
+            }
+            Message::ConfirmUnlink => {
+                if self.settings_panel.as_ref().is_some_and(|s| s.confirm_unlink) {
+                    self.settings_panel = None;
+                    self.screen = Screen::Connecting;
+                    self.send(Command::Unlink);
+                }
+            }
             Message::Tick => self.tick(),
             Message::DismissError => self.error = None,
         }
@@ -745,6 +820,9 @@ impl App {
         match e {
             Event::Started(tx) => self.cmd = Some(tx),
             Event::NeedsLink => {
+                // Also after unlinking: forget the old account's chats.
+                (self.conversations, self.names, self.avatars, self.devices) = Default::default();
+                (self.open, self.profile, self.settings_panel, self.new_group) = (None, None, None, None);
                 let error = match &self.screen {
                     Screen::Link { error, .. } => error.clone(),
                     _ => None,
@@ -885,10 +963,39 @@ impl App {
                     }
                 }
             }
-            Event::Error(e) => self.error = Some(e),
+            Event::Settings(s) => {
+                self.dark = s.dark(self.system_dark);
+                self.settings = s;
+            }
+            Event::Account { phone } => self.phone = phone,
+            Event::Profile(p) => {
+                if let Some(s) = &mut self.settings_panel {
+                    s.profile = p.clone();
+                }
+                self.profile = Some(p);
+            }
+            Event::Devices(d) => self.devices = d,
+            Event::Avatars(a) => self.avatars = a,
+            Event::Error(e) => {
+                if matches!(self.screen, Screen::Connecting) && self.me != Uuid::nil() {
+                    self.screen = Screen::Main; // unlinking failed: still linked
+                }
+                self.error = Some(e)
+            }
             Event::Notice(n) => self.notice = n,
         }
         Task::none()
+    }
+
+    fn save_settings(&mut self, s: Settings) {
+        self.dark = s.dark(self.system_dark);
+        self.settings = s.clone();
+        self.send(Command::SaveSettings(s));
+    }
+
+    /// A changed profile with a first name, once the current one is known (so nothing is lost).
+    pub fn can_save_profile(&self, p: &OwnProfile) -> bool {
+        self.profile.as_ref().is_some_and(|old| old != p) && !p.given.trim().is_empty()
     }
 
     fn send_message(&mut self, voice_note: bool) {
