@@ -152,15 +152,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Some(v) => stack![body, opaque(story_viewer(app, v))].into(),
         None => body,
     };
-    let body: Element<_> = match &app.notice {
-        None => body,
-        Some(n) => column![
+    let body: Element<_> = match app.ringing.iter().chain(&app.notice).collect::<Vec<_>>() {
+        banners if banners.is_empty() => body,
+        banners => column(banners.into_iter().map(|n| {
             container(text(n.clone()).color(Color::WHITE))
                 .padding([6, 12])
                 .width(Length::Fill)
-                .style(|_| container::Style { background: Some(BLUE.into()), ..Default::default() }),
-            body
-        ]
+                .style(|_| container::Style { background: Some(BLUE.into()), ..Default::default() })
+                .into()
+        }))
+        .push(body)
         .into(),
     };
     match &app.error {
@@ -1519,6 +1520,22 @@ mod tests {
     use crate::backend::{Command, Event};
     use crate::timeline::tests::{content, uuid};
     use iced_test::simulator;
+
+    #[test]
+    fn ringing_banner_shows_above_the_notice_until_cleared() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let banner = "📞 Alice is calling (video) · answer on your phone";
+        app.update(Message::Backend(Event::Notice(Some("Importing…".into()))));
+        app.update(Message::Backend(Event::Ringing(Some(banner.into()))));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find(banner).is_ok() && ui.find("Importing…").is_ok());
+        assert!(ui.find("hi there").is_ok(), "the chat stays usable");
+        drop(ui);
+        app.update(Message::Backend(Event::Ringing(None)));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find(banner).is_err() && ui.find("Importing…").is_ok());
+    }
 
     #[test]
     fn qr_is_dark_on_light_in_every_theme() {

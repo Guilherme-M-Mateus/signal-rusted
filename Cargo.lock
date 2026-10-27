@@ -6713,6 +6713,7 @@ dependencies = [
  "open",
  "presage",
  "presage-store-sqlite",
+ "prost",
  "protobuf",
  "rand 0.9.5",
  "reqwest",

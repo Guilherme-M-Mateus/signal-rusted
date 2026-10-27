@@ -33,13 +33,14 @@ use presage::proto::sync_message::{
 };
 use presage::proto::{
     AddressableMessage, AttachmentPointer, BodyRange, ConversationIdentifier, DataMessage, EditMessage,
-    GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage, receipt_message, typing_message,
+    CallMessage, GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage, receipt_message, typing_message,
 };
 use presage::store::{ContentsStore, StateStore, StickerPack, Thread};
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use tokio::sync::mpsc;
 
+use crate::calls::{Calls, Change};
 use crate::groups::{GroupEdit, GroupInfo};
 use crate::state::{AppState, MAX_PINNED, Settings, avatar_due, thread_key};
 use crate::stories::{Story, StoryReply, StoryStore};
@@ -302,6 +303,8 @@ pub enum Event {
     Error(String),
     /// Neutral status banner (e.g. history import in progress); `None` clears it.
     Notice(Option<String>),
+    /// "Alice is calling" banner while a call rings on the phone; `None` clears it.
+    Ringing(Option<String>),
 }
 
 pub fn now_ms() -> u64 {
@@ -649,6 +652,7 @@ async fn session(
         avatar_tx,
         data_dir: data_dir.clone(),
         unlinked: false,
+        calls: Calls::default(),
     };
     for key in b.state.avatars_checked.keys() {
         if let Ok(bytes) = std::fs::read(avatar_path(&data_dir, key)) {
@@ -702,9 +706,15 @@ async fn session(
 
     while !b.unlinked {
         // Capped so a suspended machine (monotonic clock paused) still catches up within a minute.
-        let next = b.state.next_expiry().into_iter().chain(b.stories.next_expiry()).min().map(|at| Duration::from_millis(at.saturating_sub(now_ms())).min(Duration::from_secs(60)));
+        let next = b.state.next_expiry().into_iter().chain(b.stories.next_expiry()).chain(b.calls.next_timeout()).min().map(|at| Duration::from_millis(at.saturating_sub(now_ms())).min(Duration::from_secs(60)));
         tokio::select! {
-            _ = async { match next { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => b.expire().await,
+            _ = async { match next { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => {
+                if b.calls.next_timeout().is_some_and(|at| at <= now_ms()) {
+                    let ended = b.calls.expire(now_ms());
+                    b.calls_changed(Change { started: None, ended }).await;
+                }
+                b.expire().await
+            }
             cmd = cmds.recv() => match cmd {
                 Some(cmd) => b.command(cmd).await,
                 None => return Ok(false), // UI gone
@@ -794,6 +804,7 @@ struct Backend {
     avatar_tx: mpsc::UnboundedSender<(String, Result<Fetched, String>)>,
     data_dir: PathBuf,
     unlinked: bool,
+    calls: Calls,
 }
 
 enum AvatarJob {
@@ -1679,6 +1690,22 @@ impl Backend {
                 return;
             }
             ContentBody::StoryMessage(s) => return self.story(sender, ts, s.clone()).await,
+            ContentBody::CallMessage(m) => return self.call_message(&c, m).await,
+            ContentBody::SynchronizeMessage(SyncMessage { content: Some(SyncContent::CallEvent(e)), .. }) if sender == self.me => {
+                // presage can't map a group id to a group and files group calls under Note to Self.
+                let group = e.conversation_id.as_deref().and_then(|id| <[u8; 32]>::try_from(id).ok());
+                if let Some(&key) = group.and_then(|id| self.group_ids.get(&id)) {
+                    let mut store = self.manager.store().clone();
+                    let _ = store.delete_message(&Thread::Contact(c.metadata.sender), ts).await;
+                    let thread = Thread::Group(key);
+                    if let Err(e) = store.save_message(&thread, c.clone()).await {
+                        tracing::warn!(%e, "failed to file group call event");
+                    }
+                    self.emit(Event::Incoming { thread, content: Box::new(c) });
+                    self.refresh().await;
+                    return;
+                }
+            }
             ContentBody::TypingMessage(t) => {
                 let thread = match t.group_id.as_deref().and_then(|g| <[u8; 32]>::try_from(g).ok()) {
                     Some(id) => match self.group_ids.get(&id) {
@@ -1767,6 +1794,65 @@ impl Backend {
             self.start_expiries(&thread, &t);
         }
         self.emit(Event::Incoming { thread, content: Box::new(c) });
+        self.refresh().await;
+    }
+
+    async fn call_message(&mut self, c: &Content, m: &CallMessage) {
+        let from = Thread::Contact(c.metadata.sender);
+        let caller = c.metadata.sender.raw_uuid();
+        // Signal-Desktop answers offers in message requests with a "need permission" hangup; we
+        // send nothing and show nothing, so the phone decides.
+        if m.offer.is_some() && (caller == self.me || self.is_request(&from).await) {
+            return;
+        }
+        let sent = c.metadata.client_timestamp.timestamp_millis() as u64;
+        let received = c.metadata.server_timestamp.timestamp_millis() as u64;
+        let before = self.calls.ringing.clone();
+        let groups = &self.group_ids;
+        let state = &self.state;
+        let change = self.calls.handle(from, caller, (sent, received), m, now_ms(), |id| {
+            let thread = Thread::Group(*groups.get(<&[u8; 32]>::try_from(id).ok()?)?);
+            (!state.flags(&thread).blocked).then_some(thread)
+        });
+        if change != Change::default() || self.calls.ringing != before {
+            self.calls_changed(change).await; // not for ICE updates and such
+        }
+    }
+
+    /// Notifies about a new ring, records ended calls in their chats, and updates the banner.
+    async fn calls_changed(&mut self, change: Change) {
+        let names = self.names().await;
+        let title = |r: &crate::calls::Ring| match &r.thread {
+            Thread::Group(_) => {
+                let group = self.threads.iter().find(|(t, _)| *t == r.thread).map_or("a group", |(_, title)| title);
+                format!("Group call in {group}")
+            }
+            Thread::Contact(_) => {
+                let kind = if r.video { "video" } else { "voice" };
+                format!("{} is calling ({kind})", names.get(&r.caller).map_or("Someone", String::as_str))
+            }
+        };
+        if let Some(r) = &change.started
+            && self.state.settings.notifications
+            && !self.state.is_muted(&r.thread, now_ms())
+        {
+            let (summary, body) = (title(r), "Answer on your phone".to_owned());
+            std::thread::spawn(move || {
+                let _ = notify_rust::Notification::new().appname("Signal").summary(&summary).body(&body).show();
+            });
+        }
+        self.emit(Event::Ringing(self.calls.ringing.last().map(|r| format!("📞 {} · answer on your phone", title(r)))));
+        if change.ended.is_empty() {
+            return;
+        }
+        for (ring, event) in change.ended {
+            let sync = SyncMessage { content: Some(SyncContent::CallEvent(ring.event(event))), ..Default::default() };
+            let content = crate::history::content(self.me, self.me, ring.started, sync);
+            if let Err(e) = self.manager.store().clone().save_message(&ring.thread, content.clone()).await {
+                tracing::warn!(%e, "failed to record call");
+            }
+            self.emit(Event::Incoming { thread: ring.thread, content: Box::new(content) });
+        }
         self.refresh().await;
     }
 

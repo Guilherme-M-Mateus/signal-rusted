@@ -142,6 +142,8 @@ pub struct App {
     pub system_dark: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
+    /// A call ringing on the phone (`Event::Ringing`).
+    pub ringing: Option<String>,
     pub attachments: HashMap<String, Attach>,
     pub typing: HashMap<Thread, HashMap<Uuid, Instant>>,
     /// Device thread for playback/recording, started on first use (tests inject a channel).
@@ -294,6 +296,7 @@ impl App {
             system_dark: true,
             error: None,
             notice: None,
+            ringing: None,
             attachments: HashMap::new(),
             typing: HashMap::new(),
             audio: None,
@@ -878,6 +881,7 @@ impl App {
                 // Also after unlinking: forget the old account's chats.
                 (self.conversations, self.names, self.avatars, self.devices) = Default::default();
                 (self.open, self.profile, self.settings_panel, self.new_group) = (None, None, None, None);
+                self.ringing = None;
                 let error = match &self.screen {
                     Screen::Link { error, .. } => error.clone(),
                     _ => None,
@@ -1044,6 +1048,7 @@ impl App {
                 self.error = Some(e)
             }
             Event::Notice(n) => self.notice = n,
+            Event::Ringing(r) => self.ringing = r,
         }
         Task::none()
     }

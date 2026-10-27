@@ -18,7 +18,8 @@ use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::proto::body_range::{AssociatedValue, Style};
 use presage::proto::data_message::{Flags, Quote, Reaction, Sticker};
-use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, GroupContextV2, NullMessage, ReceiptMessage, receipt_message};
+use presage::proto::sync_message::{CallEvent, Content as SyncContent, call_event};
+use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, GroupContextV2, NullMessage, ReceiptMessage, SyncMessage, receipt_message};
 use presage::store::Thread;
 use protobuf::Message as _;
 
@@ -43,7 +44,7 @@ pub struct Importer {
     receipts: Vec<(Thread, Uuid, u64, u64, Delivery)>,
 }
 
-fn content(sender: Uuid, me: Uuid, ts: u64, body: impl Into<ContentBody>) -> Content {
+pub(crate) fn content(sender: Uuid, me: Uuid, ts: u64, body: impl Into<ContentBody>) -> Content {
     let at = chrono::DateTime::from_timestamp_millis(ts as i64).unwrap_or_default();
     Content::from_body(
         body,
@@ -159,6 +160,46 @@ fn attachment(f: &pb::FilePointer) -> Option<AttachmentPointer> {
     })
 }
 
+fn individual_call(c: &pb::IndividualCall) -> CallEvent {
+    use pb::individual_call::{Direction, State, Type};
+    let video = c.type_.enum_value_or_default() == Type::VIDEO_CALL;
+    let outgoing = c.direction.enum_value_or_default() == Direction::OUTGOING;
+    let event = match c.state.enum_value_or_default() {
+        State::NOT_ACCEPTED => call_event::Event::NotAccepted as i32,
+        State::MISSED | State::MISSED_NOTIFICATION_PROFILE => crate::calls::MISSED,
+        State::ACCEPTED | State::UNKNOWN_STATE => call_event::Event::Accepted as i32,
+    };
+    CallEvent {
+        call_id: c.callId,
+        timestamp: Some(c.startedCallTimestamp),
+        r#type: Some(if video { call_event::Type::VideoCall } else { call_event::Type::AudioCall } as i32),
+        direction: Some(if outgoing { call_event::Direction::Outgoing } else { call_event::Direction::Incoming } as i32),
+        event: Some(event),
+        conversation_id: None,
+    }
+}
+
+fn group_call(c: &pb::GroupCall, started_by_me: bool) -> CallEvent {
+    use pb::group_call::State;
+    let state = c.state.enum_value_or_default();
+    let event = match state {
+        State::ACCEPTED | State::JOINED | State::OUTGOING_RING => call_event::Event::Accepted as i32,
+        State::DECLINED => call_event::Event::NotAccepted as i32,
+        State::GENERIC | State::UNKNOWN_STATE => call_event::Event::Observed as i32,
+        // A ring still "ringing" in a backup is long over.
+        State::RINGING | State::MISSED | State::MISSED_NOTIFICATION_PROFILE => crate::calls::MISSED,
+    };
+    let outgoing = state == State::OUTGOING_RING || started_by_me;
+    CallEvent {
+        call_id: c.callId,
+        timestamp: Some(c.startedCallTimestamp),
+        r#type: Some(call_event::Type::GroupCall as i32),
+        direction: Some(if outgoing { call_event::Direction::Outgoing } else { call_event::Direction::Incoming } as i32),
+        event: Some(event),
+        conversation_id: None,
+    }
+}
+
 impl Importer {
     pub fn new(me: Uuid) -> Self {
         Importer { me, ..Default::default() }
@@ -265,7 +306,14 @@ impl Importer {
                         let group = GroupContextV2 { master_key: Some(key.to_vec()), group_change: Some(change), ..Default::default() };
                         DataMessage { group_v2: Some(group), ..Default::default() }
                     }
-                    _ => return, // profile changes, calls, merges: not shown by this client yet
+                    Some(pb::chat_update_message::Update::IndividualCall(c)) => {
+                        return self.call(thread, id, individual_call(&c));
+                    }
+                    Some(pb::chat_update_message::Update::GroupCall(c)) => {
+                        let started_by_me = c.startedCallRecipientId.is_some_and(|r| matches!(self.recipients.get(&r), Some(Who::Me)));
+                        return self.call(thread, id, group_call(&c, started_by_me));
+                    }
+                    _ => return, // profile changes, merges: not shown by this client yet
                 };
                 (dm, Vec::new())
             }
@@ -318,6 +366,17 @@ impl Importer {
 }
 
 impl Importer {
+    /// A call record, as the `CallEvent` our devices sync for it (`timeline` words both alike).
+    fn call(&mut self, thread: Thread, id: u64, mut e: CallEvent) {
+        e.timestamp = e.timestamp.filter(|t| *t != 0).or(Some(id));
+        e.conversation_id = match &thread {
+            Thread::Contact(peer) => Some(peer.service_id_binary()),
+            Thread::Group(key) => Some(crate::backend::group_id(key).to_vec()),
+        };
+        let sync = SyncMessage { content: Some(SyncContent::CallEvent(e)), ..Default::default() };
+        self.rows.push((thread, content(self.me, self.me, id, sync)));
+    }
+
     /// Adds the receipt rows last, each at a timestamp no other row in its chat uses (the
     /// store keys rows by chat + timestamp, so a clash would overwrite a message).
     fn finish(&mut self) {
@@ -550,6 +609,45 @@ mod tests {
         assert_eq!(lines[1], ["You changed the disappearing message timer to 1 hour"]);
         assert_eq!(g.messages[2].preview(), "Group updated", "nothing decodable");
         assert_eq!(timeline(&i, &alice()).messages[0].preview(), "Disappearing message time set to 1 day");
+    }
+
+    #[test]
+    fn call_items_become_the_same_notices_as_synced_call_events() {
+        use pb::chat_update_message::Update;
+        use pb::individual_call::{Direction, State, Type};
+        let mut i = importer();
+        let one = |ty: Type, dir: Direction, state: State, at: u64| {
+            let mut c = pb::IndividualCall::new();
+            c.callId = Some(at);
+            c.type_ = ty.into();
+            c.direction = dir.into();
+            c.state = state.into();
+            c.startedCallTimestamp = at;
+            update(10, at, Update::IndividualCall(c))
+        };
+        i.frame(one(Type::AUDIO_CALL, Direction::INCOMING, State::MISSED, 100));
+        i.frame(one(Type::VIDEO_CALL, Direction::INCOMING, State::ACCEPTED, 200));
+        i.frame(one(Type::AUDIO_CALL, Direction::OUTGOING, State::NOT_ACCEPTED, 300));
+        i.frame(one(Type::UNKNOWN_TYPE, Direction::UNKNOWN_DIRECTION, State::NOT_ACCEPTED, 400));
+        let group = |state: pb::group_call::State, starter: Option<u64>, at: u64| {
+            let mut c = pb::GroupCall::new();
+            c.state = state.into();
+            c.startedCallRecipientId = starter;
+            c.startedCallTimestamp = at;
+            update(11, at, Update::GroupCall(c))
+        };
+        i.frame(group(pb::group_call::State::MISSED, Some(ALICE), 100));
+        i.frame(group(pb::group_call::State::JOINED, Some(ME), 200));
+        i.frame(group(pb::group_call::State::DECLINED, None, 300));
+
+        let previews = |t: &Thread| timeline(&i, t).messages.iter().map(|m| m.preview()).collect::<Vec<_>>();
+        assert_eq!(
+            previews(&alice()),
+            ["📞 Missed voice call", "📞 Incoming video call", "📞 Unanswered voice call", "📞 Declined voice call"]
+        );
+        assert_eq!(previews(&Thread::Group([7; 32])), ["📞 Missed video call", "📞 Outgoing video call", "📞 Declined video call"]);
+        // Filed like live call events, so presage would put them in the same chats.
+        assert_eq!(Thread::try_from(&i.rows[0].1).unwrap(), alice());
     }
 
     fn sent_to(recipient: u64, at: u64, status: pb::send_status::DeliveryStatus) -> pb::SendStatus {

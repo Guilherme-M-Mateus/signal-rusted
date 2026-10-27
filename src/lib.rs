@@ -6,6 +6,7 @@ pub mod stories;
 pub mod state;
 pub mod storage;
 pub mod backend;
+pub mod calls;
 pub mod dbkey;
 pub mod groups;
 pub mod audio;

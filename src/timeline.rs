@@ -203,6 +203,8 @@ pub struct Message {
     pub sticker: Option<Sticker>,
     /// "Replied to a story" / "Reacted to a story": an answer to one of the chat's stories.
     pub story_reply: Option<&'static str>,
+    /// A call notice's call id: later records of the same call replace it.
+    pub call_id: Option<u64>,
 }
 
 impl Message {
@@ -224,6 +226,7 @@ impl Message {
             expire_timer: 0,
             sticker: None,
             story_reply: None,
+            call_id: None,
         }
     }
 
@@ -371,9 +374,14 @@ impl Timeline {
                 Some(SyncContent::Sent(sync_message::Sent { edit_message: Some(edit), .. })) => {
                     self.edit(edit, self.me, true)
                 }
-                Some(SyncContent::CallEvent(_)) => {
-                    let mut m = Message::new(ts_of(c), self.me, false);
-                    m.kind = Kind::System("📞 Call".into());
+                Some(SyncContent::CallEvent(e)) => {
+                    // Our own record of a call and the phone's sync of it share the call id.
+                    let old = e.call_id.and_then(|id| self.messages.iter().position(|m| m.call_id == Some(id)));
+                    let removed = old.map(|i| self.messages.remove(i)).is_some();
+                    let Some(text) = crate::calls::notice(e) else { return removed };
+                    let mut m = Message::new(e.timestamp.unwrap_or_else(|| ts_of(c)), self.me, false);
+                    m.kind = Kind::System(text);
+                    m.call_id = e.call_id;
                     self.upsert(m);
                     true
                 }
@@ -841,6 +849,24 @@ pub(crate) mod tests {
         assert!(!t.apply(&content(uuid(ALICE), 3, profile_key_update)));
         let notices: Vec<_> = t.messages.iter().map(Message::preview).collect();
         assert_eq!(notices, ["Disappearing message time set to 1 hour", "Group updated"]);
+    }
+
+    #[test]
+    fn call_records_show_at_the_call_and_later_records_of_it_replace_them() {
+        use presage::proto::sync_message::{CallEvent, call_event::Event};
+        let call = |event: i32, at: u64| {
+            let e = CallEvent { call_id: Some(9), timestamp: Some(50), event: Some(event), ..Default::default() };
+            content(uuid(ME), at, SyncMessage { content: Some(SyncContent::CallEvent(e)), ..Default::default() })
+        };
+        let mut t = tl();
+        t.apply(&content(uuid(ALICE), 40, text(40, "call me")));
+        t.apply(&content(uuid(ALICE), 60, text(60, "?")));
+        t.apply(&call(crate::calls::MISSED, 55)); // ours, filed under the call's start
+        t.apply(&call(Event::Accepted as i32, 70)); // the phone's sync of the same call
+        let previews: Vec<_> = t.messages.iter().map(Message::preview).collect();
+        assert_eq!(previews, ["call me", "📞 Incoming voice call", "?"]);
+        assert!(t.apply(&call(Event::Delete as i32, 80)));
+        assert_eq!(t.messages.len(), 2);
     }
 
     fn names() -> HashMap<Uuid, String> {
