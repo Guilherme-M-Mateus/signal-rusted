@@ -5,6 +5,7 @@ pub mod timeline;
 pub mod state;
 pub mod storage;
 pub mod backend;
+pub mod dbkey;
 pub mod groups;
 pub mod audio;
 pub mod app;

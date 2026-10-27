@@ -3,7 +3,7 @@
 //! message as the same `Content` presage saves for live traffic, so the timeline needs nothing new.
 //! Mirrors Signal-Desktop's `backups.downloadAndImport` for the ephemeral-key case.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use libsignal_account_keys::BackupKey;
@@ -12,14 +12,17 @@ use libsignal_message_backup::key::MessageBackupKey;
 use libsignal_message_backup::parse::VarintDelimitedReader;
 use libsignal_message_backup::proto::backup as pb;
 use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+use presage::libsignal_service::groups_v2::AccessRequired;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::proto::body_range::{AssociatedValue, Style};
-use presage::proto::data_message::{Quote, Reaction, Sticker};
-use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, NullMessage};
+use presage::proto::data_message::{Flags, Quote, Reaction, Sticker};
+use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, GroupContextV2, NullMessage, ReceiptMessage, receipt_message};
 use presage::store::Thread;
 use protobuf::Message as _;
+
+use crate::timeline::{Delivery, GroupNotice, IMPORTED_NOTICES};
 
 enum Who {
     Me,
@@ -36,6 +39,8 @@ pub struct Importer {
     pub rows: Vec<(Thread, Content)>,
     /// Installed sticker packs: (pack id, pack key).
     pub sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Best receipt per outgoing message: (thread, recipient, sent ts, receipt ts, level).
+    receipts: Vec<(Thread, Uuid, u64, u64, Delivery)>,
 }
 
 fn content(sender: Uuid, me: Uuid, ts: u64, body: impl Into<ContentBody>) -> Content {
@@ -76,6 +81,59 @@ fn ranges(text: &pb::Text) -> Vec<BodyRange> {
             Some(BodyRange { start: Some(r.start), length: Some(r.length), associated_value: Some(value) })
         })
         .collect()
+}
+
+fn access(level: protobuf::EnumOrUnknown<pb::GroupV2AccessLevel>) -> AccessRequired {
+    match level.enum_value() {
+        Ok(pb::GroupV2AccessLevel::ANY) => AccessRequired::Any,
+        Ok(pb::GroupV2AccessLevel::MEMBER) => AccessRequired::Member,
+        Ok(pb::GroupV2AccessLevel::ADMINISTRATOR) => AccessRequired::Administrator,
+        _ => AccessRequired::Unsatisfiable,
+    }
+}
+
+/// A backup group update (already decrypted by the phone) as (editor, notice).
+fn group_notice(u: pb::group_change_chat_update::update::Update, me: Uuid) -> Option<(Option<Uuid>, GroupNotice)> {
+    use GroupNotice as N;
+    use pb::group_change_chat_update::update::Update as U;
+    let opt = |b: &Option<Vec<u8>>| b.as_deref().and_then(|b| Uuid::from_slice(b).ok());
+    let id = |b: &[u8]| Uuid::from_slice(b).ok();
+    let link = |approval| if approval { AccessRequired::Administrator } else { AccessRequired::Any };
+    Some(match u {
+        U::GroupCreationUpdate(u) => (opt(&u.updaterAci), N::Created),
+        U::GroupNameUpdate(u) => (opt(&u.updaterAci), N::Title(u.newGroupName.unwrap_or_default())),
+        U::GroupAvatarUpdate(u) => (opt(&u.updaterAci), N::Avatar(!u.wasRemoved)),
+        U::GroupDescriptionUpdate(u) => (opt(&u.updaterAci), N::Description(u.newDescription.is_some())),
+        U::GroupMembershipAccessLevelChangeUpdate(u) => (opt(&u.updaterAci), N::MembersAccess(access(u.accessLevel))),
+        U::GroupAttributesAccessLevelChangeUpdate(u) => (opt(&u.updaterAci), N::InfoAccess(access(u.accessLevel))),
+        U::GroupAnnouncementOnlyChangeUpdate(u) => (opt(&u.updaterAci), N::AnnouncementsOnly(u.isAnnouncementOnly)),
+        U::GroupAdminStatusUpdate(u) => (opt(&u.updaterAci), N::Admin(id(&u.memberAci)?, u.wasAdminStatusGranted)),
+        U::GroupMemberLeftUpdate(u) => (id(&u.aci), N::Removed(id(&u.aci)?)),
+        U::GroupMemberRemovedUpdate(u) => (opt(&u.removerAci), N::Removed(id(&u.removedAci)?)),
+        U::SelfInvitedToGroupUpdate(u) => (opt(&u.inviterAci), N::Invited(me)),
+        U::SelfInvitedOtherUserToGroupUpdate(u) => {
+            (Some(me), N::Invited(ServiceId::parse_from_service_id_binary(&u.inviteeServiceId)?.raw_uuid()))
+        }
+        U::GroupInvitationAcceptedUpdate(u) => (id(&u.newMemberAci), N::InviteAccepted(id(&u.newMemberAci)?)),
+        U::GroupInvitationDeclinedUpdate(u) => (opt(&u.inviteeAci), N::InviteRevoked(opt(&u.inviteeAci)?)),
+        U::GroupMemberJoinedUpdate(u) => (id(&u.newMemberAci), N::Added(id(&u.newMemberAci)?)),
+        U::GroupMemberJoinedByLinkUpdate(u) => (id(&u.newMemberAci), N::Added(id(&u.newMemberAci)?)),
+        U::GroupMemberAddedUpdate(u) => (opt(&u.updaterAci), N::Added(id(&u.newMemberAci)?)),
+        U::GroupSelfInvitationRevokedUpdate(u) => (opt(&u.revokerAci), N::InviteRevoked(me)),
+        U::GroupJoinRequestUpdate(u) => (id(&u.requestorAci), N::Requested(id(&u.requestorAci)?)),
+        U::GroupJoinRequestApprovalUpdate(u) => {
+            let who = id(&u.requestorAci)?;
+            (opt(&u.updaterAci), if u.wasApproved { N::RequestApproved(who) } else { N::RequestDenied(who) })
+        }
+        U::GroupJoinRequestCanceledUpdate(u) => (id(&u.requestorAci), N::RequestDenied(id(&u.requestorAci)?)),
+        U::GroupInviteLinkResetUpdate(u) => (opt(&u.updaterAci), N::LinkReset),
+        U::GroupInviteLinkEnabledUpdate(u) => (opt(&u.updaterAci), N::LinkAccess(link(u.linkRequiresAdminApproval))),
+        U::GroupInviteLinkAdminApprovalUpdate(u) => (opt(&u.updaterAci), N::LinkAccess(link(u.linkRequiresAdminApproval))),
+        U::GroupInviteLinkDisabledUpdate(u) => (opt(&u.updaterAci), N::LinkAccess(AccessRequired::Unsatisfiable)),
+        U::GroupExpirationTimerUpdate(u) => (opt(&u.updaterAci), N::Timer((u.expiresInMs / 1000) as u32)),
+        U::GroupTerminateChangeUpdate(u) => (opt(&u.updaterAci), N::Ended),
+        _ => return None, // generic, migration and bulk invite/request updates
+    })
 }
 
 /// Only transit-tier files (still on the attachment CDN) can be fetched by a linked device.
@@ -192,10 +250,43 @@ impl Importer {
                 self.rows.push((thread, content(Uuid::nil(), me, id, NullMessage::default())));
                 return;
             }
-            _ => return, // updates, payments, calls, polls: not shown by this client yet
+            Some(pb::chat_item::Item::UpdateMessage(u)) => {
+                let dm = match u.update {
+                    Some(pb::chat_update_message::Update::ExpirationTimerChange(t)) => DataMessage {
+                        flags: Some(Flags::ExpirationTimerUpdate as u32),
+                        expire_timer: Some((t.expiresInMs / 1000) as u32),
+                        ..Default::default()
+                    },
+                    Some(pb::chat_update_message::Update::GroupChange(g)) => {
+                        let Thread::Group(key) = &thread else { return };
+                        let notices: Vec<_> = g.updates.into_iter().filter_map(|u| group_notice(u.update?, me)).collect();
+                        let mut change = IMPORTED_NOTICES.to_vec();
+                        change.extend(serde_json::to_vec(&notices).expect("notices serialize"));
+                        let group = GroupContextV2 { master_key: Some(key.to_vec()), group_change: Some(change), ..Default::default() };
+                        DataMessage { group_v2: Some(group), ..Default::default() }
+                    }
+                    _ => return, // profile changes, calls, merges: not shown by this client yet
+                };
+                (dm, Vec::new())
+            }
+            _ => return, // payments, polls: not shown by this client yet
         };
-        if dm.body.is_none() && dm.attachments.is_empty() && dm.sticker.is_none() {
+        if dm.body.is_none() && dm.attachments.is_empty() && dm.sticker.is_none() && dm.flags.is_none() && dm.group_v2.is_none() {
             return;
+        }
+        if let Some(pb::chat_item::DirectionalDetails::Outgoing(o)) = &item.directionalDetails {
+            let best = o.sendStatus.iter().filter_map(|s| {
+                let level = match s.deliveryStatus.as_ref()? {
+                    pb::send_status::DeliveryStatus::Delivered(_) => Delivery::Delivered,
+                    pb::send_status::DeliveryStatus::Read(_) | pb::send_status::DeliveryStatus::Viewed(_) => Delivery::Read,
+                    _ => return None,
+                };
+                Some((level, s))
+            });
+            if let Some((level, s)) = best.max_by_key(|(level, _)| *level) {
+                let from = self.uuid(s.recipientId).unwrap_or(me);
+                self.receipts.push((thread.clone(), from, id, s.timestamp.max(id + 1), level));
+            }
         }
         dm.timestamp = Some(item.dateSent);
         let row = if item.revisions.is_empty() {
@@ -226,6 +317,23 @@ impl Importer {
     }
 }
 
+impl Importer {
+    /// Adds the receipt rows last, each at a timestamp no other row in its chat uses (the
+    /// store keys rows by chat + timestamp, so a clash would overwrite a message).
+    fn finish(&mut self) {
+        let mut taken: HashSet<(Thread, u64)> =
+            self.rows.iter().map(|(t, c)| (t.clone(), c.metadata.client_timestamp.timestamp_millis() as u64)).collect();
+        for (thread, from, id, mut at, level) in std::mem::take(&mut self.receipts) {
+            while !taken.insert((thread.clone(), at)) {
+                at += 1;
+            }
+            let r#type = if level == Delivery::Read { receipt_message::Type::Read } else { receipt_message::Type::Delivery };
+            let receipt = ReceiptMessage { r#type: Some(r#type as i32), timestamp: vec![id] };
+            self.rows.push((thread, content(from, self.me, at, receipt)));
+        }
+    }
+}
+
 /// Decrypts and parses a downloaded archive (HMAC is verified before any frame is used).
 pub async fn read_archive(path: &Path, ephemeral_key: [u8; 32], me: Uuid) -> anyhow::Result<Importer> {
     let backup_key: BackupKey = BackupKey(ephemeral_key);
@@ -239,6 +347,7 @@ pub async fn read_archive(path: &Path, ephemeral_key: [u8; 32], me: Uuid) -> any
     while let Some(bytes) = reader.read_next().await? {
         importer.frame(pb::Frame::parse_from_bytes(&bytes)?);
     }
+    importer.finish();
     Ok(importer)
 }
 
@@ -390,6 +499,104 @@ mod tests {
         let t = timeline(&i, &alice());
         assert_eq!((t.messages[0].id, t.messages[0].edited, t.messages[0].body.as_str()), (400, true, "v2"));
         assert!(t.messages[1].deleted);
+    }
+
+    fn update(chat: u64, sent: u64, u: pb::chat_update_message::Update) -> pb::Frame {
+        let mut m = pb::ChatUpdateMessage::new();
+        m.update = Some(u);
+        let mut item = pb::ChatItem::new();
+        item.chatId = chat;
+        item.authorId = ME;
+        item.dateSent = sent;
+        item.item = Some(pb::chat_item::Item::UpdateMessage(m));
+        let mut f = pb::Frame::new();
+        f.item = Some(pb::frame::Item::ChatItem(item));
+        f
+    }
+
+    fn group_change(updates: Vec<pb::group_change_chat_update::update::Update>) -> pb::chat_update_message::Update {
+        let mut g = pb::GroupChangeChatUpdate::new();
+        for u in updates {
+            let mut w = pb::group_change_chat_update::Update::new();
+            w.update = Some(u);
+            g.updates.push(w);
+        }
+        pb::chat_update_message::Update::GroupChange(g)
+    }
+
+    #[test]
+    fn group_and_timer_updates_become_notices() {
+        use pb::group_change_chat_update::update::Update as U;
+        let mut i = importer();
+        let mut name = pb::GroupNameUpdate::new();
+        name.updaterAci = Some(vec![2; 16]);
+        name.newGroupName = Some("Hikers".into());
+        let mut left = pb::GroupMemberLeftUpdate::new();
+        left.aci = vec![3; 16];
+        let mut timer = pb::GroupExpirationTimerUpdate::new();
+        timer.updaterAci = Some(vec![1; 16]);
+        timer.expiresInMs = 3_600_000;
+        i.frame(update(11, 100, group_change(vec![U::GroupNameUpdate(name), U::GroupMemberLeftUpdate(left)])));
+        i.frame(update(11, 200, group_change(vec![U::GroupExpirationTimerUpdate(timer)])));
+        i.frame(update(11, 300, group_change(vec![U::GenericGroupUpdate(pb::GenericGroupUpdate::new())])));
+        let mut t1 = pb::ExpirationTimerChatUpdate::new();
+        t1.expiresInMs = 86_400_000;
+        i.frame(update(10, 400, pb::chat_update_message::Update::ExpirationTimerChange(t1)));
+
+        let names = HashMap::from([(Uuid::from_bytes([2; 16]), "Alice".to_string()), (Uuid::from_bytes([3; 16]), "Bob".to_string())]);
+        let g = timeline(&i, &Thread::Group([7; 32]));
+        let lines: Vec<_> = g.messages.iter().map(|m| m.notice_lines(i.me, &names)).collect();
+        assert_eq!(lines[0], ["Alice changed the group name to “Hikers”", "Bob left the group"]);
+        assert_eq!(lines[1], ["You changed the disappearing message timer to 1 hour"]);
+        assert_eq!(g.messages[2].preview(), "Group updated", "nothing decodable");
+        assert_eq!(timeline(&i, &alice()).messages[0].preview(), "Disappearing message time set to 1 day");
+    }
+
+    fn sent_to(recipient: u64, at: u64, status: pb::send_status::DeliveryStatus) -> pb::SendStatus {
+        let mut s = pb::SendStatus::new();
+        s.recipientId = recipient;
+        s.timestamp = at;
+        s.deliveryStatus = Some(status);
+        s
+    }
+
+    fn outgoing(statuses: Vec<pb::SendStatus>) -> impl FnOnce(&mut pb::StandardMessage, &mut pb::ChatItem) {
+        move |_, item| {
+            let mut o = pb::chat_item::OutgoingMessageDetails::new();
+            o.sendStatus = statuses;
+            item.directionalDetails = Some(pb::chat_item::DirectionalDetails::Outgoing(o));
+        }
+    }
+
+    #[test]
+    fn outgoing_send_status_becomes_receipts() {
+        use pb::send_status::DeliveryStatus as S;
+        let mut i = importer();
+        i.frame(message(10, ME, 100, "read", outgoing(vec![sent_to(ALICE, 150, S::Read(Default::default()))])));
+        i.frame(message(10, ALICE, 150, "same ms as the receipt", |_, _| {}));
+        i.frame(message(10, ME, 200, "delivered", outgoing(vec![sent_to(ALICE, 0, S::Delivered(Default::default()))])));
+        i.frame(message(10, ME, 300, "sent", outgoing(vec![sent_to(ALICE, 310, S::Sent(Default::default()))])));
+        let group_status = vec![
+            sent_to(ALICE, 450, S::Delivered(Default::default())),
+            sent_to(ME, 460, S::Viewed(Default::default())),
+            sent_to(ALICE, 470, S::Pending(Default::default())),
+        ];
+        i.frame(message(11, ME, 400, "group", outgoing(group_status)));
+        i.finish();
+
+        let t = timeline(&i, &alice());
+        let got: Vec<_> = t.messages.iter().map(|m| (m.body.as_str(), m.delivery)).collect();
+        assert_eq!(
+            got,
+            [("read", Delivery::Read), ("same ms as the receipt", Delivery::Delivered), ("delivered", Delivery::Delivered), ("sent", Delivery::Sent)],
+            "the receipt row moved off the message's timestamp instead of overwriting it"
+        );
+        assert_eq!(timeline(&i, &Thread::Group([7; 32])).messages[0].delivery, Delivery::Read, "best of all recipients");
+        let mut keys: Vec<_> = i.rows.iter().map(|(t, c)| (t.clone(), c.metadata.client_timestamp.timestamp_millis())).collect();
+        let n = keys.len();
+        keys.sort_by_key(|(t, ts)| (format!("{t:?}"), *ts));
+        keys.dedup();
+        assert_eq!(keys.len(), n, "every row has its own store key");
     }
 
     #[test]

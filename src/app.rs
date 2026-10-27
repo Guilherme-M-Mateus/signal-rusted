@@ -223,12 +223,7 @@ pub enum Message {
     DismissError,
 }
 
-pub fn display_name(names: &HashMap<Uuid, String>, id: Uuid) -> String {
-    names.get(&id).cloned().unwrap_or_else(|| {
-        let s = id.to_string();
-        format!("User {}", &s[..8])
-    })
-}
+pub use crate::timeline::display_name;
 
 impl App {
     pub fn new(data_dir: PathBuf) -> (Self, Task<Message>) {
