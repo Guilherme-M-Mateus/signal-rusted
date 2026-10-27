@@ -99,7 +99,37 @@ pub fn spawn() -> mpsc::Sender<Cmd> {
     tx
 }
 
-type Capture = (Arc<AtomicBool>, std::thread::JoinHandle<(Vec<f32>, u32)>);
+/// What the capture thread has so far: finished streams, plus the current one in progress.
+#[derive(Default)]
+struct Captured {
+    rec: (Vec<f32>, u32),
+    current: Vec<f32>,
+    rate: u32,
+}
+
+type Capture = (Arc<AtomicBool>, Arc<std::sync::Mutex<Captured>>, std::thread::JoinHandle<()>);
+
+fn lock(m: &std::sync::Mutex<Captured>) -> std::sync::MutexGuard<'_, Captured> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Stops a capture and returns its samples. A stalled stream (rodio blocks until the next sample)
+/// must never hang this thread, so it waits briefly and then takes what was captured so far.
+fn stop_capture((stop, shared, h): Capture) -> (Vec<f32>, u32) {
+    stop.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !h.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !h.is_finished() {
+        tracing::warn!("microphone stalled; using what was recorded");
+    }
+    let mut c = lock(&shared);
+    let (current, rate) = (std::mem::take(&mut c.current), c.rate);
+    let mut rec = std::mem::take(&mut c.rec);
+    merge_stream(&mut rec, current, rate, false);
+    rec
+}
 
 fn device(rx: mpsc::Receiver<Cmd>) {
     let mut sink: Option<rodio::MixerDeviceSink> = None;
@@ -131,19 +161,16 @@ fn device(rx: mpsc::Receiver<Cmd>) {
             Cmd::Pause => player.iter().for_each(|p| p.pause()),
             Cmd::Resume => player.iter().for_each(|p| p.play()),
             Cmd::Record(reply) => {
-                if let Some((stop, h)) = capture.take() {
-                    stop.store(true, Ordering::Relaxed);
-                    let _ = h.join();
+                if let Some(c) = capture.take() {
+                    stop_capture(c);
                 }
                 capture = Some(record(reply));
             }
             Cmd::Finish(out) => {
-                let Some((stop, h)) = capture.take() else { continue };
-                stop.store(true, Ordering::Relaxed);
-                let rec = h.join();
+                let Some(c) = capture.take() else { continue };
+                let (samples, rate) = stop_capture(c);
                 if let Some((path, reply)) = out {
-                    let r = rec.map_err(|_| anyhow::anyhow!("recorder crashed")).and_then(|(samples, rate)| {
-                        anyhow::ensure!(!samples.is_empty(), "nothing was recorded");
+                    let r = check_recording(&samples, rate).map_err(anyhow::Error::msg).and_then(|()| {
                         std::fs::write(&path, encode_mp3(&samples, rate)?)?;
                         Ok(path)
                     });
@@ -154,41 +181,91 @@ fn device(rx: mpsc::Receiver<Cmd>) {
     }
 }
 
-/// Captures the default mic as mono on its own thread (cpal streams aren't `Send`).
+/// Refuses what isn't a voice note: too short, or silence (a mic that delivered only zeros).
+pub fn check_recording(samples: &[f32], rate: u32) -> Result<(), String> {
+    if rate == 0 || samples.len() < rate as usize / 2 {
+        return Err("Recording too short (hold the mic a little longer)".into());
+    }
+    if samples.iter().all(|s| s.abs() < 1e-4) {
+        return Err("No sound was recorded. Check your microphone; Bluetooth headsets must switch to headset mode first".into());
+    }
+    Ok(())
+}
+
+/// Adds one stream's samples to the recording. A stream that died while still silent (e.g. a
+/// Bluetooth headset switching to headset mode) contributes nothing; a rate change starts over.
+pub fn merge_stream(acc: &mut (Vec<f32>, u32), samples: Vec<f32>, rate: u32, died: bool) {
+    if died && samples.iter().all(|s| s.abs() < 1e-4) {
+        return;
+    }
+    if acc.1 != rate {
+        *acc = (Vec::new(), rate);
+    }
+    acc.0.extend(samples);
+}
+
+fn open_mic() -> Result<rodio::microphone::Microphone, String> {
+    rodio::microphone::MicrophoneBuilder::new()
+        .default_device()
+        .and_then(|b| b.default_config())
+        .map_err(|e| e.to_string())
+        .and_then(|b| b.prefer_sample_rates([48_000, 44_100].map(|r| r.try_into().expect("nonzero"))).open_stream().map_err(|e| e.to_string()))
+}
+
+/// Captures the default mic as mono on its own thread (cpal streams aren't `Send`). The stream is
+/// reopened if it dies mid-recording, as it does while a Bluetooth headset changes profile.
 fn record(reply: Reply<()>) -> Capture {
+    const REOPENS: usize = 5;
+    /// Samples between publishing progress, so a stall can't lose more than ~0.1 s.
+    const CHUNK: usize = 4_800;
     let stop = Arc::new(AtomicBool::new(false));
-    let flag = stop.clone();
+    let shared = Arc::new(std::sync::Mutex::new(Captured::default()));
+    let (flag, out) = (stop.clone(), shared.clone());
     let h = std::thread::spawn(move || {
-        let mic = rodio::microphone::MicrophoneBuilder::new()
-            .default_device()
-            .and_then(|b| b.default_config())
-            .map_err(|e| e.to_string())
-            .and_then(|b| b.prefer_sample_rates([48_000, 44_100].map(|r| r.try_into().expect("nonzero"))).open_stream().map_err(|e| e.to_string()));
-        let mic = match mic {
-            Ok(m) => {
-                let _ = reply.send(Ok(()));
-                m
+        let mut reply = Some(reply);
+        for attempt in 0..=REOPENS {
+            let mic = match open_mic() {
+                Ok(m) => m,
+                Err(e) if attempt == 0 => {
+                    let _ = reply.take().map(|r| r.send(Err(format!("Microphone unavailable: {e}"))));
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("couldn't reopen the microphone: {e}");
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+            };
+            let _ = reply.take().map(|r| r.send(Ok(())));
+            let (ch, rate) = (mic.channels().get() as usize, mic.sample_rate().get());
+            lock(&out).rate = rate;
+            let mut chunk = Vec::with_capacity(CHUNK);
+            let mut frame = Vec::with_capacity(ch);
+            for s in mic {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                frame.push(s);
+                if frame.len() == ch {
+                    chunk.push(frame.drain(..).sum::<f32>() / ch as f32);
+                    if chunk.len() == CHUNK {
+                        lock(&out).current.append(&mut chunk);
+                    }
+                }
             }
-            Err(e) => {
-                let _ = reply.send(Err(format!("Microphone unavailable: {e}")));
-                return (Vec::new(), 0);
+            let died = !flag.load(Ordering::Relaxed);
+            let mut c = lock(&out);
+            c.current.append(&mut chunk);
+            if !died {
+                return; // stop_capture merges the last stream
             }
-        };
-        let (ch, rate) = (mic.channels().get() as usize, mic.sample_rate().get());
-        let mut mono = Vec::new();
-        let mut frame = Vec::with_capacity(ch);
-        for s in mic {
-            if flag.load(Ordering::Relaxed) {
-                break;
-            }
-            frame.push(s);
-            if frame.len() == ch {
-                mono.push(frame.drain(..).sum::<f32>() / ch as f32);
-            }
+            let current = std::mem::take(&mut c.current);
+            merge_stream(&mut c.rec, current, rate, true);
+            drop(c);
+            tracing::warn!(attempt, "microphone stream stopped; reopening");
         }
-        (mono, rate)
     });
-    (stop, h)
+    (stop, shared, h)
 }
 
 #[cfg(test)]
@@ -213,6 +290,27 @@ mod tests {
         assert!((decoded.len() as i64 - sine.len() as i64).abs() < 4_000, "{} vs {}", decoded.len(), sine.len());
         let rms = (decoded.iter().map(|s| s * s).sum::<f32>() / decoded.len() as f32).sqrt();
         assert!((rms - 0.5 / 2f32.sqrt()).abs() < 0.05, "signal survives, rms {rms}");
+    }
+
+    #[test]
+    fn silent_or_short_recordings_are_refused() {
+        let rate = 48_000;
+        assert!(check_recording(&vec![0.0; rate as usize], rate).unwrap_err().contains("No sound"));
+        assert!(check_recording(&vec![0.2; 1_000], rate).unwrap_err().contains("too short"));
+        assert!(check_recording(&[], 0).is_err());
+        assert!(check_recording(&vec![0.2; rate as usize], rate).is_ok());
+    }
+
+    #[test]
+    fn dead_silent_streams_are_dropped_and_rate_changes_restart() {
+        let mut rec = (Vec::new(), 0);
+        merge_stream(&mut rec, vec![0.0; 26_000], 48_000, true); // Bluetooth switching: silence, then died
+        assert!(rec.0.is_empty());
+        merge_stream(&mut rec, vec![0.3; 100], 48_000, true); // died with real audio: kept
+        merge_stream(&mut rec, vec![0.1; 50], 48_000, false);
+        assert_eq!((rec.0.len(), rec.1), (150, 48_000));
+        merge_stream(&mut rec, vec![0.1; 10], 16_000, false); // headset mode at another rate
+        assert_eq!((rec.0.len(), rec.1), (10, 16_000), "can't mix rates");
     }
 
     #[test]
