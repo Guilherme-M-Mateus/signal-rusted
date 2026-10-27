@@ -42,6 +42,7 @@ use tokio::sync::mpsc;
 
 use crate::groups::{GroupEdit, GroupInfo};
 use crate::state::{AppState, MAX_PINNED, thread_key};
+use crate::stories::{Story, StoryReply, StoryStore};
 use crate::timeline::{Delivery, Kind, Timeline};
 
 type Mgr = Manager<SqliteStore, Registered>;
@@ -99,6 +100,10 @@ pub enum Command {
     /// `sticker` has no `data`: the backend uploads the pack's stored image as it.
     SendSticker { thread: Thread, ts: u64, sticker: Sticker },
     InstallStickerPack { id: Vec<u8>, key: Vec<u8> },
+    /// Marks a story viewed and sends the author a viewed receipt.
+    StoryViewed { author: Uuid, ts: u64 },
+    /// Answers a story privately (a 1:1 message with its `story_context`).
+    StoryReply { author: Uuid, ts: u64, reply: StoryReply },
 }
 
 /// What the sidebar's "⋯" menu and the message-request bar do to a chat.
@@ -255,6 +260,8 @@ pub enum Event {
     /// A group we just created, to open.
     GroupCreated { thread: Thread, title: String },
     Stickers { packs: Vec<Pack>, recent: Vec<(Vec<u8>, u32)> },
+    /// Every stored (unexpired) story.
+    Stories(Vec<Story>),
     Error(String),
     /// Neutral status banner (e.g. history import in progress); `None` clears it.
     Notice(Option<String>),
@@ -546,6 +553,7 @@ async fn main(
         manager,
         events,
         state: AppState::load(&data_dir.join("state.json")),
+        stories: StoryStore::load(&data_dir.join("stories.json")),
         attachments_dir: attachments_dir(&data_dir),
         open: None,
         group_ids: HashMap::new(),
@@ -554,6 +562,8 @@ async fn main(
     };
     b.emit(Event::Ready { me: b.me });
     b.emit_stickers().await;
+    b.expire_stories();
+    b.emit(Event::Stories(b.stories.stories.clone()));
     b.refresh().await;
     b.try_sync_storage().await;
 
@@ -593,7 +603,7 @@ async fn main(
 
     loop {
         // Capped so a suspended machine (monotonic clock paused) still catches up within a minute.
-        let next = b.state.next_expiry().map(|at| Duration::from_millis(at.saturating_sub(now_ms())).min(Duration::from_secs(60)));
+        let next = b.state.next_expiry().into_iter().chain(b.stories.next_expiry()).min().map(|at| Duration::from_millis(at.saturating_sub(now_ms())).min(Duration::from_secs(60)));
         tokio::select! {
             _ = async { match next { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => b.expire().await,
             cmd = cmds.recv() => match cmd {
@@ -667,6 +677,7 @@ struct Backend {
     me: Uuid,
     events: fmpsc::UnboundedSender<Event>,
     state: AppState,
+    stories: StoryStore,
     attachments_dir: PathBuf,
     open: Option<Thread>,
     /// group identifier -> master key, to route typing messages.
@@ -1040,6 +1051,31 @@ impl Backend {
                 }
                 self.emit(Event::SearchResults { query, results });
             }
+            Command::StoryViewed { author, ts } => {
+                if self.stories.mark_viewed(author, ts) {
+                    // Signal's "View receipts" for stories default to on.
+                    let receipt = ReceiptMessage { r#type: Some(receipt_message::Type::Viewed as i32), timestamp: vec![ts] };
+                    if let Err(e) = self.manager.send_message(ServiceId::Aci(author.into()), receipt, now_ms()).await {
+                        tracing::warn!(%e, "story viewed receipt failed");
+                    }
+                }
+            }
+            Command::StoryReply { author, ts, reply } => {
+                let thread = Thread::Contact(ServiceId::Aci(author.into()));
+                let r = match self.stories.get(author, ts) {
+                    Some(s) if s.allows_replies() => {
+                        let sent = now_ms();
+                        self.send_body(&thread, crate::stories::reply_message(author, ts, reply), sent).await.map(|()| sent)
+                    }
+                    _ => Err(anyhow::anyhow!("this story doesn't take replies")),
+                };
+                if let Some(sent) = self.report("reply to story", r) {
+                    if let Ok(Some(c)) = self.manager.store().message(&thread, sent).await {
+                        self.emit(Event::Incoming { thread, content: Box::new(c) });
+                    }
+                    self.refresh().await;
+                }
+            }
             Command::Chat { thread, action } => {
                 let r = self.chat_action(&thread, action).await;
                 self.report("update chat", r);
@@ -1323,6 +1359,9 @@ impl Backend {
 
     /// Deletes messages whose countdown ran out (their reactions go with them: nothing to attach to).
     async fn expire(&mut self) {
+        if self.expire_stories() {
+            self.emit(Event::Stories(self.stories.stories.clone()));
+        }
         let due = self.state.take_due(now_ms());
         if due.is_empty() {
             return;
@@ -1341,6 +1380,31 @@ impl Backend {
             self.emit(Event::Expired { thread, ids });
         }
         self.refresh().await;
+    }
+
+    /// Drops stories past Signal's 24 hours, and their downloaded media.
+    fn expire_stories(&mut self) -> bool {
+        let gone = self.stories.take_expired(now_ms());
+        for p in gone.iter().filter_map(Story::file) {
+            let _ = std::fs::remove_file(self.cache_path(p));
+        }
+        !gone.is_empty()
+    }
+
+    /// Keeps a story from someone we talk to, or from one of our groups.
+    async fn story(&mut self, author: Uuid, ts: u64, msg: presage::proto::StoryMessage) {
+        let story = Story::new(author, ts, msg);
+        let owner = story.owner();
+        let accepted = match &owner {
+            Thread::Group(k) => matches!(self.manager.store().group(*k).await, Ok(Some(_))),
+            Thread::Contact(_) => !self.is_request(&owner).await,
+        };
+        if author == self.me || !accepted || self.state.flags(&owner).blocked {
+            return;
+        }
+        if self.stories.add(story, now_ms()) {
+            self.emit(Event::Stories(self.stories.stories.clone()));
+        }
     }
 
     async fn received(&mut self, r: Received) {
@@ -1375,6 +1439,7 @@ impl Backend {
                 self.emit(Event::Receipt { timestamps: r.timestamp.clone(), level });
                 return;
             }
+            ContentBody::StoryMessage(s) => return self.story(sender, ts, s.clone()).await,
             ContentBody::TypingMessage(t) => {
                 let thread = match t.group_id.as_deref().and_then(|g| <[u8; 32]>::try_from(g).ok()) {
                     Some(id) => match self.group_ids.get(&id) {
@@ -1432,7 +1497,7 @@ impl Backend {
 
         let is_visible_incoming = sender != self.me
             && matches!(&c.body, ContentBody::DataMessage(dm)
-                if dm.reaction.is_none() && (dm.body.is_some() || !dm.attachments.is_empty() || dm.sticker.is_some()));
+                if (dm.reaction.is_none() || dm.story_context.is_some()) && (dm.body.is_some() || dm.reaction.is_some() || !dm.attachments.is_empty() || dm.sticker.is_some()));
         if is_visible_incoming {
             // Delivery receipt, as every Signal client does, except to message requests.
             if !self.is_request(&thread).await {

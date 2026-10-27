@@ -2,6 +2,7 @@ pub mod richtext;
 pub mod emoji;
 pub mod history;
 pub mod timeline;
+pub mod stories;
 pub mod state;
 pub mod storage;
 pub mod backend;

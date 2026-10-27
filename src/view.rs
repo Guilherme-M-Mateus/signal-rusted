@@ -18,10 +18,12 @@ use presage::proto::{AttachmentPointer, BodyRange, Preview};
 
 use crate::app::{App, Attach, Message, Open, Screen, StickerTab, TIMERS, display_name, is_image};
 use crate::backend::{ChatAction, Conversation, attachment_key, now_ms};
+use crate::stories::{Story, Viewer};
 use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label, short_duration};
 use crate::{emoji, richtext};
 
 pub const COMPOSER: &str = "composer";
+pub const STORY_REPLY: &str = "story-reply";
 const BLUE: Color = color!(0x2c6bed);
 
 pub fn signal_theme(dark: bool) -> Theme {
@@ -139,6 +141,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
     let body: Element<_> = match app.open.as_ref().and_then(|o| o.viewer.as_ref()) {
         Some(key) => stack![body, opaque(lightbox(app, key))].into(),
+        None => body,
+    };
+    let body: Element<_> = match &app.story_viewer {
+        Some(v) => stack![body, opaque(story_viewer(app, v))].into(),
         None => body,
     };
     let body: Element<_> = match &app.notice {
@@ -349,12 +355,21 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             );
         }
     }
+    let list = if app.stories_open { story_rows(app) } else { list };
+    let unviewed = app.stories.iter().any(|s| !s.viewed && s.expires_at() > now_ms());
+    let stories = match (app.stories_open, unviewed) {
+        (true, _) => "Chats",
+        (false, true) => "● Stories",
+        (false, false) => "Stories",
+    };
     column![
         container(
             row![
                 text("Signal").size(22).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill),
+                button(text(stories).size(13)).on_press(Message::ToggleStories).style(button::secondary),
                 button(text("New group").size(13)).on_press(Message::NewGroup).style(button::secondary),
             ]
+            .spacing(6)
             .align_y(Alignment::Center)
         )
         .padding([12, 16]),
@@ -364,6 +379,162 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     .spacing(8)
     .width(320)
     .into()
+}
+
+fn story_owner_title(app: &App, owner: &presage::store::Thread) -> String {
+    match owner {
+        presage::store::Thread::Contact(id) => display_name(&app.names, id.raw_uuid()),
+        g => app.conversations.iter().find(|c| c.thread == *g).map_or_else(|| "Group".into(), |c| c.title.clone()),
+    }
+}
+
+/// The Stories tab: people and groups with stories, a blue ring while some are unviewed.
+fn story_rows(app: &App) -> Column<'_, Message> {
+    let entries = crate::stories::list(&app.stories, now_ms());
+    if entries.is_empty() {
+        return Column::new().push(container(muted_text("No stories from the last 24 hours")).padding([8, 12]));
+    }
+    entries.into_iter().fold(Column::new(), |col, e| {
+        let title = story_owner_title(app, &e.owner);
+        let unviewed = e.unviewed();
+        let ring = container(avatar(&title, &crate::state::thread_key(&e.owner), 36.0)).padding(2).style(move |t: &Theme| container::Style {
+            border: Border { radius: 22.0.into(), width: 2.0, color: if unviewed { BLUE } else { muted(t) } },
+            ..Default::default()
+        });
+        let n = e.stories.len();
+        let sub = format!("{} · {n} {}", short_time(e.newest()), if n == 1 { "story" } else { "stories" });
+        let weight = if unviewed { Weight::Bold } else { Weight::Normal };
+        let info = column![text(title).font(Font { weight, ..Font::DEFAULT }), muted_text(sub).size(12)];
+        col.push(
+            button(row![ring, info].spacing(12).align_y(Alignment::Center))
+                .width(Length::Fill)
+                .padding([6, 12])
+                .on_press(Message::OpenStories(e.owner))
+                .style(button::text),
+        )
+    })
+}
+
+/// Story colors are Android ARGB ints.
+pub fn argb(c: u32) -> Color {
+    let [a, r, g, b] = c.to_be_bytes();
+    Color::from_rgba8(r, g, b, f32::from(a) / 255.0)
+}
+
+/// A text story's backdrop: its color or gradient (Signal's angles match iced's: 0° is bottom-to-top).
+pub fn story_background(t: &presage::proto::TextAttachment) -> Background {
+    use presage::proto::text_attachment::Background as Bg;
+    match &t.background {
+        Some(Bg::Color(c)) => argb(*c).into(),
+        Some(Bg::Gradient(g)) => {
+            let colors: Vec<u32> = if g.colors.is_empty() { g.start_color.into_iter().chain(g.end_color).collect() } else { g.colors.clone() };
+            let last = colors.len().saturating_sub(1).max(1) as f32;
+            let linear = colors.iter().enumerate().take(8).fold(
+                iced::gradient::Linear::new(iced::Degrees(g.angle.unwrap_or(0) as f32)),
+                |l, (i, c)| l.add_stop(g.positions.get(i).copied().unwrap_or(i as f32 / last), argb(*c)),
+            );
+            Background::Gradient(linear.into())
+        }
+        None => color!(0x5a5a5a).into(),
+    }
+}
+
+fn story_font(t: &presage::proto::TextAttachment) -> Font {
+    use presage::proto::text_attachment::Style;
+    match t.text_style.and_then(|s| Style::try_from(s).ok()) {
+        Some(Style::Bold) => Font { weight: Weight::Bold, ..Font::DEFAULT },
+        Some(Style::Serif) => Font { family: Family::Serif, ..Font::DEFAULT },
+        Some(Style::Script) => Font { family: Family::Cursive, ..Font::DEFAULT },
+        Some(Style::Condensed) => Font { stretch: iced::font::Stretch::Condensed, ..Font::DEFAULT },
+        _ => Font::DEFAULT,
+    }
+}
+
+/// The story itself: a 9:16 text card, an image, or a video placeholder (no playback here).
+fn story_card<'a>(app: &'a App, s: &'a Story) -> Element<'a, Message> {
+    if let Some(t) = s.text() {
+        let fg = t.text_foreground_color.map_or(Color::WHITE, argb);
+        let highlight = t.text_background_color.map(argb);
+        let label = container(text(t.text.clone().unwrap_or_default()).size(26).font(story_font(t)).color(fg).align_x(Alignment::Center))
+            .padding([4, 8])
+            .style(move |_| container::Style {
+                background: highlight.map(Background::Color),
+                border: Border { radius: 6.0.into(), ..Default::default() },
+                ..Default::default()
+            });
+        let bg = story_background(t);
+        return container(label)
+            .padding(24)
+            .width(360)
+            .height(640)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(move |_| container::Style { background: Some(bg), border: Border { radius: 12.0.into(), ..Default::default() }, ..Default::default() })
+            .into();
+    }
+    let Some(p) = s.file() else { return text("This story can't be shown").color(Color::WHITE).into() };
+    let key = attachment_key(p);
+    let shown: Element<_> = match (app.attachments.get(&key), s.is_video()) {
+        (Some(Attach::Ready(path)), false) => image(image::Handle::from_path(path)).height(Length::Fill).into(),
+        (Some(Attach::Ready(_)), true) => column![
+            text("▶ Video").size(28).color(Color::WHITE),
+            text("Video playback isn't supported yet").color(Color { a: 0.7, ..Color::WHITE }),
+            button(text("Save…")).on_press(Message::SaveAttachment(key)).style(button::secondary),
+        ]
+        .spacing(8)
+        .align_x(Alignment::Center)
+        .into(),
+        (Some(Attach::Failed(e)), _) => text(format!("Download failed: {e}")).color(Color::WHITE).into(),
+        _ => text("Loading…").color(Color::WHITE).into(),
+    };
+    match p.caption.clone().filter(|c| !c.is_empty()) {
+        Some(c) => column![shown, text(c).color(Color::WHITE)].spacing(8).align_x(Alignment::Center).into(),
+        None => shown,
+    }
+}
+
+/// Full-window story viewer: progress, author and time, ‹ ›, and a reply box when replies are on.
+fn story_viewer<'a>(app: &'a App, v: &'a Viewer) -> Element<'a, Message> {
+    let now = now_ms();
+    let Some(s) = v.current(&app.stories, now) else { return Space::new().into() };
+    let (at, n) = v.progress(&app.stories, now);
+    let bars = (0..n).fold(row![].spacing(4), |r, j| {
+        let a = if j <= at { 0.9 } else { 0.3 };
+        r.push(container(Space::new()).width(Length::Fill).height(3).style(move |_| container::Style {
+            background: Some(Color { a, ..Color::WHITE }.into()),
+            border: Border { radius: 2.0.into(), ..Default::default() },
+            ..Default::default()
+        }))
+    });
+    let who = if s.author == app.me { "You".into() } else { display_name(&app.names, s.author) };
+    let title = match s.group {
+        Some(_) => format!("{who} · {}", story_owner_title(app, &s.owner())),
+        None => who.clone(),
+    };
+    let top = row![
+        avatar(&who, &s.author.to_string(), 32.0),
+        text(title).color(Color::WHITE),
+        text(short_time(s.ts)).size(12).color(Color { a: 0.7, ..Color::WHITE }).width(Length::Fill),
+        button(text("✕").size(18)).on_press(Message::CloseStories).style(on_dark),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    let arrow = |label, delta: isize| button(text(label).size(32)).on_press(Message::StoryStep(delta)).style(on_dark);
+    let middle = row![arrow("‹", -1), center(story_card(app, s)), arrow("›", 1)].align_y(Alignment::Center).height(Length::Fill);
+    let mut col = column![bars, top, middle].spacing(10);
+    if s.allows_replies() && s.author != app.me {
+        let reactions = emoji::REACTIONS
+            .iter()
+            .fold(row![].spacing(2), |r, e| r.push(button(text(*e).size(20)).on_press(Message::StoryReact((*e).into())).style(on_dark)));
+        let input = text_input("Reply…", &v.reply).id(STORY_REPLY).on_input(Message::StoryReplyText).on_submit(Message::SendStoryReply).padding(8);
+        col = col.push(row![input, reactions].spacing(8).align_y(Alignment::Center));
+    }
+    container(col)
+        .padding(16)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style { background: Some(Color { a: 0.95, ..Color::BLACK }.into()), ..Default::default() })
+        .into()
 }
 
 fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
@@ -897,6 +1068,17 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
     if m.deleted {
         bubble = bubble.push(text("This message was deleted.").font(Font { style: FontStyle::Italic, ..Font::DEFAULT }).color(fg));
     } else {
+        if let Some(label) = m.story_reply {
+            bubble = bubble.push(
+                container(text(label).size(12).font(Font { style: FontStyle::Italic, ..Font::DEFAULT }).color(fg))
+                    .padding([4, 8])
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.18, ..Color::BLACK }.into()),
+                        border: Border { radius: 8.0.into(), width: 0.0, color: Color::TRANSPARENT },
+                        ..Default::default()
+                    }),
+            );
+        }
         if let Some(q) = &m.quote {
             let who = match q.author {
                 Some(a) if a == app.me => "You".to_string(),
@@ -1242,7 +1424,7 @@ fn sticker_picker<'a>(app: &'a App, tab: &StickerTab) -> Element<'a, Message> {
 #[allow(unused_must_use)]
 mod tests {
     use super::*;
-    use crate::app::tests::{alice, app, fake_audio, fake_packs, open_alice, voice_note};
+    use crate::app::tests::{alice, app, drain, fake_audio, fake_packs, open_alice, voice_note};
     use crate::backend::{Command, Event};
     use crate::timeline::tests::{content, uuid};
     use iced_test::simulator;
@@ -1910,5 +2092,113 @@ mod tests {
         ui.click("Signal Blog").expect("card title");
         let msgs: Vec<Message> = ui.into_messages().collect();
         assert!(msgs.iter().any(|m| matches!(m, Message::OpenUrl(u) if u == "https://signal.org/blog/")), "{msgs:?}");
+    }
+
+    fn run(app: &mut App, msgs: Vec<Message>) {
+        for m in msgs {
+            let _ = app.update(m);
+        }
+    }
+
+    #[test]
+    fn stories_tab_opens_the_viewer_and_sends_a_reply() {
+        let (mut app, mut rx) = app();
+        crate::app::tests::with_stories(&mut app);
+        let mut ui = simulator(view(&app));
+        ui.click("● Stories").expect("unviewed dot on the Stories button");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        run(&mut app, msgs);
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Bob").is_ok() && ui.find("Chats").is_ok());
+        ui.click("Alice").expect("Alice's stories listed");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        run(&mut app, msgs);
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("hello story").is_ok(), "text story shown");
+        ui.click(iced::widget::Id::new(STORY_REPLY)).expect("reply box");
+        let _ = ui.typewrite("so cool");
+        let _ = ui.tap_key(keyboard::Key::Named(key::Named::Enter));
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        run(&mut app, msgs);
+        let mut ui = simulator(view(&app));
+        ui.click("😂").expect("reaction buttons");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        run(&mut app, msgs);
+        let replies: Vec<_> = drain(&mut rx).into_iter().filter_map(|c| match c {
+            Command::StoryReply { reply, .. } => Some(reply),
+            _ => None,
+        }).collect();
+        use crate::stories::StoryReply;
+        assert_eq!(replies, [StoryReply::Text("so cool".into()), StoryReply::Reaction("😂".into())]);
+        let mut ui = simulator(view(&app));
+        ui.click("✕").expect("close");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        run(&mut app, msgs);
+        assert!(app.story_viewer.is_none());
+    }
+
+    #[test]
+    fn story_without_replies_has_no_reply_box() {
+        let (mut app, _rx) = app();
+        crate::app::tests::with_stories(&mut app);
+        app.update(Message::OpenStories(presage::store::Thread::Contact(presage::libsignal_service::protocol::ServiceId::Aci(uuid(3).into()))));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("bob's story").is_ok());
+        assert!(ui.find(iced::widget::Id::new(STORY_REPLY)).is_err());
+    }
+
+    #[test]
+    fn story_replies_show_a_quote_line() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let ctx = Some(presage::proto::data_message::StoryContext { author_aci: Some(uuid(1).to_string()), sent_timestamp: Some(5), ..Default::default() });
+        let dm = presage::proto::DataMessage { story_context: ctx, ..crate::timeline::tests::text(20, "great story") };
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(2), 20, dm)) }));
+        let mut ui = simulator(view(&app));
+        assert!(ui.find("Replied to a story").is_ok(), "quote line");
+    }
+
+    #[test]
+    fn story_colors_and_gradients() {
+        assert_eq!(argb(0x80ff0000), Color::from_rgba8(255, 0, 0, 128.0 / 255.0));
+        use presage::proto::text_attachment::{Background as Bg, Gradient};
+        let t = |bg| presage::proto::TextAttachment { background: Some(bg), ..Default::default() };
+        assert_eq!(story_background(&t(Bg::Color(0xff2c6bed))), Background::Color(BLUE));
+        let g = Gradient { colors: vec![0xffff0000, 0xff0000ff], angle: Some(90), ..Default::default() };
+        let Background::Gradient(iced::Gradient::Linear(l)) = story_background(&t(Bg::Gradient(g))) else { panic!("gradient") };
+        assert_eq!(l.angle, iced::Radians::from(iced::Degrees(90.0)));
+        let stops: Vec<_> = l.stops.iter().flatten().map(|s| (s.offset, s.color)).collect();
+        assert_eq!(stops, [(0.0, Color::from_rgb8(255, 0, 0)), (1.0, Color::from_rgb8(0, 0, 255))], "evenly spread without positions");
+    }
+
+    /// Writes `snapshots/stories-*.png`: the Stories list and a gradient text story in the viewer.
+    #[test]
+    fn stories_snapshot() {
+        let (mut app, _rx) = app();
+        crate::app::tests::with_stories(&mut app);
+        if let Some(presage::proto::story_message::Attachment::TextAttachment(t)) = &mut app.stories[0].msg.attachment {
+            t.text_style = Some(presage::proto::text_attachment::Style::Serif as i32);
+            t.background = Some(presage::proto::text_attachment::Background::Gradient(presage::proto::text_attachment::Gradient {
+                colors: vec![0xfff5a623, 0xffd0021b, 0xff4a148c],
+                angle: Some(180),
+                ..Default::default()
+            }));
+        }
+        app.stories[2].viewed = true;
+        app.update(Message::ToggleStories);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("stories-") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        for (name, open) in [("stories-list", false), ("stories-viewer", true)] {
+            if open {
+                app.update(Message::OpenStories(alice()));
+            }
+            let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+            let snap = ui.snapshot(&app.theme()).expect("render");
+            assert!(snap.matches_image(dir.join(name)).expect("write png"));
+        }
     }
 }
