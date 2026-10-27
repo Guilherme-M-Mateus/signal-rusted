@@ -34,6 +34,8 @@ pub struct Importer {
     recipients: HashMap<u64, Who>,
     chats: HashMap<u64, u64>,
     pub rows: Vec<(Thread, Content)>,
+    /// Installed sticker packs: (pack id, pack key).
+    pub sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 fn content(sender: Uuid, me: Uuid, ts: u64, body: impl Into<ContentBody>) -> Content {
@@ -135,6 +137,7 @@ impl Importer {
                 self.chats.insert(c.id, c.recipientId);
             }
             Some(pb::frame::Item::ChatItem(item)) => self.chat_item(item),
+            Some(pb::frame::Item::StickerPack(p)) => self.sticker_packs.push((p.packId, p.packKey)),
             _ => {}
         }
     }
@@ -308,6 +311,18 @@ mod tests {
 
     fn alice() -> Thread {
         Thread::Contact(ServiceId::Aci(Uuid::from_bytes([2; 16]).into()))
+    }
+
+    #[test]
+    fn installed_sticker_packs_are_collected() {
+        let mut i = importer();
+        let mut p = pb::StickerPack::new();
+        p.packId = vec![1; 16];
+        p.packKey = vec![2; 32];
+        let mut f = pb::Frame::new();
+        f.item = Some(pb::frame::Item::StickerPack(p));
+        i.frame(f);
+        assert_eq!(i.sticker_packs, [(vec![1; 16], vec![2; 32])]);
     }
 
     #[test]

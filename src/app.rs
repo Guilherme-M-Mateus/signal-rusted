@@ -11,7 +11,7 @@ use presage::libsignal_service::protocol::ServiceId;
 use presage::store::Thread;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::backend::{self, ChatAction, Command, Conversation, Event, QuoteRef, SearchResult, attachment_key, now_ms};
+use crate::backend::{self, ChatAction, Command, Conversation, Event, Pack, QuoteRef, SearchResult, attachment_key, now_ms};
 use crate::state::MAX_PINNED;
 use crate::groups::{GroupEdit, GroupInfo};
 use crate::timeline::{Delivery, Message as Msg, Timeline};
@@ -63,6 +63,8 @@ pub struct Open {
     /// Our message being edited in the composer.
     pub editing: Option<u64>,
     pub picker: Option<Picker>,
+    /// The sticker picker's open tab.
+    pub stickers: Option<StickerTab>,
     pub spoilers: HashSet<(u64, usize)>,
     /// (author, sent ts) -> when it disappears (ms).
     pub expires: HashMap<(Uuid, u64), u64>,
@@ -92,6 +94,13 @@ pub struct NewGroup {
     pub picked: Vec<Uuid>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum StickerTab {
+    Recent,
+    /// A pack id.
+    Pack(Vec<u8>),
+}
+
 pub struct Picker {
     pub query: String,
     pub group: emojis::Group,
@@ -118,6 +127,10 @@ pub struct App {
     pub playback: Option<audio::Playback>,
     /// Lengths of downloaded audio attachments, by attachment key.
     pub durations: HashMap<String, Duration>,
+    /// Installed sticker packs, by title.
+    pub packs: Vec<Pack>,
+    /// Recently sent stickers, newest first: (pack id, sticker id).
+    pub recent_stickers: Vec<(Vec<u8>, u32)>,
     /// Audio to start once its download finishes.
     play_when_ready: Option<String>,
     /// The sidebar shows archived chats instead of the inbox.
@@ -158,6 +171,12 @@ pub enum Message {
     PickerQuery(String),
     PickerGroup(emojis::Group),
     InsertEmoji(&'static str),
+    ToggleStickers,
+    StickerTab(StickerTab),
+    /// (pack id, sticker id)
+    SendSticker(Vec<u8>, u32),
+    /// (pack id, pack key)
+    InstallPack(Vec<u8>, Vec<u8>),
     Mention(Uuid),
     Spoiler(u64, usize),
     LoadOlder,
@@ -221,6 +240,8 @@ impl App {
             audio: None,
             playback: None,
             durations: HashMap::new(),
+            packs: Vec::new(),
+            recent_stickers: Vec::new(),
             play_when_ready: None,
             show_archived: false,
             requests_open: false,
@@ -337,6 +358,7 @@ impl App {
                     deleting: None,
                     editing: None,
                     picker: None,
+                    stickers: None,
                     spoilers: HashSet::new(),
                     expires: HashMap::new(),
                     timer_menu: false,
@@ -440,6 +462,7 @@ impl App {
             Message::React(author, id, emoji) => self.react(author, id, emoji),
             Message::TogglePicker => {
                 if let Some(o) = &mut self.open {
+                    o.stickers = None;
                     o.picker = match o.picker {
                         Some(_) => None,
                         None => Some(Picker { query: String::new(), group: emojis::Group::SmileysAndEmotion }),
@@ -465,6 +488,25 @@ impl App {
                     return iced::widget::operation::focus(crate::view::COMPOSER);
                 }
             }
+            Message::ToggleStickers => {
+                let tab = self.default_sticker_tab();
+                let Some(o) = &mut self.open else { return Task::none() };
+                o.picker = None;
+                o.stickers = match o.stickers {
+                    Some(_) => None,
+                    None => Some(tab),
+                };
+                if o.stickers.is_some() {
+                    self.send(Command::LoadStickers); // picks up packs synced from the phone since
+                }
+            }
+            Message::StickerTab(tab) => {
+                if let Some(o) = self.open.as_mut().filter(|o| o.stickers.is_some()) {
+                    o.stickers = Some(tab);
+                }
+            }
+            Message::SendSticker(pack_id, id) => self.send_sticker(pack_id, id),
+            Message::InstallPack(id, key) => self.send(Command::InstallStickerPack { id, key }),
             Message::Mention(id) => {
                 let Some(typed) = self.mention_query().map(|q| q.chars().count()) else { return Task::none() };
                 let name = display_name(&self.names, id);
@@ -782,6 +824,21 @@ impl App {
                 }
             }
             Event::GroupCreated { thread, title } => return self.update(Message::OpenThread(thread, title, true)),
+            Event::Stickers { packs, recent } => {
+                self.packs = packs;
+                self.recent_stickers = recent;
+                let tab = self.default_sticker_tab();
+                let packs = &self.packs;
+                if let Some(t) = self.open.as_mut().and_then(|o| o.stickers.as_mut()) {
+                    let gone = match t {
+                        StickerTab::Recent => self.recent_stickers.is_empty(),
+                        StickerTab::Pack(id) => !packs.iter().any(|p| p.id == *id),
+                    };
+                    if gone {
+                        *t = tab;
+                    }
+                }
+            }
             Event::Error(e) => self.error = Some(e),
             Event::Notice(n) => self.notice = n,
         }
@@ -902,6 +959,39 @@ impl App {
     /// Whether `thread` is an unanswered message request.
     pub fn is_request(&self, thread: &Thread) -> bool {
         self.conversations.iter().any(|c| c.thread == *thread && c.request)
+    }
+
+    /// Recents if there are any, like Signal Desktop, else the first pack.
+    fn default_sticker_tab(&self) -> StickerTab {
+        match self.packs.first() {
+            Some(p) if self.recent_stickers.is_empty() => StickerTab::Pack(p.id.clone()),
+            _ => StickerTab::Recent,
+        }
+    }
+
+    fn send_sticker(&mut self, pack_id: Vec<u8>, id: u32) {
+        let me = self.me;
+        let Some(pack) = self.packs.iter().find(|p| p.id == pack_id) else { return };
+        let Some(s) = pack.stickers.iter().find(|s| s.id == id) else { return };
+        let Some(o) = &mut self.open else { return };
+        let sticker = presage::proto::data_message::Sticker {
+            pack_id: Some(pack_id.clone()),
+            pack_key: Some(pack.key.clone()),
+            sticker_id: Some(id),
+            emoji: Some(s.emoji.clone()).filter(|e| !e.is_empty()),
+            data: None,
+        };
+        let ts = now_ms();
+        let mut m = Msg::new(ts, me, true);
+        m.delivery = Delivery::Sending;
+        m.sticker = Some(sticker.clone());
+        if let Some(t) = &mut o.timeline {
+            t.messages.push(m);
+        }
+        o.stickers = None;
+        crate::state::push_recent(&mut self.recent_stickers, (pack_id, id));
+        let thread = o.thread.clone();
+        self.send(Command::SendSticker { thread, ts, sticker });
     }
 
     fn react(&mut self, author: Uuid, id: u64, emoji: String) {
@@ -1251,6 +1341,80 @@ pub(crate) mod tests {
 
     pub fn drain(rx: &mut UnboundedReceiver<Command>) -> Vec<Command> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// A 1×1 orange PNG (generated with Python's zlib; fake sticker art).
+    pub const PNG: [u8; 69] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49,
+        0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xe2, 0x6c, 0x06, 0x00, 0x03, 0x9c, 0x01, 0x6e, 0xa2, 0x1e, 0xd8, 0x93,
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// Installed packs "Cats" (id [8], stickers 1 and 2) and "Dogs" (id [9], sticker 3).
+    pub fn fake_packs(app: &mut App, recent: Vec<(Vec<u8>, u32)>) {
+        use presage::store::{Sticker, StickerPack, StickerPackManifest};
+        let pack = |id: u8, title: &str, ids: &[u32]| StickerPack {
+            id: vec![id],
+            key: vec![id; 32],
+            manifest: StickerPackManifest {
+                title: title.into(),
+                author: String::new(),
+                cover: None,
+                stickers: ids
+                    .iter()
+                    .map(|i| Sticker { id: *i, emoji: Some("🐱".into()), content_type: Some("image/png".into()), bytes: Some(PNG.to_vec()) })
+                    .collect(),
+            },
+        };
+        let packs = backend::picker_packs([pack(9, "Dogs", &[3]), pack(8, "Cats", &[1, 2])]);
+        app.update(Message::Backend(Event::Stickers { packs, recent }));
+    }
+
+    #[test]
+    fn sticker_picker_sends_optimistically_and_remembers_recents() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        fake_packs(&mut app, Vec::new());
+        app.update(Message::ToggleStickers);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::LoadStickers]));
+        let o = app.open.as_ref().unwrap();
+        assert_eq!(o.stickers, Some(StickerTab::Pack(vec![8])), "no recents yet: the first pack by title");
+
+        app.update(Message::SendSticker(vec![8], 2));
+        let cmds = drain(&mut rx);
+        let [Command::SendSticker { thread, ts, sticker }] = cmds.as_slice() else { panic!("{cmds:?}") };
+        assert_eq!(*thread, alice());
+        assert_eq!((sticker.pack_id(), sticker.pack_key(), sticker.sticker_id(), sticker.emoji()), (&[8u8][..], &[8u8; 32][..], 2, "🐱"));
+        let o = app.open.as_ref().unwrap();
+        assert!(o.stickers.is_none(), "sending closes the picker");
+        let m = o.timeline.as_ref().unwrap().messages.last().unwrap();
+        assert_eq!((m.id, m.delivery, m.sticker.as_ref()), (*ts, Delivery::Sending, Some(sticker)));
+        assert_eq!(app.recent_stickers, [(vec![8], 2)]);
+
+        let pointer = presage::proto::AttachmentPointer { cdn_number: Some(2), ..Default::default() };
+        app.update(Message::Backend(Event::Sent { thread: alice(), ts: *ts, attachments: vec![pointer], error: None }));
+        assert_eq!(app.open.as_ref().unwrap().timeline.as_ref().unwrap().messages.last().unwrap().delivery, Delivery::Sent);
+
+        app.update(Message::ToggleStickers);
+        assert_eq!(app.open.as_ref().unwrap().stickers, Some(StickerTab::Recent), "recents first once there are some");
+        app.update(Message::TogglePicker);
+        assert!(app.open.as_ref().unwrap().stickers.is_none(), "one picker at a time");
+    }
+
+    #[test]
+    fn sticker_tab_falls_back_when_its_pack_goes_away() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        fake_packs(&mut app, Vec::new());
+        app.update(Message::ToggleStickers);
+        app.update(Message::StickerTab(StickerTab::Pack(vec![9])));
+        app.update(Message::Backend(Event::Stickers { packs: Vec::new(), recent: Vec::new() }));
+        assert_eq!(app.open.as_ref().unwrap().stickers, Some(StickerTab::Recent));
+        app.update(Message::SendSticker(vec![8], 1));
+        assert!(!drain(&mut rx).iter().any(|c| matches!(c, Command::SendSticker { .. })), "uninstalled packs can't be sent from");
+        app.update(Message::InstallPack(vec![8], vec![1]));
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::InstallStickerPack { id, key }] if *id == [8] && *key == [1]));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use presage::libsignal_service::content::{Content, ContentBody};
 use presage::libsignal_service::prelude::Uuid;
-use presage::proto::data_message::{Flags, Quote as ProtoQuote, Reaction};
+use presage::proto::data_message::{Flags, Quote as ProtoQuote, Reaction, Sticker};
 use presage::proto::sync_message::{self, Content as SyncContent};
 use presage::proto::{AttachmentPointer, BodyRange, DataMessage, EditMessage, receipt_message};
 
@@ -52,6 +52,8 @@ pub struct Message {
     pub delivery: Delivery,
     /// Disappearing-message timer in seconds (0 = off).
     pub expire_timer: u32,
+    /// Its image pointer (`data`) is also the last entry of `attachments`, to download it.
+    pub sticker: Option<Sticker>,
 }
 
 impl Message {
@@ -70,6 +72,7 @@ impl Message {
             deleted: false,
             delivery: if outgoing { Delivery::Sent } else { Delivery::Delivered },
             expire_timer: 0,
+            sticker: None,
         }
     }
 
@@ -94,6 +97,9 @@ impl Message {
         }
         if let Kind::System(s) = &self.kind {
             return s.clone();
+        }
+        if let Some(s) = &self.sticker {
+            return format!("{} Sticker", s.emoji.as_deref().unwrap_or("")).trim_start().to_owned();
         }
         let text = self.body.replace('\u{FFFC}', "@");
         match (text.trim().is_empty(), self.attachments.first()) {
@@ -304,6 +310,7 @@ fn fill(m: &mut Message, dm: &DataMessage) {
     if let Some(sticker) = dm.sticker.as_ref().and_then(|s| s.data.clone()) {
         m.attachments.push(sticker);
     }
+    m.sticker = dm.sticker.clone();
     m.quote = dm.quote.as_ref().map(quote);
     m.expire_timer = dm.expire_timer.unwrap_or(0);
 }
@@ -570,6 +577,17 @@ pub(crate) mod tests {
         assert_eq!(m.preview(), "📷 Photo");
         let q = m.quote.as_ref().unwrap();
         assert_eq!((q.id, q.author, q.text.as_str()), (5, Some(uuid(ME)), "original"));
+    }
+
+    #[test]
+    fn stickers_keep_their_pack_and_download_pointer() {
+        let mut t = tl();
+        let data = AttachmentPointer { content_type: Some("image/webp".into()), ..Default::default() };
+        let sticker = Sticker { pack_id: Some(vec![1]), sticker_id: Some(3), emoji: Some("🐱".into()), data: Some(data.clone()), ..Default::default() };
+        t.apply(&content(uuid(ALICE), 10, DataMessage { timestamp: Some(10), sticker: Some(sticker.clone()), ..Default::default() }));
+        let m = &t.messages[0];
+        assert_eq!((m.sticker.as_ref(), m.attachments.as_slice()), (Some(&sticker), [data].as_slice()));
+        assert_eq!(m.preview(), "🐱 Sticker");
     }
 
     #[test]
