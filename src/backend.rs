@@ -374,6 +374,11 @@ fn db_passphrase(data_dir: &Path) -> anyhow::Result<String> {
     Ok(key)
 }
 
+/// Whether any stored row in a chat was sent by us (our messages, reactions or edits).
+pub fn wrote_in(rows: impl IntoIterator<Item = Content>, me: Uuid) -> bool {
+    rows.into_iter().any(|c| c.metadata.sender.raw_uuid() == me)
+}
+
 /// Writes a secret readable only by the owner.
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)?;
@@ -734,8 +739,9 @@ impl Backend {
                 None => continue, // contacts without messages live in the "new chat" search
             };
             let in_contacts = matches!(&thread, Thread::Contact(id) if address_book.contains(&id.raw_uuid()));
+            let request = self.state.is_request(&thread, self.me, in_contacts) && !self.accept_if_answered(&thread).await;
             out.push(Conversation {
-                request: self.state.is_request(&thread, self.me, in_contacts),
+                request,
                 pinned: self.state.is_pinned(&thread),
                 archived: f.archived,
                 muted: f.muted_until > now,
@@ -770,14 +776,25 @@ impl Backend {
     }
 
     /// `AppState::is_request`, looking the sender up in the address book.
-    async fn is_request(&self, thread: &Thread) -> bool {
+    async fn is_request(&mut self, thread: &Thread) -> bool {
         let in_contacts = match thread {
             Thread::Contact(id) => {
                 matches!(self.manager.store().contact_by_id(id).await, Ok(Some(c)) if c.phone_number.is_some())
             }
             Thread::Group(_) => false,
         };
-        self.state.is_request(thread, self.me, in_contacts)
+        self.state.is_request(thread, self.me, in_contacts) && !self.accept_if_answered(thread).await
+    }
+
+    /// Signal treats a chat you've written in as accepted; imported history can contain such
+    /// chats from people outside the address book. Checked only for would-be requests.
+    async fn accept_if_answered(&mut self, thread: &Thread) -> bool {
+        let Ok(rows) = self.manager.store().messages(thread, ..).await else { return false };
+        let answered = wrote_in(rows.flatten(), self.me);
+        if answered {
+            self.state.accept(thread);
+        }
+        answered
     }
 
     async fn sync_to_self(&mut self, sync: SyncMessage) -> anyhow::Result<()> {
@@ -1437,6 +1454,14 @@ mod tests {
         assert_eq!(attachment_key(&p), "abcd");
         let q = AttachmentPointer { size: Some(3), ..Default::default() };
         assert!(attachment_key(&q).ends_with("-3"));
+    }
+
+    #[test]
+    fn a_chat_we_wrote_in_is_answered() {
+        use crate::timeline::tests::{content, text, uuid};
+        assert!(!wrote_in(vec![content(uuid(2), 1, text(1, "hi"))], uuid(1)), "only their messages");
+        assert!(wrote_in(vec![content(uuid(2), 1, text(1, "hi")), content(uuid(1), 2, text(2, "yo"))], uuid(1)));
+        assert!(!wrote_in(Vec::new(), uuid(1)));
     }
 
     #[test]
