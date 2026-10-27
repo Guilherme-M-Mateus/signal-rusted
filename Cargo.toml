@@ -40,6 +40,13 @@ mp3lame-encoder = "0.2"
 # SQLCipher key in the OS keyring: Secret Service (libdbus) on Linux, Keychain, Credential Manager.
 keyring = { version = "3.6", features = ["sync-secret-service", "crypto-rust", "apple-native", "windows-native"] }
 
+# 1:1 voice/video calls (feature `calls`, see docs/calls.md). Its build script downloads
+# Signal's prebuilt WebRTC (libwebrtc.a) through RingRTC's own bin/fetch-artifact.
+ringrtc = { git = "https://github.com/signalapp/ringrtc", tag = "v2.73.0", features = ["native"], optional = true }
+
+[features]
+calls = ["dep:ringrtc"]
+
 [dev-dependencies]
 iced_test = "0.14"
 tempfile = "3"

@@ -40,12 +40,16 @@ use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use tokio::sync::mpsc;
 
+use crate::calls::{Call, CallCommand};
 use crate::groups::{GroupEdit, GroupInfo};
 use crate::state::{AppState, MAX_PINNED, Settings, avatar_due, thread_key};
 use crate::stories::{Story, StoryReply, StoryStore};
 use crate::timeline::{Delivery, Kind, Timeline};
 
 type Mgr = Manager<SqliteStore, Registered>;
+
+#[cfg(feature = "calls")]
+mod calling;
 
 /// Rows loaded when opening a conversation (reactions/receipts count as rows).
 const HISTORY_ROWS: usize = 2000;
@@ -110,6 +114,8 @@ pub enum Command {
     StoryViewed { author: Uuid, ts: u64 },
     /// Answers a story privately (a 1:1 message with its `story_context`).
     StoryReply { author: Uuid, ts: u64, reply: StoryReply },
+    /// A 1:1 call (feature `calls`; ignored without it).
+    Call(CallCommand),
 }
 
 /// Our profile as the settings screen edits it.
@@ -302,6 +308,8 @@ pub enum Event {
     Error(String),
     /// Neutral status banner (e.g. history import in progress); `None` clears it.
     Notice(Option<String>),
+    /// The current call changed (feature `calls`).
+    Call(Call),
 }
 
 pub fn now_ms() -> u64 {
@@ -633,6 +641,9 @@ async fn session(
         link(store, &data_dir, cmds, &events).await?
     };
     let (avatar_tx, mut avatar_rx) = mpsc::unbounded_channel();
+    let (call_tx, mut call_rx) = mpsc::unbounded_channel::<crate::calls::Out>();
+    #[cfg(not(feature = "calls"))]
+    drop(call_tx);
 
     let mut b = Backend {
         me: ServiceId::from(manager.registration_data().service_ids.aci()).raw_uuid(),
@@ -649,6 +660,8 @@ async fn session(
         avatar_tx,
         data_dir: data_dir.clone(),
         unlinked: false,
+        #[cfg(feature = "calls")]
+        calling: calling::Calling::new(call_tx),
     };
     for key in b.state.avatars_checked.keys() {
         if let Ok(bytes) = std::fs::read(avatar_path(&data_dir, key)) {
@@ -711,6 +724,7 @@ async fn session(
             },
             Some(r) = in_rx.recv() => b.received(r).await,
             Some((key, r)) = avatar_rx.recv() => b.avatar_fetched(key, r).await,
+            Some(o) = call_rx.recv() => b.call_out(o).await,
             Some(result) = done_rx.recv() => {
                 b.emit(Event::Notice(None));
                 match result {
@@ -794,6 +808,15 @@ struct Backend {
     avatar_tx: mpsc::UnboundedSender<(String, Result<Fetched, String>)>,
     data_dir: PathBuf,
     unlinked: bool,
+    #[cfg(feature = "calls")]
+    calling: calling::Calling,
+}
+
+#[cfg(not(feature = "calls"))]
+impl Backend {
+    async fn call_out(&mut self, o: crate::calls::Out) {
+        match o {}
+    }
 }
 
 enum AvatarJob {
@@ -1121,6 +1144,10 @@ impl Backend {
                 self.refresh().await;
             }
             Command::Close => self.open = None,
+            #[cfg(feature = "calls")]
+            Command::Call(c) => self.call_command(c),
+            #[cfg(not(feature = "calls"))]
+            Command::Call(_) => {}
             Command::Send { thread, ts, body, ranges, attachments, quote, voice_note } => {
                 let r = self.send(&thread, ts, body, ranges, attachments, quote, voice_note).await;
                 self.sent(thread, ts, r).await;
@@ -1656,6 +1683,10 @@ impl Backend {
                 let _ = self.manager.store().clone().delete_message(&thread, ts).await;
             }
             return;
+        }
+        #[cfg(feature = "calls")]
+        if let ContentBody::CallMessage(m) = &c.body {
+            return self.call_message(&c, m).await;
         }
         match &c.body {
             ContentBody::ReceiptMessage(r) => {

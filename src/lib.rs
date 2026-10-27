@@ -9,5 +9,6 @@ pub mod backend;
 pub mod dbkey;
 pub mod groups;
 pub mod audio;
+pub mod calls;
 pub mod app;
 pub mod view;

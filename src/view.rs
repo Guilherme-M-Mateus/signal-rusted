@@ -18,6 +18,7 @@ use presage::proto::{AttachmentPointer, BodyRange, Preview};
 
 use crate::app::{App, Attach, Message, Open, Screen, StickerTab, TIMERS, display_name, is_image};
 use crate::backend::{ChatAction, Conversation, attachment_key, now_ms};
+use crate::calls::{Call, CallCommand, Phase};
 use crate::stories::{Story, Viewer};
 use crate::timeline::{Delivery, Kind, Message as Msg, attachment_label, short_duration};
 use crate::{emoji, richtext};
@@ -150,6 +151,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
     let body: Element<_> = match &app.story_viewer {
         Some(v) => stack![body, opaque(story_viewer(app, v))].into(),
+        None => body,
+    };
+    let body: Element<_> = match &app.call {
+        Some(c) => column![call_bar(app, c), body].into(),
         None => body,
     };
     let body: Element<_> = match &app.notice {
@@ -565,7 +570,7 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         who.into()
     };
     let header = container(
-        row![container(who).width(Length::Fill), timer_control(app, o)].spacing(12).align_y(Alignment::Center),
+        row![container(who).width(Length::Fill), call_button(app, o), timer_control(app, o)].spacing(12).align_y(Alignment::Center),
     )
     .padding([10, 16]);
     let header: Element<_> = if o.timer_menu {
@@ -610,6 +615,52 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
 
     let bottom = if app.is_request(&o.thread) { request_bar(o) } else { composer(app, o) };
     column![header, rule::horizontal(1), body, bottom].into()
+}
+
+/// "📞" in a 1:1 chat's header, when this build has calls; idle while another call is up.
+fn call_button<'a>(app: &App, o: &Open) -> Element<'a, Message> {
+    let presage::store::Thread::Contact(peer) = &o.thread else { return Space::new().into() };
+    if !crate::calls::ENABLED || app.is_request(&o.thread) {
+        return Space::new().into();
+    }
+    let idle = app.call.as_ref().is_none_or(|c| matches!(c.phase, Phase::Ended(_)));
+    let b = button(text("📞 Call").size(13)).style(button::text);
+    b.on_press_maybe(idle.then(|| Message::Call(CallCommand::Start(peer.raw_uuid())))).into()
+}
+
+/// The current call, above everything: who, its state or timer, and its controls.
+fn call_bar<'a>(app: &App, c: &Call) -> Element<'a, Message> {
+    let who = display_name(&app.names, c.peer);
+    let kind = if c.video { "video call" } else { "call" };
+    let status = match (&c.phase, c.incoming) {
+        (Phase::Calling, true) => format!("Incoming {kind} from {who}…"),
+        (Phase::Ringing, true) => format!("Incoming {kind} from {who}"),
+        (Phase::Calling, false) => format!("Calling {who}…"),
+        (Phase::Ringing, false) => format!("Ringing {who}…"),
+        (Phase::Connected, _) => format!("{who} · {}", crate::calls::elapsed(c.connected_at.unwrap_or(0), now_ms())),
+        (Phase::Reconnecting, _) => format!("{who} · Reconnecting…"),
+        (Phase::Ended(why), _) => format!("{who} · {why}"),
+    };
+    let act = |label: &'static str, cmd: CallCommand, style: fn(&Theme, button::Status) -> button::Style| {
+        button(text(label).size(13)).on_press(Message::Call(cmd)).style(style)
+    };
+    let mut controls = row![].spacing(8);
+    match (&c.phase, c.incoming) {
+        (Phase::Ended(_), _) => controls = controls.push(button(text("Close").size(13)).on_press(Message::DismissCall).style(button::secondary)),
+        (Phase::Ringing, true) => {
+            controls = controls.push(act("Decline", CallCommand::Hangup, button::danger)).push(act("Accept", CallCommand::Accept, button::success));
+        }
+        (Phase::Calling, true) => controls = controls.push(act("Decline", CallCommand::Hangup, button::danger)),
+        _ => {
+            let mute = if c.muted { act("Unmute", CallCommand::Mute(false), button::primary) } else { act("Mute", CallCommand::Mute(true), button::secondary) };
+            controls = controls.push(mute).push(act("Hang up", CallCommand::Hangup, button::danger));
+        }
+    }
+    container(row![text(status).width(Length::Fill), controls].spacing(12).align_y(Alignment::Center))
+        .padding([6, 12])
+        .width(Length::Fill)
+        .style(|t: &Theme| container::Style { background: Some(surface(t).into()), ..Default::default() })
+        .into()
 }
 
 /// Shown instead of the composer until a message request is answered.
@@ -2406,5 +2457,91 @@ mod tests {
             let snap = ui.snapshot(&app.theme()).expect("render");
             assert!(snap.matches_image(dir.join(name)).expect("write png"));
         }
+    }
+
+    fn call(phase: Phase, incoming: bool) -> Call {
+        Call { peer: uuid(2), incoming, video: false, phase, muted: false, connected_at: None }
+    }
+
+    fn sent_calls(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>) -> Vec<CallCommand> {
+        drain(rx).into_iter().filter_map(|c| if let Command::Call(c) = c { Some(c) } else { None }).collect()
+    }
+
+    #[test]
+    fn incoming_call_is_answered_or_declined_from_the_call_bar() {
+        let (mut app, mut rx) = app();
+        app.update(Message::Backend(Event::Call(call(Phase::Calling, true))));
+        {
+            let mut ui = simulator(view(&app));
+            assert!(ui.find("Incoming call from Alice…").is_ok());
+            assert!(ui.find("Accept").is_err(), "nothing to accept until it rings");
+        }
+
+        app.update(Message::Backend(Event::Call(call(Phase::Ringing, true))));
+        assert!(simulator(view(&app)).find("Incoming call from Alice").is_ok());
+        click(&mut app, "Accept");
+        assert_eq!(sent_calls(&mut rx), [CallCommand::Accept]);
+        click(&mut app, "Decline");
+        assert_eq!(sent_calls(&mut rx), [CallCommand::Hangup]);
+    }
+
+    #[test]
+    fn connected_call_shows_its_timer_and_mutes_and_hangs_up() {
+        let (mut app, mut rx) = app();
+        let connected = Call { connected_at: Some(now_ms() - 65_000), ..call(Phase::Connected, false) };
+        app.update(Message::Backend(Event::Call(connected.clone())));
+        assert!(simulator(view(&app)).find("Alice · 1:05").is_ok());
+        click(&mut app, "Mute");
+        assert_eq!(sent_calls(&mut rx), [CallCommand::Mute(true)]);
+        app.update(Message::Backend(Event::Call(Call { muted: true, ..connected })));
+        click(&mut app, "Unmute");
+        assert_eq!(sent_calls(&mut rx), [CallCommand::Mute(false)]);
+        click(&mut app, "Hang up");
+        assert_eq!(sent_calls(&mut rx), [CallCommand::Hangup]);
+    }
+
+    #[test]
+    fn ended_call_stays_until_closed() {
+        let (mut app, mut rx) = app();
+        app.update(Message::Backend(Event::Call(call(Phase::Ended("No answer".into()), false))));
+        assert!(simulator(view(&app)).find("Alice · No answer").is_ok());
+        click(&mut app, "Close");
+        assert!(app.call.is_none());
+        assert!(sent_calls(&mut rx).is_empty(), "closing is local");
+    }
+
+    /// The header's call button exists only in `calls` builds, and only for 1:1 chats.
+    #[test]
+    fn header_call_button() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        assert_eq!(simulator(view(&app)).find("📞 Call").is_ok(), crate::calls::ENABLED);
+        if crate::calls::ENABLED {
+            click(&mut app, "📞 Call");
+            assert_eq!(sent_calls(&mut rx), [CallCommand::Start(uuid(2))]);
+            // Busy with a call: the button does nothing.
+            app.update(Message::Backend(Event::Call(call(Phase::Ringing, false))));
+            click(&mut app, "📞 Call");
+            assert!(sent_calls(&mut rx).is_empty());
+        }
+        let (group, _rx) = crate::app::tests::open_group();
+        assert!(simulator(view(&group)).find("📞 Call").is_err());
+    }
+
+    /// Writes `snapshots/call-bar-*.png`: a connected call over Alice's chat.
+    #[test]
+    fn call_bar_snapshot() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        app.update(Message::Backend(Event::Call(Call { connected_at: Some(now_ms() - 65_000), ..call(Phase::Connected, false) })));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("call-bar") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        let snap = ui.snapshot(&app.theme()).expect("render");
+        assert!(snap.matches_image(dir.join("call-bar")).expect("write png"));
     }
 }

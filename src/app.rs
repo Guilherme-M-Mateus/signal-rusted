@@ -14,6 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::backend::{
     self, ChatAction, Command, Conversation, Device, Event, OwnProfile, Pack, QuoteRef, SearchResult, attachment_key, now_ms,
 };
+use crate::calls::{Call, CallCommand, Phase};
 use crate::state::{MAX_PINNED, Settings, ThemeChoice};
 use crate::groups::{GroupEdit, GroupInfo};
 use crate::stories::{Story, StoryReply, Viewer};
@@ -170,6 +171,8 @@ pub struct App {
     pub stories_open: bool,
     /// The full-window story viewer.
     pub story_viewer: Option<Viewer>,
+    /// The current or just-ended 1:1 call (feature `calls`).
+    pub call: Option<Call>,
     data_dir: PathBuf,
 }
 
@@ -268,6 +271,9 @@ pub enum Message {
     ConfirmUnlink,
     Tick,
     DismissError,
+    Call(CallCommand),
+    /// Closes the bar of an ended call.
+    DismissCall,
 }
 
 pub use crate::timeline::display_name;
@@ -310,6 +316,7 @@ impl App {
             stories: Vec::new(),
             stories_open: false,
             story_viewer: None,
+            call: None,
             data_dir,
         };
         (app, iced::system::theme().map(Message::Theme))
@@ -341,9 +348,10 @@ impl App {
         } else if self.open.as_ref().is_some_and(|o| o.viewer.is_some()) {
             subs.push(iced::keyboard::listen().filter_map(viewer_key));
         }
+        let call_connected = self.call.as_ref().is_some_and(|c| c.phase == Phase::Connected);
         if audio_active {
             subs.push(iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick));
-        } else if typing_active || self.open.as_ref().is_some_and(|o| o.typing_sent || !o.expires.is_empty()) {
+        } else if call_connected || typing_active || self.open.as_ref().is_some_and(|o| o.typing_sent || !o.expires.is_empty()) {
             subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
         }
         Subscription::batch(subs)
@@ -867,6 +875,8 @@ impl App {
             }
             Message::Tick => self.tick(),
             Message::DismissError => self.error = None,
+            Message::Call(c) => self.send(Command::Call(c)),
+            Message::DismissCall => self.call = None,
         }
         Task::none()
     }
@@ -1044,6 +1054,7 @@ impl App {
                 self.error = Some(e)
             }
             Event::Notice(n) => self.notice = n,
+            Event::Call(c) => self.call = Some(c),
         }
         Task::none()
     }
