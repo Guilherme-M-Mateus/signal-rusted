@@ -10,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| {
         directories::ProjectDirs::from("org", "signal-rs", "signal-rs").unwrap().data_dir().to_owned()
     });
-    let pass = std::fs::read_to_string(dir.join("db.key"))?;
+    let pass = signal_rs::dbkey::db_passphrase(&dir, &signal_rs::dbkey::OsKeyring::new(&dir))?;
     let store = SqliteStore::open_with_passphrase(&dir.join("signal.db3").to_string_lossy(), Some(pass.trim()), OnNewIdentity::Trust).await?;
     let me = presage::libsignal_service::protocol::ServiceId::from(store.load_registration_data().await?.unwrap().service_ids.aci()).raw_uuid();
     let mut threads: Vec<(Thread, String)> = store.groups().await?.flatten().map(|(k, g)| (Thread::Group(k), g.title)).collect();
