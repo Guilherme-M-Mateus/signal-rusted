@@ -16,6 +16,7 @@ use crate::backend::{
 };
 use crate::state::{MAX_PINNED, Settings, ThemeChoice};
 use crate::groups::{GroupEdit, GroupInfo};
+use crate::stories::{Story, StoryReply, Viewer};
 use crate::timeline::{Delivery, Message as Msg, Timeline};
 use crate::{audio, emoji, richtext};
 
@@ -163,6 +164,12 @@ pub struct App {
     pub row_menu: Option<Thread>,
     /// Opens a link in the system browser; tests swap it so nothing is ever launched.
     pub open_url: fn(&str),
+    /// Received stories (the backend drops them after 24h).
+    pub stories: Vec<Story>,
+    /// The sidebar lists stories instead of chats.
+    pub stories_open: bool,
+    /// The full-window story viewer.
+    pub story_viewer: Option<Viewer>,
     data_dir: PathBuf,
 }
 
@@ -235,6 +242,17 @@ pub enum Message {
     /// Steps the viewer through the conversation's images (-1 back, 1 forward).
     ViewerStep(isize),
     CloseViewer,
+    ToggleStories,
+    /// Opens the story viewer at this person's or group's stories.
+    OpenStories(Thread),
+    /// Previous (-1) or next (1) story.
+    StoryStep(isize),
+    /// The viewer's clock: auto-advances once a story has been up long enough.
+    StoryTick(Instant),
+    CloseStories,
+    StoryReplyText(String),
+    SendStoryReply,
+    StoryReact(String),
     OpenUrl(String),
     Saved(Result<(), String>),
     Theme(iced::theme::Mode),
@@ -294,6 +312,9 @@ impl App {
             row_hovered: None,
             row_menu: None,
             open_url: open_in_browser,
+            stories: Vec::new(),
+            stories_open: false,
+            story_viewer: None,
             data_dir,
         };
         (app, iced::system::theme().map(Message::Theme))
@@ -319,7 +340,10 @@ impl App {
         let typing_active = self.typing.values().any(|m| !m.is_empty());
         let audio_active = self.playback.as_ref().is_some_and(|p| !p.is_paused())
             || self.open.as_ref().is_some_and(|o| o.recording.is_some());
-        if self.open.as_ref().is_some_and(|o| o.viewer.is_some()) {
+        if self.story_viewer.is_some() {
+            subs.push(iced::keyboard::listen().filter_map(story_key));
+            subs.push(iced::time::every(Duration::from_millis(250)).map(Message::StoryTick));
+        } else if self.open.as_ref().is_some_and(|o| o.viewer.is_some()) {
             subs.push(iced::keyboard::listen().filter_map(viewer_key));
         }
         if audio_active {
@@ -765,6 +789,42 @@ impl App {
                     return iced::widget::operation::focus(crate::view::COMPOSER);
                 }
             }
+            Message::ToggleStories => self.stories_open = !self.stories_open,
+            Message::OpenStories(owner) => {
+                self.story_viewer = Viewer::open(&self.stories, &owner, Instant::now(), now_ms());
+                self.show_story();
+                return iced::widget::operation::focus("stories"); // off the composer, so keys reach the viewer
+            }
+            Message::StoryStep(delta) => self.story_step(delta, Instant::now()),
+            Message::StoryTick(now) => {
+                let ms = now_ms();
+                let Some(v) = &mut self.story_viewer else { return Task::none() };
+                let Some(s) = v.current(&self.stories, ms) else { return Task::none() };
+                // Videos don't play here, and media counts from when it's on screen.
+                let loaded = s.file().is_none_or(|p| matches!(self.attachments.get(&attachment_key(p)), Some(Attach::Ready(_))));
+                if s.is_video() || !loaded {
+                    v.started = now;
+                } else if v.due(now) {
+                    self.story_step(1, now);
+                }
+            }
+            Message::CloseStories => self.story_viewer = None,
+            Message::StoryReplyText(t) => {
+                if let Some(v) = &mut self.story_viewer {
+                    v.reply = t;
+                }
+            }
+            Message::SendStoryReply => {
+                let body = self.story_viewer.as_ref().map(|v| v.reply.trim().to_owned()).unwrap_or_default();
+                if !body.is_empty() && self.send_story_reply(StoryReply::Text(body)) {
+                    if let Some(v) = &mut self.story_viewer {
+                        v.reply.clear();
+                    }
+                }
+            }
+            Message::StoryReact(emoji) => {
+                self.send_story_reply(StoryReply::Reaction(emoji));
+            }
             Message::OpenUrl(url) => {
                 // Only web links: message text is untrusted, never hand other schemes to the OS.
                 if url::Url::parse(&url).is_ok_and(|u| matches!(u.scheme(), "http" | "https")) {
@@ -976,6 +1036,12 @@ impl App {
             }
             Event::Devices(d) => self.devices = d,
             Event::Avatars(a) => self.avatars = a,
+            Event::Stories(s) => {
+                self.stories = s;
+                if self.story_viewer.as_ref().is_some_and(|v| v.current(&self.stories, now_ms()).is_none()) {
+                    self.story_viewer = None; // it expired
+                }
+            }
             Event::Error(e) => {
                 if matches!(self.screen, Screen::Connecting) && self.me != Uuid::nil() {
                     self.screen = Screen::Main; // unlinking failed: still linked
@@ -1213,6 +1279,42 @@ impl App {
         }
     }
 
+    fn story_step(&mut self, delta: isize, now: Instant) {
+        let Some(v) = &mut self.story_viewer else { return };
+        if v.step(&self.stories, delta, now, now_ms()) {
+            self.show_story();
+        } else {
+            self.story_viewer = None;
+        }
+    }
+
+    /// The story now on screen: marks it viewed (the backend sends the receipt) and downloads it.
+    fn show_story(&mut self) {
+        let Some(s) = self.story_viewer.as_ref().and_then(|v| v.current(&self.stories, now_ms())) else {
+            self.story_viewer = None;
+            return;
+        };
+        let (author, ts, file) = (s.author, s.ts, s.file().map(attachment_key));
+        if let Some(s) = self.stories.iter_mut().find(|s| s.author == author && s.ts == ts && !s.viewed) {
+            s.viewed = true;
+            self.send(Command::StoryViewed { author, ts });
+        }
+        if let Some(key) = file {
+            self.fetch(&key);
+        }
+    }
+
+    /// Replies to the story on screen, if it takes replies; true if sent.
+    fn send_story_reply(&mut self, reply: StoryReply) -> bool {
+        let Some(s) = self.story_viewer.as_ref().and_then(|v| v.current(&self.stories, now_ms())) else { return false };
+        if !s.allows_replies() || s.author == self.me {
+            return false;
+        }
+        let c = Command::StoryReply { author: s.author, ts: s.ts, reply };
+        self.send(c);
+        true
+    }
+
     fn stop_typing(&mut self) {
         if let Some(o) = self.open.as_mut().filter(|o| o.typing_sent) {
             o.typing_sent = false;
@@ -1248,6 +1350,7 @@ impl App {
             .as_ref()
             .and_then(|o| o.timeline.as_ref())
             .and_then(|t| t.messages.iter().flat_map(Msg::pointers).find(|a| attachment_key(a) == key))
+            .or_else(|| self.stories.iter().filter_map(Story::file).find(|a| attachment_key(a) == key))
             .cloned();
         if let Some(p) = pointer.filter(|p| p.cdn_number.is_some() || p.attachment_identifier.is_some()) {
             self.attachments.insert(key.to_owned(), Attach::Loading);
@@ -1388,6 +1491,16 @@ fn viewer_key(e: iced::keyboard::Event) -> Option<Message> {
         Event::KeyPressed { key: Key::Named(Named::ArrowLeft), .. } => Some(Message::ViewerStep(-1)),
         Event::KeyPressed { key: Key::Named(Named::ArrowRight), .. } => Some(Message::ViewerStep(1)),
         Event::KeyPressed { key: Key::Named(Named::Escape), .. } => Some(Message::CloseViewer),
+        _ => None,
+    }
+}
+
+fn story_key(e: iced::keyboard::Event) -> Option<Message> {
+    use iced::keyboard::{Event, Key, key::Named};
+    match e {
+        Event::KeyPressed { key: Key::Named(Named::ArrowLeft), .. } => Some(Message::StoryStep(-1)),
+        Event::KeyPressed { key: Key::Named(Named::ArrowRight), .. } => Some(Message::StoryStep(1)),
+        Event::KeyPressed { key: Key::Named(Named::Escape), .. } => Some(Message::CloseStories),
         _ => None,
     }
 }
@@ -2332,5 +2445,101 @@ pub(crate) mod tests {
             app.update(Message::OpenUrl(url.into()));
         }
         assert_eq!(OPENED.with(|o| o.borrow().clone()), ["https://signal.org/a?b=1", "http://x.y"]);
+    }
+
+    /// Alice's text story (an hour old) then her photo story (now); Bob's text story without replies.
+    pub fn with_stories(app: &mut App) -> String {
+        use crate::stories::tests::text_story;
+        let now = now_ms();
+        let mut photo_story = text_story(ALICE, now - 1000, "");
+        photo_story.msg.attachment = Some(presage::proto::story_message::Attachment::FileAttachment(photo(0x5a, 1000)));
+        let mut bob = text_story(3, now - 2000, "bob's story");
+        bob.msg.allows_replies = Some(false);
+        let key = attachment_key(photo_story.file().unwrap());
+        app.update(Message::Backend(Event::Stories(vec![text_story(ALICE, now - 3_600_000, "hello story"), photo_story, bob])));
+        key
+    }
+
+    fn story_ts(app: &App) -> Option<u64> {
+        app.story_viewer.as_ref()?.current(&app.stories, now_ms()).map(|s| s.ts)
+    }
+
+    #[test]
+    fn story_viewer_marks_viewed_downloads_auto_advances_and_closes() {
+        let (mut app, mut rx) = app();
+        let key = with_stories(&mut app);
+        let ts: Vec<u64> = app.stories.iter().map(|s| s.ts).collect();
+        app.update(Message::OpenStories(alice()));
+        assert_eq!(story_ts(&app), Some(ts[0]), "oldest unviewed first");
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::StoryViewed { author, ts: t }] if *author == uuid(ALICE) && *t == ts[0]));
+        assert!(app.stories[0].viewed);
+
+        let t0 = app.story_viewer.as_ref().unwrap().started;
+        app.update(Message::StoryTick(t0 + Duration::from_secs(4)));
+        assert_eq!(story_ts(&app), Some(ts[0]), "not yet");
+        app.update(Message::StoryTick(t0 + crate::stories::STORY_DURATION));
+        assert_eq!(story_ts(&app), Some(ts[1]), "auto-advanced to the photo");
+        let cmds = drain(&mut rx);
+        assert!(cmds.iter().any(|c| matches!(c, Command::FetchAttachment(p) if attachment_key(p) == key)), "photo downloads");
+        assert!(cmds.iter().any(|c| matches!(c, Command::StoryViewed { ts: t, .. } if *t == ts[1])));
+
+        // The photo's 5s only start once it's on screen.
+        let t1 = t0 + Duration::from_secs(60);
+        app.update(Message::StoryTick(t1));
+        assert_eq!(story_ts(&app), Some(ts[1]), "still loading");
+        app.update(Message::Backend(Event::Attachment { key, path: Ok("/nonexistent/s.png".into()) }));
+        app.update(Message::StoryTick(t1 + Duration::from_secs(1)));
+        assert_eq!(story_ts(&app), Some(ts[1]));
+        app.update(Message::StoryTick(t1 + crate::stories::STORY_DURATION));
+        assert_eq!(story_ts(&app), Some(ts[2]), "on to Bob");
+        drain(&mut rx);
+
+        app.update(Message::StoryStep(-1));
+        assert_eq!(story_ts(&app), Some(ts[1]), "back");
+        assert!(drain(&mut rx).is_empty(), "viewed stories send no second receipt");
+        app.update(Message::StoryStep(1));
+        app.update(Message::StoryStep(1));
+        assert!(app.story_viewer.is_none(), "past the last story");
+
+        app.update(Message::OpenStories(alice()));
+        let esc = story_key(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        app.update(esc.expect("Esc closes"));
+        assert!(app.story_viewer.is_none());
+    }
+
+    #[test]
+    fn story_replies_and_reactions_only_where_allowed() {
+        let (mut app, mut rx) = app();
+        with_stories(&mut app);
+        let ts = app.stories[0].ts;
+        app.update(Message::OpenStories(alice()));
+        drain(&mut rx);
+        app.update(Message::StoryReplyText("  nice!  ".into()));
+        let t0 = app.story_viewer.as_ref().unwrap().started;
+        app.update(Message::StoryTick(t0 + Duration::from_secs(30)));
+        assert_eq!(story_ts(&app), Some(ts), "typing a reply pauses auto-advance");
+        app.update(Message::SendStoryReply);
+        app.update(Message::StoryReact("❤️".into()));
+        let cmds = drain(&mut rx);
+        assert!(matches!(&cmds[..], [
+            Command::StoryReply { author: a1, ts: t1, reply: StoryReply::Text(body) },
+            Command::StoryReply { author: a2, ts: t2, reply: StoryReply::Reaction(e) },
+        ] if body == "nice!" && e == "❤️" && *a1 == uuid(ALICE) && *a2 == uuid(ALICE) && *t1 == ts && *t2 == ts), "{cmds:?}");
+        assert_eq!(app.story_viewer.as_ref().unwrap().reply, "", "box cleared");
+
+        app.update(Message::OpenStories(Thread::Contact(ServiceId::Aci(uuid(3).into()))));
+        drain(&mut rx);
+        app.update(Message::StoryReplyText("hi".into()));
+        app.update(Message::SendStoryReply);
+        app.update(Message::StoryReact("👍".into()));
+        assert!(drain(&mut rx).is_empty(), "Bob turned replies off");
     }
 }

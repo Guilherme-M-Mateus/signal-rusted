@@ -56,6 +56,8 @@ pub struct Message {
     pub expire_timer: u32,
     /// Its image pointer (`data`) is also the last entry of `attachments`, to download it.
     pub sticker: Option<Sticker>,
+    /// "Replied to a story" / "Reacted to a story": an answer to one of the chat's stories.
+    pub story_reply: Option<&'static str>,
 }
 
 impl Message {
@@ -76,6 +78,7 @@ impl Message {
             delivery: if outgoing { Delivery::Sent } else { Delivery::Delivered },
             expire_timer: 0,
             sticker: None,
+            story_reply: None,
         }
     }
 
@@ -250,6 +253,20 @@ impl Timeline {
     }
 
     fn data_message(&mut self, dm: &DataMessage, author: Uuid, outgoing: bool, id: u64) -> bool {
+        if dm.story_context.is_some() {
+            // Story replies are plain messages; a reaction to a story shows as its emoji.
+            let mut m = Message::new(id, author, outgoing);
+            fill(&mut m, dm);
+            m.story_reply = Some(match dm.reaction.as_ref().and_then(|r| r.emoji.clone()) {
+                Some(e) => {
+                    m.body = e;
+                    "Reacted to a story"
+                }
+                None => "Replied to a story",
+            });
+            self.upsert(m);
+            return true;
+        }
         if let Some(r) = &dm.reaction {
             return self.reaction(r, author);
         }
@@ -646,6 +663,19 @@ pub(crate) mod tests {
             [45, 300, 3_599, 28_800, 86_400 * 3, 2_419_200].map(short_duration),
             ["45s", "5m", "59m", "8h", "3d", "4w"]
         );
+    }
+
+    #[test]
+    fn story_replies_and_reactions_show_as_messages() {
+        use presage::proto::data_message::StoryContext;
+        let ctx = Some(StoryContext { author_aci: Some(uuid(ME).to_string()), sent_timestamp: Some(5), ..Default::default() });
+        let mut t = tl();
+        t.apply(&content(uuid(ALICE), 10, DataMessage { story_context: ctx.clone(), ..text(10, "love it") }));
+        t.apply(&content(uuid(ALICE), 20, DataMessage { story_context: ctx, ..react(uuid(ME), 5, "😂", false) }));
+        let got: Vec<_> = t.messages.iter().map(|m| (m.id, m.body.as_str(), m.story_reply)).collect();
+        assert_eq!(got, [(10, "love it", Some("Replied to a story")), (20, "😂", Some("Reacted to a story"))]);
+        t.apply(&content(uuid(ALICE), 30, text(30, "plain")));
+        assert_eq!(t.messages[2].story_reply, None);
     }
 
     #[test]

@@ -380,7 +380,8 @@ impl<S: Store> Manager<S, Registered> {
         {
             Some(ws) => Ok(ws.clone()),
             None => {
-                let headers = &[("X-Signal-Receive-Stories", "false")];
+                // signal-rs: receive stories; the app keeps them itself (`save_message` skips them).
+                let headers = &[("X-Signal-Receive-Stories", "true")];
                 let ws = self
                     .identified_push_service()
                     .ws(
