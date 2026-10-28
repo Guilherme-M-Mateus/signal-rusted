@@ -12,3 +12,4 @@ pub mod groups;
 pub mod audio;
 pub mod app;
 pub mod view;
+pub mod icons;
