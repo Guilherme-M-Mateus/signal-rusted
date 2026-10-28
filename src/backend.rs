@@ -395,7 +395,7 @@ pub fn merge_names(
 fn wipe_local_data(data_dir: &Path) -> std::io::Result<()> {
     let names = [
         "signal.db3", "signal.db3-wal", "signal.db3-shm", "db.key", "state.json", "state.tmp", "transfer.key", "transfer.bin",
-        "stories.json", "stories.tmp", "attachments", "avatars",
+        "stories.json", "stories.tmp", "attachments", "avatars", "gifs",
     ];
     for name in names {
         let p = data_dir.join(name);

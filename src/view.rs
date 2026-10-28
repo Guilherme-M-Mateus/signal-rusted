@@ -2292,7 +2292,7 @@ fn gif_picker<'a>(app: &'a App, g: &'a crate::app::GifPanel) -> Element<'a, Mess
         .iter()
         .enumerate()
         .fold(row![].spacing(4), |r, (i, (gif, h))| {
-            let cell = container(image(h.clone()).height(96).content_fit(ContentFit::Contain).border_radius(round(8.0))).id(format!("gif-{i}"));
+            let cell = container(image(h.clone()).width(128).height(96).content_fit(ContentFit::Cover).border_radius(round(8.0))).id(format!("gif-{i}"));
             r.push(button(cell).padding(2).on_press(Message::SendGif(gif.url.clone())).style(button::text))
         })
         .wrap();
@@ -2490,6 +2490,103 @@ mod tests {
         app.attachments.insert(key.clone(), Attach::Ready("/nonexistent/a0.m4a".into()));
         app.durations.insert(key, std::time::Duration::from_secs(12));
         app
+    }
+
+    /// README screenshots and GIF frames, from fake data only: `scripts/readme-media.sh` runs this
+    /// and turns `snapshots/readme/` into `docs/images/`.
+    #[test]
+    #[ignore = "writes README media; run through scripts/readme-media.sh"]
+    fn readme_media() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots/readme");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frame = |app: &App, name: &str| {
+            let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(app));
+            assert!(ui.snapshot(&app.theme()).expect("render").matches_image(dir.join(name)).expect("write png"));
+        };
+
+        // A fuller chat list around the demo conversation.
+        let mut app = demo();
+        let base = app.conversations[0].clone();
+        let chat = |title: &str, n: u8, preview: &str, ts, group: bool, unread| Conversation {
+            thread: if group { presage::store::Thread::Group([n; 32]) } else { presage::store::Thread::Contact(presage::libsignal_service::protocol::ServiceId::Aci(uuid(n).into())) },
+            title: title.into(),
+            preview: preview.into(),
+            last_ts: ts,
+            unread,
+            is_group: group,
+            ..base.clone()
+        };
+        let mut list = vec![
+            Conversation { last_ts: now_ms(), preview: "👍🏽❤️".into(), unread: 0, ..base.clone() },
+            chat("Weekend trip", 7, "Bob: who's bringing the tent?", now_ms() - 600_000, true, 3),
+            chat("Bob", 3, "Voice message", now_ms() - 3_600_000, false, 0),
+            chat("Rust meetup", 8, "Slides are up 🎉", now_ms() - 86_400_000, true, 0),
+            chat("Note to Self", 1, "groceries: oat milk, coffee", now_ms() - 2 * 86_400_000, false, 0),
+        ];
+        list[1].pinned = true;
+        list[4].muted = true;
+        app.update(Message::Backend(Event::Conversations(list)));
+        app.update(Message::SetTheme(ThemeChoice::Dark));
+        frame(&app, "hero");
+
+        // Every theme, then a custom one.
+        for (i, &(choice, _)) in THEMES.iter().enumerate().skip(1) {
+            app.update(Message::SetTheme(choice));
+            frame(&app, &format!("theme-{i:02}"));
+        }
+        app.custom_themes = vec![crate::themes::CustomTheme { name: "Ocean".into(), background: "#0b1d2a".into(), text: "#e0f2ff".into(), accent: "#2bb3c0".into() }];
+        app.update(Message::SetCustomTheme("Ocean".into()));
+        frame(&app, "theme-99");
+
+        // Round and square corners.
+        app.update(Message::SetTheme(ThemeChoice::Rusted));
+        frame(&app, "rounding-1");
+        app.update(Message::SetSquare(true));
+        frame(&app, "rounding-2");
+        app.update(Message::SetSquare(false));
+
+        // The emoji / sticker / GIF panel.
+        app.update(Message::SetTheme(ThemeChoice::Dark));
+        fake_packs(&mut app, vec![(vec![8], 1), (vec![8], 2), (vec![9], 3)]);
+        let tile = |r, g, b| image::Handle::from_rgba(4, 3, [r, g, b, 255].repeat(12));
+        // Snapshots don't decode encoded images; raw pixels show up.
+        for (i, st) in app.packs.iter_mut().flat_map(|p| p.stickers.iter_mut()).enumerate() {
+            st.image = [tile(0xe8, 0x64, 0x1f), tile(0x2b, 0xb3, 0xc0), tile(0xa7, 0xc0, 0x80)][i % 3].clone();
+        }
+        app.update(Message::OpenFun(Fun::Emoji));
+        frame(&app, "fun-1");
+        app.update(Message::OpenFun(Fun::Stickers));
+        frame(&app, "fun-2");
+        app.update(Message::OpenFun(Fun::Gifs));
+        let gifs = [(0xe8, 0x64, 0x1f), (0x2b, 0xb3, 0xc0), (0xa7, 0xc0, 0x80), (0xd6, 0x45, 0x7a), (0x5e, 0x81, 0xac), (0xff, 0xc1, 0x07), (0x4c, 0xaf, 0x50), (0x7a, 0xa5, 0xf7)]
+            .into_iter()
+            .map(|(r, g, b)| (crate::gifs::Gif { title: String::new(), preview: String::new(), url: String::new() }, tile(r, g, b)))
+            .collect();
+        app.update(Message::GifResults(String::new(), Ok(gifs)));
+        frame(&app, "fun-3");
+
+        // The disappearing-messages menu.
+        app.update(Message::TogglePicker);
+        app.update(Message::ToggleTimerMenu);
+        frame(&app, "timer-menu");
+
+        // Settings pages.
+        let (mut s, _rx) = settings_app();
+        s.plugins = vec![
+            crate::plugins::Plugin { name: "auto-reply.py".into(), path: "/plugins/auto-reply.py".into() },
+            crate::plugins::Plugin { name: "reminders".into(), path: "/plugins/reminders".into() },
+        ];
+        s.update(Message::TogglePlugin("auto-reply.py".into(), true));
+        s.plugin_status.insert("auto-reply.py".into(), "Running".into());
+        s.update(Message::SetTheme(ThemeChoice::Dark));
+        for (i, section) in [SettingsSection::Profile, SettingsSection::Appearance, SettingsSection::Chats, SettingsSection::Plugins, SettingsSection::Devices]
+            .into_iter()
+            .enumerate()
+        {
+            s.update(Message::SettingsSection(section));
+            frame(&s, &format!("settings-{i}"));
+        }
     }
 
     #[test]
