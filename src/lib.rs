@@ -1,5 +1,8 @@
 pub mod richtext;
 pub mod emoji;
+pub mod gifs;
+pub mod themes;
+pub mod plugins;
 pub mod history;
 pub mod timeline;
 pub mod stories;

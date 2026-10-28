@@ -9,9 +9,16 @@ description = "Native Rust Signal desktop client (iced UI, presage/libsignal pro
 presage = { path = "vendor/presage" }
 presage-store-sqlite = { path = "vendor/presage-store-sqlite" }
 iced = { version = "0.14", features = ["tokio", "image", "svg", "qr_code", "advanced"] }
-tokio = { version = "1", features = ["rt", "macros", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "fs", "process", "io-util"] }
 futures = "0.3"
 emojis = "0.9"
+# Animated GIF frames (already in the tree via iced's image feature).
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+# Profile photo upload (versions libsignal-service already uses): AES-GCM under the profile key,
+# and the profile write's base64/bincode encodings.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+base64 = "0.22"
+bincode = "1.3"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -31,7 +38,7 @@ libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag =
 protobuf = "3.7.2"
 # Decodes RingRTC's group-ring payload (already used by libsignal-service).
 prost = "0.14"
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }
 url = "2"
 # Opens clicked links in the system browser (xdg-open / open / ShellExecute, no shell quoting issues).
 open = "5"

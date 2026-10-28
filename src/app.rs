@@ -15,6 +15,8 @@ use crate::backend::{
     self, ChatAction, Command, Conversation, Device, Event, OwnProfile, Pack, QuoteRef, SearchResult, attachment_key, now_ms,
 };
 use crate::calls::{Call, CallCommand, Phase};
+use crate::gifs::{Animation, Gif, Provider as GifProvider};
+use crate::themes::CustomTheme;
 use crate::state::{MAX_PINNED, Settings, ThemeChoice};
 use crate::groups::{GroupEdit, GroupInfo};
 use crate::stories::{Story, StoryReply, Viewer};
@@ -69,10 +71,13 @@ pub struct Open {
     pub picker: Option<Picker>,
     /// The sticker picker's open tab.
     pub stickers: Option<StickerTab>,
+    /// The GIF picker; the emoji, sticker and GIF pickers are tabs of one panel, so one is open at a time.
+    pub gifs: Option<GifPanel>,
     pub spoilers: HashSet<(u64, usize)>,
     /// (author, sent ts) -> when it disappears (ms).
     pub expires: HashMap<(Uuid, u64), u64>,
-    pub timer_menu: bool,
+    /// The open disappearing-messages menu and its custom-time entry.
+    pub timer_menu: Option<CustomTimer>,
     /// Members picked from the @-autocomplete: (inserted name, ACI).
     pub mentions: Vec<(String, Uuid)>,
     /// When the current voice-note recording started.
@@ -85,6 +90,21 @@ pub struct Open {
     typing_sent: bool,
 }
 
+/// The disappearing-messages menu's custom time: an amount of `unit` seconds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CustomTimer {
+    pub amount: String,
+    pub unit: u32,
+}
+
+impl CustomTimer {
+    /// The custom time in seconds: a positive amount, at most a year.
+    pub fn seconds(&self) -> Option<u32> {
+        let n: u32 = self.amount.parse().ok().filter(|&n| n > 0)?;
+        n.checked_mul(self.unit).filter(|&s| s <= 31_536_000)
+    }
+}
+
 /// Edits in progress in the group info panel.
 pub struct GroupPanel {
     pub title: String,
@@ -92,11 +112,15 @@ pub struct GroupPanel {
     pub add_query: String,
 }
 
-/// The settings screen's profile edits and the unlink confirmation.
+/// The settings screen's page, profile edits and the unlink confirmation.
 #[derive(Default)]
 pub struct SettingsPanel {
     pub profile: OwnProfile,
     pub confirm_unlink: bool,
+    /// A profile photo change is uploading.
+    pub photo_busy: bool,
+    /// The custom theme being made or edited, and the name it was saved under (if it was).
+    pub theme_draft: Option<(Option<String>, CustomTheme)>,
     pub section: SettingsSection,
 }
 
@@ -105,8 +129,11 @@ pub struct SettingsPanel {
 pub enum SettingsSection {
     #[default]
     Profile,
-    Themes,
+    /// Themes and rounding (Signal Desktop's "Appearance").
+    Appearance,
+    Chats,
     Notifications,
+    Plugins,
     Devices,
     About,
 }
@@ -117,6 +144,22 @@ pub enum Tab {
     Chats,
     Stories,
     Settings,
+}
+
+/// The tabs of the emoji/sticker/GIF panel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Fun {
+    Emoji,
+    Stickers,
+    Gifs,
+}
+
+#[derive(Default)]
+pub struct GifPanel {
+    pub query: String,
+    pub results: Vec<(Gif, iced::widget::image::Handle)>,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 /// The "New group" dialog.
@@ -195,6 +238,20 @@ pub struct App {
     pub story_viewer: Option<Viewer>,
     /// The current or just-ended 1:1 call (feature `calls`).
     pub call: Option<Call>,
+    /// Our signal.me link and its QR code (Settings → Profile).
+    pub share: Option<(String, qr_code::Data)>,
+    /// Programs in the plugins folder; those in `settings.plugins` run.
+    pub plugins: Vec<crate::plugins::Plugin>,
+    /// Running plugins' event inboxes, and the last thing each reported (Settings → Plugins).
+    plugin_tx: HashMap<String, UnboundedSender<String>>,
+    pub plugin_status: HashMap<String, String>,
+    /// Themes from the themes folder (Settings → Appearance).
+    pub custom_themes: Vec<CustomTheme>,
+    /// Decoded animated GIF attachments, by attachment key.
+    pub animations: HashMap<String, Animation>,
+    /// The animation clock: GIFs show the frame at `now - started`.
+    pub started: Instant,
+    pub now: Instant,
     data_dir: PathBuf,
 }
 
@@ -227,6 +284,17 @@ pub enum Message {
     PickerGroup(emojis::Group),
     InsertEmoji(&'static str),
     ToggleStickers,
+    /// Switches the emoji/sticker/GIF panel's tab.
+    OpenFun(Fun),
+    GifQuery(String),
+    /// Debounced: searches if the query is still current.
+    RunGifSearch(String),
+    GifResults(String, Result<Vec<(Gif, iced::widget::image::Handle)>, String>),
+    /// Downloads this GIF and sends it.
+    SendGif(String),
+    GifDownloaded(Result<PathBuf, String>),
+    Animated(String, Option<Animation>),
+    AnimTick(Instant),
     StickerTab(StickerTab),
     /// (pack id, sticker id)
     SendSticker(Vec<u8>, u32),
@@ -237,6 +305,9 @@ pub enum Message {
     LoadOlder,
     ToggleTimerMenu,
     SetTimer(u32),
+    TimerAmount(String),
+    /// The custom time's unit, in seconds.
+    TimerUnit(u32),
     ShowArchived(bool),
     ToggleRequests,
     RowHover(Option<Thread>),
@@ -287,7 +358,29 @@ pub enum Message {
     SettingsSection(SettingsSection),
     EditProfile(OwnProfile),
     SaveProfile,
+    /// Picks a new profile photo; `PhotoReady` carries it cropped and compressed.
+    ChangePhoto,
+    PhotoPicked(Option<PathBuf>),
+    PhotoReady(Result<Vec<u8>, String>),
+    RemovePhoto,
     SetTheme(ThemeChoice),
+    SetCustomTheme(String),
+    /// Something from a running plugin.
+    Plugin(String, crate::plugins::Update),
+    TogglePlugin(String, bool),
+    OpenPluginsFolder,
+    /// Opens the theme editor on a saved theme, or a new one based on the current colors.
+    EditTheme(Option<CustomTheme>),
+    ThemeDraft(CustomTheme),
+    SaveTheme,
+    DeleteTheme,
+    CancelThemeEdit,
+    OpenThemesFolder,
+    SetSquare(bool),
+    SetGifProvider(GifProvider),
+    SetGifKey(String),
+    /// Copies text (the profile's signal.me link) to the clipboard.
+    Copy(String),
     SetNotifications(bool),
     SetNotificationText(bool),
     /// Asks for confirmation (`true`) or cancels (`false`).
@@ -342,6 +435,14 @@ impl App {
             stories_open: false,
             story_viewer: None,
             call: None,
+            share: None,
+            custom_themes: crate::themes::load(&crate::themes::dir(&data_dir)),
+            plugins: crate::plugins::discover(&crate::plugins::dir(&data_dir)),
+            plugin_tx: HashMap::new(),
+            plugin_status: HashMap::new(),
+            animations: HashMap::new(),
+            started: Instant::now(),
+            now: Instant::now(),
             data_dir,
         };
         (app, iced::system::theme().map(Message::Theme))
@@ -356,14 +457,42 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
+        if let Some(t) = self.selected_custom_theme().and_then(crate::view::custom_theme) {
+            return t;
+        }
         crate::view::app_theme(self.settings.theme, self.dark)
+    }
+
+    /// The custom theme in use; a deleted one falls back to System.
+    pub fn selected_custom_theme(&self) -> Option<&CustomTheme> {
+        (self.settings.theme == ThemeChoice::Custom).then(|| self.custom_themes.iter().find(|t| t.name == self.settings.custom_theme)).flatten()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
             Subscription::run_with(self.data_dir.clone(), |d| backend::run(d.clone())).map(Message::Backend),
             iced::system::theme_changes().map(Message::Theme),
+            // shortcut: winit 0.30 only delivers drops on X11/XWayland, Windows and macOS, not native Wayland.
+            iced::event::listen_with(|e, _, _| match e {
+                iced::Event::Window(iced::window::Event::FileDropped(p)) => Some(Message::Picked(vec![p])),
+                _ => None,
+            }),
         ];
+        // Only while the main screen is up: plugins act on chats.
+        if matches!(self.screen, Screen::Main) {
+            for p in self.plugins.iter().filter(|p| self.settings.plugins.contains(&p.name)) {
+                let name = p.name.clone();
+                subs.push(Subscription::run_with(p.clone(), crate::plugins::run).with(name).map(|(name, u)| Message::Plugin(name, u)));
+            }
+        }
+        let animating = self.open.as_ref().and_then(|o| Some((o, o.timeline.as_ref()?))).is_some_and(|(o, t)| {
+            t.messages[t.messages.len().saturating_sub(o.shown)..]
+                .iter()
+                .any(|m| m.attachments.iter().any(|a| self.animations.contains_key(&attachment_key(a))))
+        });
+        if animating {
+            subs.push(iced::time::every(Duration::from_millis(40)).map(Message::AnimTick));
+        }
         let typing_active = self.typing.values().any(|m| !m.is_empty());
         let audio_active = self.playback.as_ref().is_some_and(|p| !p.is_paused())
             || self.open.as_ref().is_some_and(|o| o.recording.is_some());
@@ -462,9 +591,10 @@ impl App {
                     editing: None,
                     picker: None,
                     stickers: None,
+                    gifs: None,
                     spoilers: HashSet::new(),
                     expires: HashMap::new(),
-                    timer_menu: false,
+                    timer_menu: None,
                     mentions: Vec::new(),
                     recording: None,
                     info: None,
@@ -566,8 +696,10 @@ impl App {
             Message::React(author, id, emoji) => self.react(author, id, emoji),
             Message::TogglePicker => {
                 if let Some(o) = &mut self.open {
-                    o.stickers = None;
+                    let was_open = o.stickers.is_some() || o.gifs.is_some();
+                    (o.stickers, o.gifs) = (None, None);
                     o.picker = match o.picker {
+                        None if was_open => None,
                         Some(_) => None,
                         None => Some(Picker { query: String::new(), group: emojis::Group::SmileysAndEmotion }),
                     };
@@ -595,7 +727,7 @@ impl App {
             Message::ToggleStickers => {
                 let tab = self.default_sticker_tab();
                 let Some(o) = &mut self.open else { return Task::none() };
-                o.picker = None;
+                (o.picker, o.gifs) = (None, None);
                 o.stickers = match o.stickers {
                     Some(_) => None,
                     None => Some(tab),
@@ -604,6 +736,75 @@ impl App {
                     self.send(Command::LoadStickers); // picks up packs synced from the phone since
                 }
             }
+            Message::OpenFun(fun) => {
+                let Some(o) = &mut self.open else { return Task::none() };
+                match fun {
+                    Fun::Emoji if o.picker.is_none() => {
+                        (o.stickers, o.gifs) = (None, None);
+                        return self.update(Message::TogglePicker);
+                    }
+                    Fun::Stickers if o.stickers.is_none() => {
+                        (o.picker, o.gifs) = (None, None);
+                        return self.update(Message::ToggleStickers);
+                    }
+                    Fun::Gifs if o.gifs.is_none() => {
+                        (o.picker, o.stickers) = (None, None);
+                        o.gifs = Some(GifPanel::default());
+                        return self.update(Message::RunGifSearch(String::new()));
+                    }
+                    _ => {}
+                }
+            }
+            Message::GifQuery(q) => {
+                let Some(g) = self.open.as_mut().and_then(|o| o.gifs.as_mut()) else { return Task::none() };
+                g.query = q.clone();
+                return Task::perform(
+                    async move {
+                        tokio::time::sleep(SEARCH_DEBOUNCE).await;
+                        q
+                    },
+                    Message::RunGifSearch,
+                );
+            }
+            Message::RunGifSearch(q) => {
+                let Some(g) = self.open.as_mut().and_then(|o| o.gifs.as_mut()).filter(|g| g.query == q) else {
+                    return Task::none();
+                };
+                (g.loading, g.error) = (true, None);
+                let (provider, key) = (self.settings.gif_provider, self.settings.gif_key().to_owned());
+                return Task::perform(crate::gifs::search(provider, key, q.clone()), move |r| Message::GifResults(q.clone(), r));
+            }
+            Message::GifResults(q, r) => {
+                if let Some(g) = self.open.as_mut().and_then(|o| o.gifs.as_mut()).filter(|g| g.query == q) {
+                    g.loading = false;
+                    match r {
+                        Ok(results) => g.results = results,
+                        Err(e) => g.error = Some(e),
+                    }
+                }
+            }
+            Message::SendGif(url) => {
+                if self.open.as_ref().is_none_or(|o| self.is_request(&o.thread)) {
+                    return Task::none();
+                }
+                if let Some(o) = &mut self.open {
+                    o.gifs = None;
+                }
+                return Task::perform(crate::gifs::download(url, self.data_dir.join("gifs")), Message::GifDownloaded);
+            }
+            Message::GifDownloaded(Ok(path)) => {
+                if let Some(o) = &mut self.open {
+                    o.files.push(path);
+                }
+                self.send_message(false);
+            }
+            Message::GifDownloaded(Err(e)) => self.error = Some(format!("GIF not sent: {e}")),
+            Message::Animated(key, a) => {
+                if let Some(a) = a {
+                    self.animations.insert(key, a);
+                }
+            }
+            Message::AnimTick(now) => self.now = now,
             Message::StickerTab(tab) => {
                 if let Some(o) = self.open.as_mut().filter(|o| o.stickers.is_some()) {
                     o.stickers = Some(tab);
@@ -638,8 +839,21 @@ impl App {
             Message::ToggleTimerMenu => {
                 if self.can_set_timer() {
                     if let Some(o) = &mut self.open {
-                        o.timer_menu = !o.timer_menu;
+                        o.timer_menu = match o.timer_menu {
+                            Some(_) => None,
+                            None => Some(CustomTimer { amount: String::new(), unit: 3_600 }),
+                        };
                     }
+                }
+            }
+            Message::TimerAmount(amount) => {
+                if let Some(c) = self.open.as_mut().and_then(|o| o.timer_menu.as_mut()) {
+                    c.amount = amount.chars().filter(char::is_ascii_digit).take(6).collect();
+                }
+            }
+            Message::TimerUnit(unit) => {
+                if let Some(c) = self.open.as_mut().and_then(|o| o.timer_menu.as_mut()) {
+                    c.unit = unit;
                 }
             }
             Message::SetTimer(seconds) => {
@@ -648,7 +862,7 @@ impl App {
                     return Task::none();
                 }
                 let Some(o) = &mut self.open else { return Task::none() };
-                o.timer_menu = false;
+                o.timer_menu = None;
                 let (thread, is_group) = (o.thread.clone(), o.is_group);
                 if self.timer(&thread) == seconds {
                     return Task::none();
@@ -882,6 +1096,12 @@ impl App {
                     s.section = section;
                     s.confirm_unlink = false;
                 }
+                if section == SettingsSection::Plugins {
+                    self.plugins = crate::plugins::discover(&crate::plugins::dir(&self.data_dir));
+                }
+                if section == SettingsSection::Appearance {
+                    self.custom_themes = crate::themes::load(&crate::themes::dir(&self.data_dir)); // picks up dropped-in files
+                }
             }
             Message::EditProfile(p) => {
                 if let Some(s) = &mut self.settings_panel {
@@ -893,7 +1113,129 @@ impl App {
                     self.send(Command::UpdateProfile { given: p.given, family: p.family, about: p.about, emoji: p.emoji });
                 }
             }
+            Message::ChangePhoto => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Choose a profile photo")
+                            .add_filter("Images", &["jpg", "jpeg", "png", "webp", "gif"])
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_owned())
+                    },
+                    Message::PhotoPicked,
+                );
+            }
+            Message::PhotoPicked(Some(path)) => {
+                return Task::perform(
+                    async move {
+                        let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+                        tokio::task::spawn_blocking(move || backend::avatar_jpeg(&bytes)).await.map_err(|e| e.to_string())?
+                    },
+                    Message::PhotoReady,
+                );
+            }
+            Message::PhotoPicked(None) => {}
+            Message::PhotoReady(Ok(jpeg)) => {
+                if let Some(s) = self.settings_panel.as_mut().filter(|s| !s.photo_busy) {
+                    s.photo_busy = true;
+                    self.send(Command::SetAvatar(Some(jpeg)));
+                }
+            }
+            Message::PhotoReady(Err(e)) => self.error = Some(format!("Photo not changed: {e}")),
+            Message::RemovePhoto => {
+                if let Some(s) = self.settings_panel.as_mut().filter(|s| !s.photo_busy) {
+                    s.photo_busy = true;
+                    self.send(Command::SetAvatar(None));
+                }
+            }
+            Message::Plugin(name, update) => return self.plugin(name, update),
+            Message::TogglePlugin(name, on) => {
+                let mut s = self.settings.clone();
+                s.plugins.retain(|p| *p != name);
+                if on {
+                    s.plugins.push(name.clone());
+                    self.plugin_status.insert(name, "Starting…".into());
+                } else {
+                    self.plugin_tx.remove(&name);
+                    self.plugin_status.remove(&name);
+                }
+                self.save_settings(s);
+            }
+            Message::OpenPluginsFolder => {
+                let dir = crate::plugins::dir(&self.data_dir);
+                let _ = std::fs::create_dir_all(&dir);
+                (self.open_url)(&dir.to_string_lossy());
+            }
+            Message::SetCustomTheme(name) => self.save_settings(Settings { theme: ThemeChoice::Custom, custom_theme: name, ..self.settings.clone() }),
+            Message::EditTheme(saved) => {
+                let p = self.theme().palette();
+                let draft = match saved {
+                    Some(t) => (Some(t.name.clone()), t),
+                    None => (None, CustomTheme {
+                        name: String::new(),
+                        background: crate::themes::to_hex(p.background),
+                        text: crate::themes::to_hex(p.text),
+                        accent: crate::themes::to_hex(p.primary),
+                    }),
+                };
+                if let Some(s) = &mut self.settings_panel {
+                    s.theme_draft = Some(draft);
+                }
+            }
+            Message::ThemeDraft(t) => {
+                if let Some((_, d)) = self.settings_panel.as_mut().and_then(|s| s.theme_draft.as_mut()) {
+                    *d = t;
+                }
+            }
+            Message::SaveTheme => {
+                let Some((original, t)) = self.settings_panel.as_ref().and_then(|s| s.theme_draft.clone()).filter(|(_, t)| t.is_valid()) else {
+                    return Task::none();
+                };
+                let dir = crate::themes::dir(&self.data_dir);
+                if let Some(old) = original.and_then(|n| self.custom_themes.iter().find(|x| x.name == n).cloned()).filter(|old| old.name != t.name) {
+                    let _ = crate::themes::delete(&dir, &old); // renamed
+                }
+                if let Err(e) = crate::themes::save(&dir, &t) {
+                    self.error = Some(format!("Theme not saved: {e}"));
+                    return Task::none();
+                }
+                self.custom_themes = crate::themes::load(&dir);
+                if let Some(s) = &mut self.settings_panel {
+                    s.theme_draft = None;
+                }
+                return self.update(Message::SetCustomTheme(t.name));
+            }
+            Message::DeleteTheme => {
+                let Some((Some(name), _)) = self.settings_panel.as_mut().and_then(|s| s.theme_draft.take()) else { return Task::none() };
+                let dir = crate::themes::dir(&self.data_dir);
+                if let Some(t) = self.custom_themes.iter().find(|t| t.name == name) {
+                    let _ = crate::themes::delete(&dir, t);
+                }
+                self.custom_themes = crate::themes::load(&dir);
+            }
+            Message::CancelThemeEdit => {
+                if let Some(s) = &mut self.settings_panel {
+                    s.theme_draft = None;
+                }
+            }
+            Message::OpenThemesFolder => {
+                let dir = crate::themes::dir(&self.data_dir);
+                let _ = std::fs::create_dir_all(&dir);
+                (self.open_url)(&dir.to_string_lossy());
+            }
             Message::SetTheme(theme) => self.save_settings(Settings { theme, ..self.settings.clone() }),
+            Message::SetSquare(square) => self.save_settings(Settings { square, ..self.settings.clone() }),
+            Message::SetGifProvider(gif_provider) => self.save_settings(Settings { gif_provider, ..self.settings.clone() }),
+            Message::SetGifKey(key) => {
+                let mut s = self.settings.clone();
+                match s.gif_provider {
+                    GifProvider::Giphy => s.giphy_key = key,
+                    GifProvider::Tenor => s.tenor_key = key,
+                }
+                self.save_settings(s);
+            }
+            Message::Copy(t) => return iced::clipboard::write(t),
             Message::SetNotifications(notifications) => self.save_settings(Settings { notifications, ..self.settings.clone() }),
             Message::SetNotificationText(notification_text) => {
                 self.save_settings(Settings { notification_text, ..self.settings.clone() })
@@ -978,6 +1320,7 @@ impl App {
                 }
             }
             Event::Incoming { thread, content } => {
+                self.plugin_message(&thread, &content);
                 if let Some(t) = self.open.as_mut().filter(|o| o.thread == thread).and_then(|o| o.timeline.as_mut()) {
                     if t.apply(&content) {
                         if let Some(by) = self.typing.get_mut(&thread) {
@@ -1024,6 +1367,13 @@ impl App {
                         move |d| Message::AudioDuration(k.clone(), d),
                     );
                 }
+                if let Some(p) = path.as_ref().ok().filter(|p| mime_guess::from_path(p).first_raw() == Some("image/gif")) {
+                    let (k, p) = (key.clone(), p.clone());
+                    task = Task::perform(
+                        async move { tokio::task::spawn_blocking(move || crate::gifs::decode(&p)).await.ok().flatten() },
+                        move |a| Message::Animated(k.clone(), a),
+                    );
+                }
                 let a = match path {
                     Ok(p) => Attach::Ready(p),
                     Err(e) => Attach::Failed(e),
@@ -1068,12 +1418,17 @@ impl App {
             }
             Event::Settings(s) => {
                 self.dark = s.dark(self.system_dark);
+                crate::view::set_square(s.square);
                 self.settings = s;
             }
-            Event::Account { phone } => self.phone = phone,
+            Event::Account { phone } => {
+                self.share = share_link(&phone).and_then(|l| Some((l.clone(), qr_code::Data::new(l).ok()?)));
+                self.phone = phone;
+            }
             Event::Profile(p) => {
                 if let Some(s) = &mut self.settings_panel {
                     s.profile = p.clone();
+                    s.photo_busy = false;
                 }
                 self.profile = Some(p);
             }
@@ -1086,6 +1441,9 @@ impl App {
                 }
             }
             Event::Error(e) => {
+                if let Some(s) = &mut self.settings_panel {
+                    s.photo_busy = false;
+                }
                 if matches!(self.screen, Screen::Connecting) && self.me != Uuid::nil() {
                     self.screen = Screen::Main; // unlinking failed: still linked
                 }
@@ -1100,6 +1458,7 @@ impl App {
 
     fn save_settings(&mut self, s: Settings) {
         self.dark = s.dark(self.system_dark);
+        crate::view::set_square(s.square);
         self.settings = s.clone();
         self.send(Command::SaveSettings(s));
     }
@@ -1178,6 +1537,7 @@ impl App {
         if let Some(t) = &mut o.timeline {
             t.messages.push(m);
         }
+        let event = (!body.is_empty()).then(|| (o.thread.clone(), body.clone()));
         let cmd = Command::Send {
             thread: o.thread.clone(),
             ts,
@@ -1192,6 +1552,85 @@ impl App {
         o.typing_sent = false; // a sent message implicitly stops typing for recipients
         o.last_keystroke = None;
         self.send(cmd);
+        if let Some((thread, body)) = event {
+            self.plugin_event(serde_json::json!({ "type": "sent", "chat": crate::state::thread_key(&thread), "chat_name": self.chat_title(&thread), "timestamp": ts, "body": body }));
+        }
+    }
+
+    /// Hands a JSON event to every running plugin.
+    fn plugin_event(&mut self, event: serde_json::Value) {
+        let line = event.to_string();
+        self.plugin_tx.retain(|_, tx| tx.send(line.clone()).is_ok());
+    }
+
+    /// An incoming (or synced) message with text, as a plugin event.
+    fn plugin_message(&mut self, thread: &Thread, content: &presage::libsignal_service::content::Content) {
+        if self.plugin_tx.is_empty() {
+            return;
+        }
+        let mut t = Timeline::new(self.me);
+        t.apply(content);
+        let Some(m) = t.messages.last().filter(|m| !m.body.is_empty()) else { return };
+        let event = serde_json::json!({
+            "type": "message",
+            "chat": crate::state::thread_key(thread),
+            "chat_name": self.chat_title(thread),
+            "from": m.author.to_string(),
+            "from_name": display_name(&self.names, m.author),
+            "outgoing": m.author == self.me,
+            "timestamp": m.id,
+            "body": m.body,
+        });
+        self.plugin_event(event);
+    }
+
+    fn chat_title(&self, thread: &Thread) -> String {
+        self.conversations.iter().find(|c| c.thread == *thread).map(|c| c.title.clone()).unwrap_or_default()
+    }
+
+    fn plugin(&mut self, name: String, update: crate::plugins::Update) -> Task<Message> {
+        use crate::plugins::{Action, Update};
+        if !self.settings.plugins.contains(&name) {
+            return Task::none(); // disabled while this was in flight
+        }
+        match update {
+            Update::Ready(tx) => {
+                self.plugin_tx.insert(name.clone(), tx);
+                self.plugin_status.insert(name, "Running".into());
+            }
+            Update::Exited(status) => {
+                self.plugin_tx.remove(&name);
+                self.plugin_status.insert(name, format!("Stopped ({status})"));
+            }
+            Update::Invalid(line) => {
+                tracing::warn!(plugin = name, line, "ignored a line that isn't a plugin action");
+            }
+            Update::Action(Action::Notify { title, body }) => {
+                std::thread::spawn(move || {
+                    let _ = notify_rust::Notification::new().appname("signal-rusted").summary(&title).body(&body).show();
+                });
+            }
+            Update::Action(Action::Send { chat, body }) => {
+                // Only to chats in the list, and never to an unanswered request.
+                let Some(thread) = crate::state::parse_thread_key(&chat).filter(|t| self.conversations.iter().any(|c| c.thread == *t && !c.request))
+                else {
+                    tracing::warn!(plugin = name, chat, "plugin tried to send to an unknown chat");
+                    return Task::none();
+                };
+                let body = body.trim().to_owned();
+                if body.is_empty() {
+                    return Task::none();
+                }
+                let ts = now_ms();
+                if let Some(t) = self.open.as_mut().filter(|o| o.thread == thread).and_then(|o| o.timeline.as_mut()) {
+                    let mut m = Msg::new(ts, self.me, true);
+                    (m.body, m.delivery) = (body.clone(), Delivery::Sending);
+                    t.messages.push(m);
+                }
+                self.send(Command::Send { thread, ts, body, ranges: Vec::new(), attachments: Vec::new(), quote: None, voice_note: false });
+            }
+        }
+        Task::none()
     }
 
     /// Applies a menu or request-bar choice right away; the backend persists it and refreshes.
@@ -1519,6 +1958,20 @@ impl App {
 }
 
 /// The letters after an `@` that ends `before` (the `@` at the start or after a space).
+/// The signal.me link that opens a chat with this phone number (Signal's "share phone number" link).
+pub fn share_link(phone: &str) -> Option<String> {
+    let digits = phone.strip_prefix('+')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| format!("https://signal.me/#p/+{digits}"))
+}
+
+#[test]
+fn share_links() {
+    assert_eq!(share_link("+15550100").as_deref(), Some("https://signal.me/#p/+15550100"));
+    assert_eq!(share_link("15550100"), None);
+    assert_eq!(share_link("+"), None);
+    assert_eq!(share_link("+1 555"), None);
+}
+
 fn mention_query(before: &str) -> Option<&str> {
     let at = before.rfind('@')?;
     let q = &before[at + 1..];
@@ -1577,6 +2030,29 @@ pub(crate) mod tests {
     }
 
     /// An app on the main screen with one open conversation and a captured command channel.
+    #[test]
+    fn custom_theme_is_saved_selected_and_deleted() {
+        let (mut app, _rx) = app();
+        let dir = tempfile::tempdir().unwrap();
+        app.data_dir = dir.path().to_owned();
+        app.update(Message::ToggleSettings);
+        app.update(Message::EditTheme(None));
+        let (_, mut d) = app.settings_panel.as_ref().unwrap().theme_draft.clone().unwrap();
+        assert!(crate::themes::hex(&d.accent).is_some(), "starts from the current colors");
+        app.update(Message::SaveTheme);
+        assert!(app.settings_panel.as_ref().unwrap().theme_draft.is_some(), "no name, not saved");
+        (d.name, d.background, d.accent) = ("Ocean".into(), "#001122".into(), "#33aaff".into());
+        app.update(Message::ThemeDraft(d.clone()));
+        app.update(Message::SaveTheme);
+        assert_eq!((app.settings.theme, app.settings.custom_theme.as_str()), (ThemeChoice::Custom, "Ocean"));
+        assert_eq!(crate::themes::to_hex(app.theme().palette().background), "#001122");
+        assert_eq!(crate::themes::load(&crate::themes::dir(dir.path())), [d.clone()]);
+        app.update(Message::EditTheme(Some(d)));
+        app.update(Message::DeleteTheme);
+        assert!(app.custom_themes.is_empty());
+        assert_ne!(crate::themes::to_hex(app.theme().palette().background), "#001122", "a deleted theme falls back");
+    }
+
     pub fn app() -> (App, UnboundedReceiver<Command>) {
         let (tx, rx) = unbounded_channel();
         let (mut app, _) = App::new(PathBuf::from("/nonexistent"));
@@ -2141,13 +2617,13 @@ pub(crate) mod tests {
         let (mut app, mut rx) = app();
         open_alice(&mut app, &mut rx);
         app.update(Message::ToggleTimerMenu);
-        assert!(app.open.as_ref().unwrap().timer_menu);
+        assert!(app.open.as_ref().unwrap().timer_menu.is_some());
         app.update(Message::SetTimer(300));
         app.update(Message::SetTimer(300));
         let cmds = drain(&mut rx);
         assert!(matches!(cmds.as_slice(), [Command::SetTimer { thread, seconds: 300 }] if *thread == alice()), "{cmds:?}");
         assert_eq!(app.timer(&alice()), 300);
-        assert!(!app.open.as_ref().unwrap().timer_menu, "choosing closes the menu");
+        assert!(app.open.as_ref().unwrap().timer_menu.is_none(), "choosing closes the menu");
     }
 
     #[test]
@@ -2158,7 +2634,7 @@ pub(crate) mod tests {
         app.update(Message::ToggleTimerMenu);
         app.update(Message::SetTimer(30));
         assert!(drain(&mut rx).is_empty());
-        assert!(!app.open.as_ref().unwrap().timer_menu);
+        assert!(app.open.as_ref().unwrap().timer_menu.is_none());
     }
 
     #[test]
@@ -2374,7 +2850,7 @@ pub(crate) mod tests {
     fn group_timer_is_a_group_change_when_allowed() {
         let (mut app, mut rx) = open_group();
         app.update(Message::ToggleTimerMenu);
-        assert!(app.open.as_ref().unwrap().timer_menu);
+        assert!(app.open.as_ref().unwrap().timer_menu.is_some());
         app.update(Message::SetTimer(300));
         let cmds = drain(&mut rx);
         assert!(matches!(cmds.as_slice(), [Command::EditGroup { edit: GroupEdit::Timer(300), .. }]), "{cmds:?}");
