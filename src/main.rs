@@ -19,6 +19,16 @@ fn main() -> iced::Result {
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .window_size((1100.0, 760.0))
+        .window(iced::window::Settings {
+            size: (1100.0, 760.0).into(),
+            icon: iced::window::icon::from_file_data(include_bytes!("../assets/icon-256.png"), None).ok(),
+            // Wayland takes the taskbar icon from the .desktop file with this name (packaging/).
+            #[cfg(target_os = "linux")]
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: "signal-rs".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
         .run()
 }

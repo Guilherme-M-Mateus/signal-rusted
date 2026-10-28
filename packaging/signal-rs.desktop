@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=signal-rs
+Comment=Native Rust Signal client (unofficial)
+Exec=signal-rs
+Icon=signal-rs
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+StartupWMClass=signal-rs
