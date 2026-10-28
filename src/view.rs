@@ -48,7 +48,7 @@ pub fn signal_theme(dark: bool) -> Theme {
             danger: color!(0xe53935),
         }
     };
-    Theme::custom(if dark { "Signal Dark" } else { "Signal Light" }, palette)
+    Theme::custom(if dark { "signal-rusted Dark" } else { "signal-rusted Light" }, palette)
 }
 
 fn is_dark(theme: &Theme) -> bool {
@@ -376,7 +376,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     column![
         container(
             row![
-                text("Signal").size(22).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill),
+                text("signal-rusted").size(22).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill),
                 button(text(stories).size(13)).on_press(Message::ToggleStories).style(button::secondary),
                 button(text("New group").size(13)).on_press(Message::NewGroup).style(button::secondary),
                 button(text("⚙").size(18)).on_press(Message::ToggleSettings).style(button::text),
@@ -842,7 +842,7 @@ fn settings<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, M
     ].spacing(8));
     col = col.push(row![
         button(text("Save profile")).on_press_maybe(app.can_save_profile(p).then_some(Message::SaveProfile)).style(button::primary),
-        muted_text("Change your photo on your phone: signal-rs can't upload one yet."),
+        muted_text("Change your photo on your phone: signal-rusted can't upload one yet."),
     ].spacing(12).align_y(Alignment::Center));
 
     col = col.push(heading("Appearance"));
@@ -2278,7 +2278,7 @@ mod tests {
         app.update(Message::Backend(Event::Account { phone: "+15550100".into() }));
         app.update(Message::Backend(Event::Devices(vec![
             crate::backend::Device { id: 1, name: "Fake Phone".into(), this: false },
-            crate::backend::Device { id: 2, name: "signal-rs on desk".into(), this: true },
+            crate::backend::Device { id: 2, name: "signal-rusted on desk".into(), this: true },
         ])));
         (app, rx)
     }

@@ -15,6 +15,7 @@ pub struct OsKeyring(Result<keyring::Entry, String>);
 
 impl OsKeyring {
     pub fn new(data_dir: &Path) -> Self {
+        // Pre-rename service name, kept: a new name would lose the existing database key.
         OsKeyring(keyring::Entry::new("signal-rs", &data_dir.to_string_lossy()).map_err(|e| e.to_string()))
     }
 

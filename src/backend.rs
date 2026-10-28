@@ -1875,7 +1875,7 @@ impl Backend {
         {
             let (summary, body) = (title(r), "Answer on your phone".to_owned());
             std::thread::spawn(move || {
-                let _ = notify_rust::Notification::new().appname("Signal").summary(&summary).body(&body).show();
+                let _ = notify_rust::Notification::new().appname("signal-rusted").summary(&summary).body(&body).show();
             });
         }
         self.emit(Event::Ringing(self.calls.ringing.last().map(|r| format!("📞 {} · answer on your phone", title(r)))));
@@ -1902,7 +1902,7 @@ impl Backend {
         let Some(m) = t.messages.last() else { return };
         let names = self.names().await;
         let Some(body) = self.state.settings.notification_body(m.summary(self.me, &names)) else { return };
-        let sender = names.get(&m.author).cloned().unwrap_or_else(|| "Signal".into());
+        let sender = names.get(&m.author).cloned().unwrap_or_else(|| "signal-rusted".into());
         let title = match thread {
             Thread::Group(k) => match self.manager.store().group(*k).await {
                 Ok(Some(g)) => format!("{sender} in {}", g.title),
@@ -1912,7 +1912,7 @@ impl Backend {
         };
         // notify-rust blocks on D-Bus; keep it off the protocol task.
         std::thread::spawn(move || {
-            let _ = notify_rust::Notification::new().appname("Signal").summary(&title).body(&body).show();
+            let _ = notify_rust::Notification::new().appname("signal-rusted").summary(&title).body(&body).show();
         });
     }
 }

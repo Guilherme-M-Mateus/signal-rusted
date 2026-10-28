@@ -6933,7 +6933,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "signal-rs"
+name = "signal-rusted"
 version = "0.1.0"
 dependencies = [
  "anyhow",

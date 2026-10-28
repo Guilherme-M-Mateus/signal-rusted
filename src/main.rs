@@ -1,4 +1,4 @@
-use signal_rs::app::App;
+use signal_rusted::app::App;
 
 fn main() -> iced::Result {
     let filter = tracing_subscriber::EnvFilter::builder()
@@ -8,6 +8,7 @@ fn main() -> iced::Result {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // SIGNAL_RS_DATA lets you run a second, independent profile (e.g. for testing).
+    // The data dir (and keyring entry) keep the pre-rename name: renaming would orphan the database.
     let data_dir = std::env::var_os("SIGNAL_RS_DATA").map(Into::into).unwrap_or_else(|| {
         directories::ProjectDirs::from("org", "signal-rs", "signal-rs")
             .expect("home directory")
@@ -15,7 +16,7 @@ fn main() -> iced::Result {
             .to_owned()
     });
 
-    iced::application(move || App::new(data_dir.clone()), App::update, signal_rs::view::view)
+    iced::application(move || App::new(data_dir.clone()), App::update, signal_rusted::view::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
@@ -25,7 +26,7 @@ fn main() -> iced::Result {
             // Wayland takes the taskbar icon from the .desktop file with this name (packaging/).
             #[cfg(target_os = "linux")]
             platform_specific: iced::window::settings::PlatformSpecific {
-                application_id: "signal-rs".into(),
+                application_id: "signal-rusted".into(),
                 ..Default::default()
             },
             ..Default::default()

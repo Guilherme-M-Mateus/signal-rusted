@@ -328,8 +328,8 @@ impl App {
     pub fn title(&self) -> String {
         let unread: usize = self.conversations.iter().map(|c| c.unread).sum();
         match unread {
-            0 => "Signal".into(),
-            n => format!("Signal ({n})"),
+            0 => "signal-rusted".into(),
+            n => format!("signal-rusted ({n})"),
         }
     }
 
@@ -1524,7 +1524,7 @@ fn open_in_browser(url: &str) {
 
 fn default_device_name() -> String {
     let host = std::fs::read_to_string("/etc/hostname").map(|h| h.trim().to_owned()).unwrap_or_default();
-    if host.is_empty() { "signal-rs".into() } else { format!("signal-rs on {host}") }
+    if host.is_empty() { "signal-rusted".into() } else { format!("signal-rusted on {host}") }
 }
 
 #[cfg(test)]
@@ -2301,7 +2301,7 @@ pub(crate) mod tests {
     #[test]
     fn window_title_counts_unread() {
         let (app, _rx) = app();
-        assert_eq!(app.title(), "Signal (2)");
+        assert_eq!(app.title(), "signal-rusted (2)");
     }
 
     /// Makes us an admin of `open_group()`'s group.

@@ -3,14 +3,15 @@
 use presage::model::identity::OnNewIdentity;
 use presage::store::{ContentsStore, StateStore, Thread};
 use presage_store_sqlite::SqliteStore;
-use signal_rs::timeline::{Kind, Timeline};
+use signal_rusted::timeline::{Kind, Timeline};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| {
+        // The data dir keeps its original name so existing installs find their data.
         directories::ProjectDirs::from("org", "signal-rs", "signal-rs").unwrap().data_dir().to_owned()
     });
-    let pass = signal_rs::dbkey::db_passphrase(&dir, &signal_rs::dbkey::OsKeyring::new(&dir))?;
+    let pass = signal_rusted::dbkey::db_passphrase(&dir, &signal_rusted::dbkey::OsKeyring::new(&dir))?;
     let store = SqliteStore::open_with_passphrase(&dir.join("signal.db3").to_string_lossy(), Some(pass.trim()), OnNewIdentity::Trust).await?;
     let me = presage::libsignal_service::protocol::ServiceId::from(store.load_registration_data().await?.unwrap().service_ids.aci()).raw_uuid();
     let mut threads: Vec<(Thread, String)> = store.groups().await?.flatten().map(|(k, g)| (Thread::Group(k), g.title)).collect();
@@ -22,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         let tl = Timeline::from_newest_first(me, store.messages(&t, ..).await?.flatten(), usize::MAX);
         if tl.messages.is_empty() { continue }
         let m = &tl.messages;
-        let count = |f: &dyn Fn(&signal_rs::timeline::Message) -> bool| m.iter().filter(|x| f(x)).count();
+        let count = |f: &dyn Fn(&signal_rusted::timeline::Message) -> bool| m.iter().filter(|x| f(x)).count();
         println!(
             "{title}: {} msgs ({} out), {} reactions, {} styled, {} quotes, {} attachments, {} edited, {} deleted, {} system",
             m.len(), count(&|x| x.outgoing), m.iter().map(|x| x.reactions.len()).sum::<usize>(),
