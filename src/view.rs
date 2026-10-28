@@ -9,14 +9,16 @@ use iced::widget::text::Span;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::widget::{
     Column, Space, button, center, checkbox, column, container, image, mouse_area, opaque, progress_bar, qr_code, rich_text, row,
-    rule, scrollable, span, stack, text, text_editor, text_input,
+    rule, scrollable, span, stack, svg, text, text_editor, text_input, tooltip,
 };
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Font, Length, Theme, color, mouse};
 use presage::libsignal_service::prelude::Uuid;
 use presage::proto::data_message::Sticker;
 use presage::proto::{AttachmentPointer, BodyRange, Preview};
 
-use crate::app::{App, Attach, Message, Open, Screen, StickerTab, TIMERS, display_name, is_image};
+use crate::app::{App, Attach, Message, Open, Screen, SettingsSection, StickerTab, TIMERS, Tab, display_name, is_image};
+use crate::icons::{self, icon, tinted};
+use crate::state::ThemeChoice;
 use crate::backend::{ChatAction, Conversation, attachment_key, now_ms};
 use crate::calls::{Call, CallCommand, Phase};
 use crate::stories::{Story, Viewer};
@@ -27,40 +29,90 @@ pub const COMPOSER: &str = "composer";
 pub const STORY_REPLY: &str = "story-reply";
 const BLUE: Color = color!(0x2c6bed);
 
-pub fn signal_theme(dark: bool) -> Theme {
+/// The themes the settings offer, in order.
+pub const THEMES: [(ThemeChoice, &str); 8] = [
+    (ThemeChoice::System, "System"),
+    (ThemeChoice::Light, "Light"),
+    (ThemeChoice::Dark, "Dark"),
+    (ThemeChoice::Midnight, "Midnight"),
+    (ThemeChoice::Rusted, "Rusted"),
+    (ThemeChoice::Nord, "Nord"),
+    (ThemeChoice::Sakura, "Sakura"),
+    (ThemeChoice::Mint, "Mint"),
+];
+
+/// `choice`'s colors; `dark` picks Light or Dark for "System".
+pub fn app_theme(choice: ThemeChoice, dark: bool) -> Theme {
     use iced::theme::Palette;
-    let palette = if dark {
-        Palette {
-            background: color!(0x121212),
-            text: color!(0xe9e9e9),
-            primary: BLUE,
-            success: color!(0x4caf50),
-            warning: color!(0xffc107),
-            danger: color!(0xf44336),
-        }
-    } else {
-        Palette {
-            background: color!(0xffffff),
-            text: color!(0x1b1b1b),
-            primary: BLUE,
-            success: color!(0x4caf50),
-            warning: color!(0xffc107),
-            danger: color!(0xe53935),
-        }
+    let (name, background, text, primary) = match (choice, dark) {
+        (ThemeChoice::Midnight, _) => ("Midnight", color!(0x000000), color!(0xe9e9e9), BLUE),
+        (ThemeChoice::Rusted, _) => ("Rusted", color!(0x1d1f23), color!(0xeeeae6), color!(0xe8641f)),
+        (ThemeChoice::Nord, _) => ("Nord", color!(0x2e3440), color!(0xeceff4), color!(0x5e81ac)),
+        (ThemeChoice::Sakura, _) => ("Sakura", color!(0xfff7f9), color!(0x2b1b22), color!(0xd6457a)),
+        (ThemeChoice::Mint, _) => ("Mint", color!(0xf3faf6), color!(0x18281f), color!(0x2e8b57)),
+        (_, true) => ("Dark", color!(0x121212), color!(0xe9e9e9), BLUE),
+        (_, false) => ("Light", color!(0xffffff), color!(0x1b1b1b), BLUE),
     };
-    Theme::custom(if dark { "signal-rusted Dark" } else { "signal-rusted Light" }, palette)
+    let danger = if dark { color!(0xf44336) } else { color!(0xe53935) };
+    let palette = Palette { background, text, primary, success: color!(0x4caf50), warning: color!(0xffc107), danger };
+    Theme::custom(format!("signal-rusted {name}"), palette)
 }
 
 fn is_dark(theme: &Theme) -> bool {
     theme.palette().background.r < 0.5
 }
 
+/// `a` moved `t` of the way towards `b`.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    Color::from_rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t)
+}
+
 fn muted(theme: &Theme) -> Color {
-    if is_dark(theme) { color!(0x9a9a9a) } else { color!(0x6b6b6b) }
+    let p = theme.palette();
+    mix(p.background, p.text, 0.6)
 }
 
 fn surface(theme: &Theme) -> Color {
-    if is_dark(theme) { color!(0x2e2e2e) } else { color!(0xe9e9e9) }
+    let p = theme.palette();
+    mix(p.background, p.text, if is_dark(theme) { 0.12 } else { 0.085 })
+}
+
+/// The navigation rail's slightly tinted background.
+fn rail(theme: &Theme) -> Color {
+    let p = theme.palette();
+    mix(p.background, p.text, 0.04)
+}
+
+fn accent(theme: &Theme) -> Color {
+    theme.palette().primary
+}
+
+const BOLD: Font = Font { weight: Weight::Bold, ..Font::DEFAULT };
+
+/// The app icon (assets/icon.svg).
+fn logo<'a>(size: f32) -> iced::widget::Svg<'a> {
+    svg(svg::Handle::from_memory(include_bytes!("../assets/icon.svg").as_slice())).width(size).height(size)
+}
+
+/// A round, borderless icon button with a tooltip; `label` is also its widget id (for tests).
+fn icon_button<'a>(src: &'static str, label: &'static str, msg: Option<Message>) -> Element<'a, Message> {
+    let b = button(icon(src, 20)).padding(8).on_press_maybe(msg).style(|t: &Theme, status| button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| surface(t).into()),
+        text_color: t.palette().text,
+        border: Border { radius: 20.0.into(), ..Default::default() },
+        ..Default::default()
+    });
+    tip(container(b).id(label), label, tooltip::Position::Bottom)
+}
+
+fn tip<'a>(content: impl Into<Element<'a, Message>>, label: &'static str, at: tooltip::Position) -> Element<'a, Message> {
+    let label = container(text(label).size(12)).padding([4, 8]).style(container::rounded_box);
+    tooltip(content, label, at).gap(4).into()
+}
+
+/// Rounded "pill" fill for the search box and the composer.
+fn pill(t: &Theme) -> Background {
+    surface(t).scale_alpha(0.7).into()
 }
 
 const AVATAR_COLORS: [Color; 8] = [
@@ -131,16 +183,18 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Screen::Connecting => center(text("Connecting…").size(18)).into(),
         Screen::Link { device_name, qr, waiting, error } => link_view(device_name, qr.as_ref(), *waiting, error.as_deref()),
         Screen::Main => row![
-            sidebar(app),
+            nav_rail(app),
+            rule::vertical(1),
+            match &app.settings_panel {
+                Some(s) => settings_nav(app, s),
+                None => sidebar(app),
+            },
             rule::vertical(1),
             match (&app.settings_panel, &app.new_group, &app.open) {
                 (Some(s), ..) => settings(app, s),
                 (None, Some(g), _) => new_group(app, g),
                 (None, None, Some(o)) => conversation(app, o),
-                (None, None, None) => center(text("Select a conversation to start messaging").style(|t: &Theme| text::Style {
-                    color: Some(muted(t))
-                }))
-                .into(),
+                (None, None, None) => welcome(),
             }
         ]
         .into(),
@@ -163,7 +217,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             container(text(n.clone()).color(Color::WHITE))
                 .padding([6, 12])
                 .width(Length::Fill)
-                .style(|_| container::Style { background: Some(BLUE.into()), ..Default::default() })
+                .style(|t: &Theme| container::Style { background: Some(accent(t).into()), ..Default::default() })
                 .into()
         }))
         .push(body)
@@ -191,6 +245,71 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
 }
 
+fn welcome<'a>() -> Element<'a, Message> {
+    center(
+        column![
+            logo(112.0),
+            text("Welcome to signal-rusted").size(24).font(BOLD),
+            muted_text("Select a chat to start messaging").size(14),
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center),
+    )
+    .into()
+}
+
+/// Signal-Desktop's left rail: Chats and Stories up top, Settings and your avatar at the bottom.
+fn nav_rail(app: &App) -> Element<'_, Message> {
+    let current = if app.settings_panel.is_some() {
+        Tab::Settings
+    } else if app.stories_open {
+        Tab::Stories
+    } else {
+        Tab::Chats
+    };
+    let item = |src: &'static str, label: &'static str, tab: Tab, dot: bool| {
+        let selected = current == tab;
+        let mut face = stack![container(icon(src, 22)).center(44)];
+        if dot {
+            face = face.push(container(container(Space::new()).width(9).height(9).style(|t: &Theme| container::Style {
+                background: Some(accent(t).into()),
+                border: Border { radius: 5.0.into(), ..Default::default() },
+                ..Default::default()
+            })).padding([8, 7]).align_right(44));
+        }
+        let b = button(face).padding(0).on_press(Message::ShowTab(tab)).style(move |t: &Theme, status| button::Style {
+            background: (selected || matches!(status, button::Status::Hovered)).then(|| surface(t).scale_alpha(if selected { 1.0 } else { 0.6 }).into()),
+            text_color: t.palette().text,
+            border: Border { radius: 12.0.into(), ..Default::default() },
+            ..Default::default()
+        });
+        tip(container(b).id(label), label, tooltip::Position::Right)
+    };
+    let unread = app.conversations.iter().any(|c| !c.archived && !c.request && (c.unread > 0 || c.marked_unread));
+    let unviewed = app.stories.iter().any(|s| !s.viewed && s.expires_at() > now_ms());
+    let me: Element<_> = match app.profile.as_ref().filter(|p| !p.given.is_empty()) {
+        Some(p) => avatar(app, &p.given, &app.me.to_string(), 32.0),
+        None => container(icon(icons::USER, 20)).center(32).into(),
+    };
+    let profile = button(me).padding(6).on_press(Message::ShowTab(Tab::Settings)).style(button::text);
+    container(
+        column![
+            container(logo(36.0)).padding([4, 0]),
+            item(icons::CHATS, "Chats", Tab::Chats, unread && current != Tab::Chats),
+            item(icons::STORIES, "Stories", Tab::Stories, unviewed),
+            Space::new().height(Length::Fill),
+            item(icons::SETTINGS, "Settings", Tab::Settings, false),
+            tip(profile, "Profile", tooltip::Position::Right),
+        ]
+        .spacing(8)
+        .padding([12, 10])
+        .align_x(Alignment::Center),
+    )
+    .height(Length::Fill)
+    .style(|t: &Theme| container::Style { background: Some(rail(t).into()), ..Default::default() })
+    .into()
+}
+
 fn link_view<'a>(
     device_name: &'a str,
     qr: Option<&'a qr_code::Data>,
@@ -198,6 +317,7 @@ fn link_view<'a>(
     error: Option<&'a str>,
 ) -> Element<'a, Message> {
     let mut col = column![
+        logo(96.0),
         text("Link this device").size(28),
         text("On your phone open Signal → Settings → Linked devices → Link new device, then scan the code."),
     ]
@@ -233,11 +353,12 @@ fn chat_row<'a>(app: &'a App, c: &'a Conversation) -> Element<'a, Message> {
     let seed = crate::state::thread_key(&c.thread);
     let dim = |t: &Theme| text::Style { color: Some(muted(t)) };
     let mut top = row![text(c.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill)].spacing(4);
+    let flag = |src: &'static str, id: &'static str| container(icon(src, 14).style(|t: &Theme, _| svg::Style { color: Some(muted(t)) })).id(id);
     if c.pinned {
-        top = top.push(text("📌").size(12));
+        top = top.push(flag(icons::PIN, "pinned"));
     }
     if c.muted {
-        top = top.push(text("🔕").size(12));
+        top = top.push(flag(icons::MUTED, "muted"));
     }
     if c.last_ts > 0 {
         top = top.push(text(short_time(c.last_ts)).size(12).style(dim));
@@ -249,25 +370,25 @@ fn chat_row<'a>(app: &'a App, c: &'a Conversation) -> Element<'a, Message> {
         bottom = bottom.push(
             container(text(c.unread.to_string()).size(12).color(Color::WHITE))
                 .padding([1, 7])
-                .style(|_| container::Style {
-                    background: Some(BLUE.into()),
+                .style(|t: &Theme| container::Style {
+                    background: Some(accent(t).into()),
                     border: Border { radius: 10.0.into(), ..Default::default() },
                     ..Default::default()
                 }),
         );
     } else if c.marked_unread {
-        bottom = bottom.push(container(Space::new()).width(10).height(10).style(|_| container::Style {
-            background: Some(BLUE.into()),
+        bottom = bottom.push(container(Space::new()).width(10).height(10).style(|t: &Theme| container::Style {
+            background: Some(accent(t).into()),
             border: Border { radius: 5.0.into(), ..Default::default() },
             ..Default::default()
         }));
     }
-    let item = row![avatar(app, &c.title, &seed, 44.0), column![top, bottom].spacing(2)]
+    let item = row![avatar(app, &c.title, &seed, 48.0), column![top, bottom].spacing(4)]
         .spacing(12)
         .align_y(Alignment::Center);
     let open = button(item)
         .width(Length::Fill)
-        .padding([10, 12])
+        .padding([10, 10])
         .on_press(Message::OpenThread(c.thread.clone(), c.title.clone(), c.is_group))
         .style(move |t: &Theme, status| {
             let bg = match (selected, status) {
@@ -275,13 +396,13 @@ fn chat_row<'a>(app: &'a App, c: &'a Conversation) -> Element<'a, Message> {
                 (_, button::Status::Hovered) => Some(surface(t).scale_alpha(0.5).into()),
                 _ => None,
             };
-            button::Style { background: bg, text_color: t.palette().text, ..Default::default() }
+            button::Style { background: bg, text_color: t.palette().text, border: Border { radius: 10.0.into(), ..Default::default() }, ..Default::default() }
         });
     // iced has no context menu: a "⋯" on hover opens the row's actions (not for requests).
     let menu_open = app.row_menu.as_ref() == Some(&c.thread);
     let mut line = row![open].align_y(Alignment::Center);
     if !c.request && (menu_open || app.row_hovered.as_ref() == Some(&c.thread)) {
-        line = line.push(button(text("⋯").size(16)).on_press(Message::RowMenu(Some(c.thread.clone()))).style(button::text));
+        line = line.push(icon_button(icons::MORE, "Chat actions", Some(Message::RowMenu(Some(c.thread.clone())))));
     }
     let mut col = column![line];
     if menu_open {
@@ -297,18 +418,21 @@ fn chat_row<'a>(app: &'a App, c: &'a Conversation) -> Element<'a, Message> {
         .spacing(4);
         col = col.push(container(menu.wrap()).padding([4, 12]));
     }
-    mouse_area(col).on_enter(Message::RowHover(Some(c.thread.clone()))).on_exit(Message::RowHover(None)).into()
+    mouse_area(container(col).padding([0, 8])).on_enter(Message::RowHover(Some(c.thread.clone()))).on_exit(Message::RowHover(None)).into()
 }
 
 fn sidebar(app: &App) -> Element<'_, Message> {
     let q = app.search.trim().to_lowercase();
     let shown = |c: &&Conversation| q.is_empty() || c.title.to_lowercase().contains(&q);
-    let section = |label: String, msg| {
-        button(text(label).size(13)).width(Length::Fill).padding([8, 12]).on_press(msg).style(button::text)
+    let section = |src: &'static str, label: String, msg| {
+        let content = row![icon(src, 16).style(|t: &Theme, _| svg::Style { color: Some(muted(t)) }), text(label).size(13)]
+            .spacing(10)
+            .align_y(Alignment::Center);
+        container(button(content).width(Length::Fill).padding([10, 12]).on_press(msg).style(button::text)).padding([0, 8])
     };
     let mut list = Column::new();
     if app.show_archived {
-        list = list.push(section("← Archived chats".into(), Message::ShowArchived(false)));
+        list = list.push(section(icons::BACK, "Archived chats".into(), Message::ShowArchived(false)));
         for c in app.conversations.iter().filter(|c| c.archived && !c.request).filter(shown) {
             list = list.push(chat_row(app, c));
         }
@@ -316,7 +440,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         let requests: Vec<&Conversation> = app.conversations.iter().filter(|c| c.request).filter(shown).collect();
         if !requests.is_empty() {
             let arrow = if app.requests_open { "▾" } else { "▸" };
-            list = list.push(section(format!("{arrow} Message requests ({})", requests.len()), Message::ToggleRequests));
+            list = list.push(section(icons::USER, format!("{arrow} Message requests ({})", requests.len()), Message::ToggleRequests));
             if app.requests_open {
                 for c in requests {
                     list = list.push(chat_row(app, c));
@@ -328,7 +452,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         }
         let archived = app.conversations.iter().filter(|c| c.archived && !c.request).count();
         if archived > 0 {
-            list = list.push(section(format!("Archived chats ({archived})"), Message::ShowArchived(true)));
+            list = list.push(section(icons::ARCHIVE, format!("Archived chats ({archived})"), Message::ShowArchived(true)));
         }
     }
     let contacts = app.contact_matches();
@@ -366,30 +490,33 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             );
         }
     }
-    let list = if app.stories_open { story_rows(app) } else { list };
-    let unviewed = app.stories.iter().any(|s| !s.viewed && s.expires_at() > now_ms());
-    let stories = match (app.stories_open, unviewed) {
-        (true, _) => "Chats",
-        (false, true) => "● Stories",
-        (false, false) => "Stories",
-    };
-    column![
-        container(
-            row![
-                text("signal-rusted").size(22).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).width(Length::Fill),
-                button(text(stories).size(13)).on_press(Message::ToggleStories).style(button::secondary),
-                button(text("New group").size(13)).on_press(Message::NewGroup).style(button::secondary),
-                button(text("⚙").size(18)).on_press(Message::ToggleSettings).style(button::text),
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center)
-        )
-        .padding([12, 16]),
-        container(text_input("Search", &app.search).on_input(Message::Search).padding(8)).padding([0, 12]),
-        scrollable(list).height(Length::Fill),
+    let (title, list) = if app.stories_open { ("Stories", story_rows(app)) } else { ("Chats", list) };
+    let mut header = row![text(title).size(22).font(BOLD).width(Length::Fill)].align_y(Alignment::Center);
+    if !app.stories_open {
+        header = header.push(icon_button(icons::COMPOSE, "New group", Some(Message::NewGroup)));
+    }
+    let search = row![
+        icon(icons::SEARCH, 16).style(|t: &Theme, _| svg::Style { color: Some(muted(t)) }),
+        text_input("Search", &app.search).on_input(Message::Search).padding([6, 0]).style(|t: &Theme, st| text_input::Style {
+            background: Color::TRANSPARENT.into(),
+            border: Border::default(),
+            ..text_input::default(t, st)
+        }),
     ]
     .spacing(8)
-    .width(320)
+    .align_y(Alignment::Center);
+    let search = container(search).padding([2, 12]).style(|t: &Theme| container::Style {
+        background: Some(pill(t)),
+        border: Border { radius: 18.0.into(), ..Default::default() },
+        ..Default::default()
+    });
+    column![
+        container(header).padding(iced::Padding { top: 14.0, right: 12.0, bottom: 0.0, left: 18.0 }),
+        container(search).padding([0, 16]),
+        scrollable(list).height(Length::Fill),
+    ]
+    .spacing(12)
+    .width(340)
     .into()
 }
 
@@ -410,7 +537,7 @@ fn story_rows(app: &App) -> Column<'_, Message> {
         let title = story_owner_title(app, &e.owner);
         let unviewed = e.unviewed();
         let ring = container(avatar(app, &title, &crate::state::thread_key(&e.owner), 36.0)).padding(2).style(move |t: &Theme| container::Style {
-            border: Border { radius: 22.0.into(), width: 2.0, color: if unviewed { BLUE } else { muted(t) } },
+            border: Border { radius: 22.0.into(), width: 2.0, color: if unviewed { accent(t) } else { muted(t) } },
             ..Default::default()
         });
         let n = e.stories.len();
@@ -559,8 +686,8 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         text(format!("{} typing…", typing.join(", "))).size(12).style(|t: &Theme| text::Style { color: Some(muted(t)) }).into()
     };
     let who = row![
-        avatar(app, &o.title, &crate::state::thread_key(&o.thread), 32.0),
-        column![text(o.title.clone()).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), subtitle],
+        avatar(app, &o.title, &crate::state::thread_key(&o.thread), 36.0),
+        column![text(o.title.clone()).size(16).font(BOLD), subtitle],
     ]
     .spacing(12)
     .align_y(Alignment::Center);
@@ -570,10 +697,11 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     } else {
         who.into()
     };
-    let header = container(
-        row![container(who).width(Length::Fill), call_button(app, o), timer_control(app, o)].spacing(12).align_y(Alignment::Center),
-    )
-    .padding([10, 16]);
+    let mut actions = row![call_button(app, o), timer_control(app, o)].spacing(4).align_y(Alignment::Center);
+    if o.is_group {
+        actions = actions.push(icon_button(icons::INFO, "Group details", Some(Message::ToggleGroupInfo)));
+    }
+    let header = container(row![container(who).width(Length::Fill), actions].spacing(12).align_y(Alignment::Center)).padding([10, 16]);
     let header: Element<_> = if o.timer_menu {
         let current = app.timer(&o.thread);
         let options = TIMERS.iter().fold(row![].spacing(6), |r, &(secs, label)| {
@@ -625,8 +753,7 @@ fn call_button<'a>(app: &App, o: &Open) -> Element<'a, Message> {
         return Space::new().into();
     }
     let idle = app.call.as_ref().is_none_or(|c| matches!(c.phase, Phase::Ended(_)));
-    let b = button(text("📞 Call").size(13)).style(button::text);
-    b.on_press_maybe(idle.then(|| Message::Call(CallCommand::Start(peer.raw_uuid())))).into()
+    icon_button(icons::PHONE, "Call", idle.then(|| Message::Call(CallCommand::Start(peer.raw_uuid()))))
 }
 
 /// The current call, above everything: who, its state or timer, and its controls.
@@ -697,12 +824,14 @@ fn request_bar(o: &Open) -> Element<'_, Message> {
 fn timer_control<'a>(app: &App, o: &Open) -> Element<'a, Message> {
     let secs = app.timer(&o.thread);
     let label = TIMERS.iter().find(|(s, _)| *s == secs).map_or_else(|| short_duration(secs.into()), |(_, l)| l.to_string());
-    let label = text(format!("⏱ {label}")).size(13);
-    if app.can_set_timer() {
-        button(label).on_press(Message::ToggleTimerMenu).style(button::text).into()
-    } else {
-        label.style(|t: &Theme| text::Style { color: Some(muted(t)) }).into()
-    }
+    let label = row![icon(icons::TIMER, 18), text(label).size(13)].spacing(6).align_y(Alignment::Center);
+    let b = button(label).padding([8, 10]).style(|t: &Theme, status| button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| surface(t).into()),
+        text_color: t.palette().text,
+        border: Border { radius: 18.0.into(), ..Default::default() },
+        ..Default::default()
+    });
+    tip(b.on_press_maybe(app.can_set_timer().then_some(Message::ToggleTimerMenu)), "Disappearing messages", tooltip::Position::Bottom)
 }
 
 fn muted_text<'a>(s: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
@@ -805,84 +934,192 @@ fn group_panel<'a>(app: &'a App, o: &'a Open, p: &'a crate::app::GroupPanel) -> 
     scrollable(col).height(Length::Fill).into()
 }
 
-/// Profile, appearance, notifications and linked devices.
-fn settings<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, Message> {
-    use crate::state::ThemeChoice;
-    let bold = Font { weight: Weight::Bold, ..Font::DEFAULT };
-    let heading = |t: &'static str| text(t).size(16).font(bold);
+const SECTIONS: [(SettingsSection, &str, &str); 5] = [
+    (SettingsSection::Profile, icons::USER, "Profile"),
+    (SettingsSection::Themes, icons::PALETTE, "Themes"),
+    (SettingsSection::Notifications, icons::BELL, "Notifications"),
+    (SettingsSection::Devices, icons::DEVICES, "Linked devices"),
+    (SettingsSection::About, icons::ABOUT, "About"),
+];
+
+/// The settings' page list, in the chat list's place (as in Signal-Desktop).
+fn settings_nav<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, Message> {
     let p = &s.profile;
-    let edit = |f: fn(&mut crate::backend::OwnProfile, String)| {
-        move |v: String| {
-            let mut p = p.clone();
-            f(&mut p, v);
-            Message::EditProfile(p)
-        }
-    };
-    let mut col = Column::new().spacing(10).padding([16, 24]).max_width(560);
-    col = col.push(row![
-        text("Settings").size(20).font(bold).width(Length::Fill),
-        button(text("Close")).on_press(Message::ToggleSettings).style(button::text),
-    ].align_y(Alignment::Center));
-
-    col = col.push(heading("Profile"));
-    col = col.push(row![
-        avatar(app, &p.given, &app.me.to_string(), 56.0),
-        column![
-            text(if app.phone.is_empty() { "…".to_string() } else { app.phone.clone() }),
-            muted_text(format!("ACI {}", app.me)),
-        ].spacing(2),
-    ].spacing(12).align_y(Alignment::Center));
-    col = col.push(row![
-        text_input("First name (required)", &p.given).id("profile-given").on_input(edit(|p, v| p.given = v)).padding(8),
-        text_input("Last name", &p.family).on_input(edit(|p, v| p.family = v)).padding(8),
-    ].spacing(8));
-    col = col.push(row![
-        text_input("😀", &p.emoji).on_input(edit(|p, v| p.emoji = v)).padding(8).width(64),
-        text_input("About", &p.about).on_input(edit(|p, v| p.about = v)).padding(8),
-    ].spacing(8));
-    col = col.push(row![
-        button(text("Save profile")).on_press_maybe(app.can_save_profile(p).then_some(Message::SaveProfile)).style(button::primary),
-        muted_text("Change your photo on your phone: signal-rusted can't upload one yet."),
-    ].spacing(12).align_y(Alignment::Center));
-
-    col = col.push(heading("Appearance"));
-    let theme = [(ThemeChoice::System, "System"), (ThemeChoice::Light, "Light"), (ThemeChoice::Dark, "Dark")]
-        .into_iter()
-        .fold(row![].spacing(6), |r, (choice, label)| {
-            let style = if app.settings.theme == choice { button::primary } else { button::secondary };
-            r.push(button(text(label)).on_press(Message::SetTheme(choice)).style(style))
-        });
-    col = col.push(theme);
-
-    col = col.push(heading("Notifications"));
-    col = col.push(checkbox(app.settings.notifications).label("Show notifications").on_toggle(Message::SetNotifications));
-    let text_toggle = checkbox(app.settings.notification_text).label("Show message text in notifications");
-    col = col.push(if app.settings.notifications { text_toggle.on_toggle(Message::SetNotificationText) } else { text_toggle });
-
-    col = col.push(heading("Linked devices"));
-    if app.devices.is_empty() {
-        col = col.push(muted_text("Loading…"));
+    let name = format!("{} {}", p.given, p.family).trim().to_owned();
+    let card = row![
+        avatar(app, &p.given, &app.me.to_string(), 48.0),
+        column![text(if name.is_empty() { "Your profile".into() } else { name }).font(BOLD), muted_text(app.phone.clone())].spacing(2),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    let mut col = column![
+        container(text("Settings").size(22).font(BOLD)).padding(iced::Padding { top: 14.0, right: 12.0, bottom: 4.0, left: 18.0 }),
+        container(button(card).width(Length::Fill).padding([10, 10]).on_press(Message::SettingsSection(SettingsSection::Profile)).style(button::text)).padding([0, 8]),
+    ]
+    .spacing(6);
+    for (section, src, label) in SECTIONS {
+        let selected = s.section == section;
+        let item = button(row![icon(src, 20), text(label)].spacing(14).align_y(Alignment::Center))
+            .width(Length::Fill)
+            .padding([10, 12])
+            .on_press(Message::SettingsSection(section))
+            .style(move |t: &Theme, status| button::Style {
+                background: (selected || matches!(status, button::Status::Hovered))
+                    .then(|| surface(t).scale_alpha(if selected { 1.0 } else { 0.5 }).into()),
+                text_color: t.palette().text,
+                border: Border { radius: 10.0.into(), ..Default::default() },
+                ..Default::default()
+            });
+        col = col.push(container(item).padding([0, 8]));
     }
-    for d in &app.devices {
-        let mut r = row![text(d.name.clone()).width(Length::Fill)].spacing(8).align_y(Alignment::Center);
-        if d.this {
-            r = r.push(badge("This device"));
-        }
-        col = col.push(r);
-    }
-    col = col.push(if s.confirm_unlink {
-        Element::from(column![
-            text("Unlink this device? It stops receiving messages, and all its local data (messages, attachments, keys) is deleted.")
-                .style(text::danger),
-            row![
-                button(text("Cancel")).on_press(Message::AskUnlink(false)).style(button::secondary),
-                button(text("Unlink and delete data")).on_press(Message::ConfirmUnlink).style(button::danger),
-            ].spacing(8),
-        ].spacing(8))
-    } else {
-        button(text("Unlink this device")).on_press(Message::AskUnlink(true)).style(button::danger).into()
+    scrollable(col).height(Length::Fill).width(340).into()
+}
+
+/// A titled group of settings rows on a raised card.
+fn settings_card<'a>(title: &'static str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    column![
+        text(title).size(13).font(BOLD).style(|t: &Theme| text::Style { color: Some(muted(t)) }),
+        container(body).padding(16).width(Length::Fill).style(|t: &Theme| container::Style {
+            background: Some(rail(t).into()),
+            border: Border { radius: 12.0.into(), width: 1.0, color: surface(t) },
+            ..Default::default()
+        }),
+    ]
+    .spacing(8)
+    .into()
+}
+
+/// One theme as a little chat preview: an incoming and an outgoing bubble on its background.
+fn theme_card<'a>(app: &App, choice: ThemeChoice, label: &'static str) -> Element<'a, Message> {
+    let dark = crate::state::Settings { theme: choice, ..app.settings.clone() }.dark(app.system_dark);
+    let preview = app_theme(choice, dark);
+    let (p, incoming) = (preview.palette(), surface(&preview));
+    let selected = app.settings.theme == choice;
+    let bar = |w: f32, c: Color| container(Space::new()).width(w).height(14).style(move |_| container::Style {
+        background: Some(c.into()),
+        border: Border { radius: 7.0.into(), ..Default::default() },
+        ..Default::default()
     });
-    scrollable(col).height(Length::Fill).into()
+    let chat = column![
+        bar(78.0, incoming),
+        container(bar(64.0, p.primary)).align_right(Length::Fill),
+        bar(52.0, incoming),
+    ]
+    .spacing(7);
+    let swatch = container(chat).padding(12).width(150).height(90).style(move |t: &Theme| container::Style {
+        background: Some(p.background.into()),
+        border: Border { radius: 12.0.into(), width: if selected { 3.0 } else { 1.0 }, color: if selected { accent(t) } else { surface(t) } },
+        ..Default::default()
+    });
+    let mut caption = row![text(label).size(14)].spacing(6).align_y(Alignment::Center);
+    if selected {
+        caption = caption.push(icon(icons::CHECK, 16).style(|t: &Theme, _| svg::Style { color: Some(accent(t)) }));
+    }
+    button(column![swatch, caption].spacing(8).align_x(Alignment::Center))
+        .padding(4)
+        .on_press(Message::SetTheme(choice))
+        .style(button::text)
+        .into()
+}
+
+/// The selected settings page: profile, themes, notifications, linked devices or about.
+fn settings<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, Message> {
+    let title = SECTIONS.iter().find(|(sec, ..)| *sec == s.section).map_or("Settings", |(_, _, l)| l);
+    let mut col = Column::new().spacing(20).padding([24, 32]).max_width(640);
+    col = col.push(text(title).size(22).font(BOLD));
+    match s.section {
+        SettingsSection::Profile => {
+            let p = &s.profile;
+            let edit = |f: fn(&mut crate::backend::OwnProfile, String)| {
+                move |v: String| {
+                    let mut p = p.clone();
+                    f(&mut p, v);
+                    Message::EditProfile(p)
+                }
+            };
+            col = col.push(
+                column![
+                    avatar(app, &p.given, &app.me.to_string(), 88.0),
+                    text(if app.phone.is_empty() { "…".to_string() } else { app.phone.clone() }).size(16),
+                    muted_text(format!("ACI {}", app.me)).size(12),
+                ]
+                .spacing(6)
+                .align_x(Alignment::Center)
+                .width(Length::Fill),
+            );
+            let form = column![
+                row![
+                    text_input("First name (required)", &p.given).id("profile-given").on_input(edit(|p, v| p.given = v)).padding(10),
+                    text_input("Last name", &p.family).on_input(edit(|p, v| p.family = v)).padding(10),
+                ]
+                .spacing(8),
+                row![
+                    text_input("😀", &p.emoji).on_input(edit(|p, v| p.emoji = v)).padding(10).width(64),
+                    text_input("About", &p.about).on_input(edit(|p, v| p.about = v)).padding(10),
+                ]
+                .spacing(8),
+                button(text("Save profile")).padding([8, 16]).on_press_maybe(app.can_save_profile(p).then_some(Message::SaveProfile)).style(button::primary),
+                muted_text("Change your photo on your phone: signal-rusted can't upload one yet."),
+            ]
+            .spacing(12);
+            col = col.push(settings_card("Name and about", form));
+        }
+        SettingsSection::Themes => {
+            let cards = THEMES.iter().fold(row![].spacing(12), |r, &(choice, label)| r.push(theme_card(app, choice, label)));
+            col = col.push(settings_card("Theme", cards.wrap().vertical_spacing(12)));
+            col = col.push(muted_text("System follows your desktop's light or dark mode. The others always look the same."));
+        }
+        SettingsSection::Notifications => {
+            let text_toggle = checkbox(app.settings.notification_text).label("Show message text in notifications");
+            let body = column![
+                checkbox(app.settings.notifications).label("Show notifications").on_toggle(Message::SetNotifications),
+                if app.settings.notifications { text_toggle.on_toggle(Message::SetNotificationText) } else { text_toggle },
+            ]
+            .spacing(14);
+            col = col.push(settings_card("Notifications", body));
+        }
+        SettingsSection::Devices => {
+            let mut list = Column::new().spacing(12);
+            if app.devices.is_empty() {
+                list = list.push(muted_text("Loading…"));
+            }
+            for d in &app.devices {
+                let mut r = row![icon(icons::DEVICES, 20), text(d.name.clone()).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
+                if d.this {
+                    r = r.push(badge("This device"));
+                }
+                list = list.push(r);
+            }
+            col = col.push(settings_card("Devices", list));
+            col = col.push(if s.confirm_unlink {
+                Element::from(column![
+                    text("Unlink this device? It stops receiving messages, and all its local data (messages, attachments, keys) is deleted.")
+                        .style(text::danger),
+                    row![
+                        button(text("Cancel")).on_press(Message::AskUnlink(false)).style(button::secondary),
+                        button(text("Unlink and delete data")).on_press(Message::ConfirmUnlink).style(button::danger),
+                    ].spacing(8),
+                ].spacing(8))
+            } else {
+                button(text("Unlink this device")).on_press(Message::AskUnlink(true)).style(button::danger).into()
+            });
+        }
+        SettingsSection::About => {
+            col = col.push(
+                column![
+                    logo(128.0),
+                    text("signal-rusted").size(24).font(BOLD),
+                    muted_text(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                    text("A native Signal desktop client written in Rust.").align_x(Alignment::Center),
+                    muted_text("Unofficial: not affiliated with or endorsed by Signal Messenger, LLC. AGPL-3.0-only."),
+                ]
+                .spacing(10)
+                .align_x(Alignment::Center)
+                .width(Length::Fill),
+            );
+        }
+    }
+    scrollable(col).height(Length::Fill).width(Length::Fill).into()
 }
 
 /// "New group": name it and pick members from contacts.
@@ -980,13 +1217,130 @@ fn spans<'a>(
         .collect()
 }
 
-fn delivery_mark(d: Delivery) -> &'static str {
-    match d {
-        Delivery::Failed => "⚠ Not sent",
-        Delivery::Sending => "◷",
-        Delivery::Sent => "✓",
-        Delivery::Delivered | Delivery::Read => "✓✓",
+/// Signal's receipt marks: dashed ring, ringed check, two rings, two filled rings.
+fn delivery_mark<'a>(d: Delivery, color: Color) -> Element<'a, Message> {
+    let (src, id) = match d {
+        Delivery::Failed => return text("⚠ Not sent").size(11).color(color).into(),
+        Delivery::Sending => (icons::SENDING, "receipt-sending"),
+        Delivery::Sent => (icons::SENT, "receipt-sent"),
+        Delivery::Delivered => (icons::DELIVERED, "receipt-delivered"),
+        Delivery::Read => (icons::READ, "receipt-read"),
+    };
+    container(tinted(src, 15, color)).id(id).into()
+}
+
+/// A bubble's diagonal sheen: lighter top-left, deeper bottom-right.
+fn bubble_fill(c: Color) -> Background {
+    // Pale fills (light-theme incoming) only get a faint shade, or they look dirty.
+    let (light, dark) = if c.r + c.g + c.b > 2.4 { (0.0, 0.05) } else { (0.12, 0.12) };
+    let linear = iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_4 * 3.0))
+        .add_stop(0.0, mix(c, Color::WHITE, light))
+        .add_stop(1.0, mix(c, Color::BLACK, dark));
+    Background::Gradient(linear.into())
+}
+
+/// A round button that stands out on either bubble: accent on grey, white on accent.
+/// `label` is its widget id (for tests).
+fn bubble_button<'a>(src: &'static str, label: &'static str, press: Option<Message>, on_accent: bool) -> Element<'a, Message> {
+    let b = button(container(icon(src, 18).style(move |t: &Theme, _| svg::Style { color: Some(if on_accent { accent(t) } else { Color::WHITE }) })).center(18))
+        .padding(9)
+        .on_press_maybe(press)
+        .style(move |t: &Theme, status| {
+            let base = if on_accent { Color::WHITE } else { accent(t) };
+            let bg = match status {
+                button::Status::Hovered => mix(base, Color::BLACK, 0.1),
+                button::Status::Disabled => base.scale_alpha(0.5),
+                _ => base,
+            };
+            button::Style { background: Some(bg.into()), border: Border { radius: 18.0.into(), ..Default::default() }, ..Default::default() }
+        });
+    container(b).id(label).into()
+}
+
+/// The badge text and color of a file's icon: its extension, colored by kind (Word blue,
+/// Excel green, PowerPoint orange, PDF red…); the MIME type covers names without one.
+pub fn file_kind(name: Option<&str>, content_type: Option<&str>) -> (String, Color) {
+    let ext = name.and_then(|n| n.rsplit_once('.')).map(|(_, e)| e.to_ascii_lowercase()).filter(|e| !e.is_empty() && e.len() <= 8);
+    let ct = content_type.unwrap_or("");
+    let has = |words: &[&str]| words.iter().any(|w| ct.contains(w));
+    let color = match ext.as_deref().unwrap_or("") {
+        "pdf" => color!(0xe5484d),
+        "doc" | "docx" | "odt" | "rtf" | "pages" => color!(0x2b6be5),
+        "xls" | "xlsx" | "ods" | "csv" | "tsv" | "numbers" => color!(0x1f9d55),
+        "ppt" | "pptx" | "odp" | "key" => color!(0xe8710a),
+        "zip" | "rar" | "7z" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" => color!(0xc08a00),
+        "mp3" | "wav" | "ogg" | "m4a" | "flac" | "aac" | "opus" => color!(0x8e4ec6),
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" => color!(0xd6409f),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "svg" | "bmp" | "tiff" => color!(0x12a594),
+        "rs" | "py" | "js" | "ts" | "json" | "html" | "css" | "c" | "cpp" | "h" | "java" | "go" | "sh" | "toml" | "yaml" | "yml" | "xml" => {
+            color!(0x5b5bd6)
+        }
+        "exe" | "msi" | "apk" | "dmg" | "deb" | "rpm" | "appimage" => color!(0x4b4f58),
+        _ if ct == "application/pdf" => color!(0xe5484d),
+        _ if has(&["msword", "wordprocessing"]) => color!(0x2b6be5),
+        _ if has(&["excel", "spreadsheet"]) => color!(0x1f9d55),
+        _ if has(&["powerpoint", "presentation"]) => color!(0xe8710a),
+        _ if has(&["zip", "compressed", "x-tar"]) => color!(0xc08a00),
+        _ if ct.starts_with("audio/") => color!(0x8e4ec6),
+        _ if ct.starts_with("video/") => color!(0xd6409f),
+        _ if ct.starts_with("image/") => color!(0x12a594),
+        _ => color!(0x8b8d98),
+    };
+    let badge = ext.map_or_else(
+        || ct.split_once('/').map(|(_, sub)| sub.rsplit(['.', '-', '+']).next().unwrap_or(sub)).filter(|s| s.len() <= 4 && !s.is_empty()).unwrap_or("file").to_owned(),
+        |e| e.chars().take(4).collect(),
+    );
+    (badge.to_uppercase(), color)
+}
+
+/// "820 B", "14 KB", "3.2 MB".
+fn file_size(bytes: u32) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} B"),
+        b if b < 1024 * 1024 => format!("{} KB", b.div_ceil(1024)),
+        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
     }
+}
+
+/// A file attachment as Signal shows it: a colored page with the extension, the name, its
+/// size, and a round download / save / retry button.
+fn file_card<'a>(app: &'a App, a: &AttachmentPointer, key: String, fg: Color) -> Element<'a, Message> {
+    let ct = a.content_type.as_deref();
+    let (badge, color) = file_kind(a.file_name.as_deref(), ct);
+    let page = stack![
+        tinted(icons::DOCUMENT, 40, color),
+        container(text(badge.clone()).size(if badge.len() > 3 { 8 } else { 10 }).font(BOLD).color(Color::WHITE)).center_x(40).padding(iced::Padding { top: 20.0, ..Default::default() }),
+    ];
+    let tile = container(page).center(52).style(|t: &Theme| container::Style {
+        background: Some(t.palette().background.into()),
+        border: Border { radius: 12.0.into(), ..Default::default() },
+        ..Default::default()
+    });
+    let fallback = match ct.unwrap_or("") {
+        c if c.starts_with("image/") => "Photo",
+        c if c.starts_with("video/") => "Video",
+        _ => "File",
+    };
+    let name = a.file_name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| fallback.into());
+    let size = a.size.filter(|s| *s > 0).map(file_size);
+    let on_accent = fg == Color::WHITE;
+    let (detail, action) = match app.attachments.get(&key) {
+        Some(Attach::Ready(_)) => (size, Some(bubble_button(icons::SAVE, "Save", Some(Message::SaveAttachment(key)), on_accent))),
+        Some(Attach::Loading) => (Some("Downloading…".into()), Some(bubble_button(icons::SENDING, "Downloading", None, on_accent))),
+        Some(Attach::Failed(e)) => (Some(format!("Download failed: {e}")), Some(bubble_button(icons::RETRY, "Retry", Some(Message::FetchAttachment(key)), on_accent))),
+        // Our own just-sent attachment, not uploaded yet.
+        None if a.cdn_number.is_none() && a.attachment_identifier.is_none() => (size, None),
+        None => (size, Some(bubble_button(icons::DOWNLOAD, "Download", Some(Message::FetchAttachment(key)), on_accent))),
+    };
+    let mut info = column![text(name).font(BOLD).color(fg).wrapping(text::Wrapping::WordOrGlyph)].spacing(2).width(Length::Fill);
+    if let Some(d) = detail {
+        info = info.push(text(d).size(12).color(Color { a: 0.75, ..fg }));
+    }
+    let mut r = row![tile, info].spacing(12).align_y(Alignment::Center).width(300);
+    if let Some(b) = action {
+        r = r.push(b);
+    }
+    r.into()
 }
 
 /// Inline player: play/pause, progress and time; the first press downloads.
@@ -995,12 +1349,13 @@ fn audio_player<'a>(app: &'a App, a: &AttachmentPointer, key: String, fg: Color)
     let total = app.durations.get(&key).copied();
     let playing = app.playback.as_ref().filter(|p| p.key == key);
     let pos = playing.map(|p| p.position(now)).unwrap_or_default();
-    let (icon, press) = match app.attachments.get(&key) {
-        Some(Attach::Loading) => ("…", None),
-        _ if a.cdn_number.is_none() && a.attachment_identifier.is_none() && !app.attachments.contains_key(&key) => ("▶", None),
-        _ if playing.is_some_and(|p| !p.is_paused()) => ("⏸", Some(Message::PlayPause(key.clone()))),
-        _ => ("▶", Some(Message::PlayPause(key.clone()))),
+    let (src, label, press) = match app.attachments.get(&key) {
+        Some(Attach::Loading) => (icons::SENDING, "Downloading", None),
+        _ if a.cdn_number.is_none() && a.attachment_identifier.is_none() && !app.attachments.contains_key(&key) => (icons::PLAY, "Play", None),
+        _ if playing.is_some_and(|p| !p.is_paused()) => (icons::PAUSE, "Pause", Some(Message::PlayPause(key.clone()))),
+        _ => (icons::PLAY, "Play", Some(Message::PlayPause(key.clone()))),
     };
+    let on_accent = fg == Color::WHITE;
     let time = match (playing, total) {
         (Some(_), Some(t)) => format!("{} / {}", crate::audio::mmss(pos.min(t)), crate::audio::mmss(t)),
         (Some(_), None) => crate::audio::mmss(pos),
@@ -1012,8 +1367,12 @@ fn audio_player<'a>(app: &'a App, a: &AttachmentPointer, key: String, fg: Color)
         _ => 0.0,
     };
     let mut r = row![
-        button(text(icon).size(16)).on_press_maybe(press).style(button::secondary),
-        progress_bar(0.0..=1.0, frac).length(140).girth(4),
+        bubble_button(src, label, press, on_accent),
+        progress_bar(0.0..=1.0, frac).length(140).girth(4).style(move |t: &Theme| progress_bar::Style {
+            background: Color { a: 0.3, ..fg }.into(),
+            bar: (if on_accent { Color::WHITE } else { accent(t) }).into(),
+            border: Border { radius: 2.0.into(), ..Default::default() },
+        }),
         text(time).size(12).color(fg),
     ]
     .spacing(8)
@@ -1036,31 +1395,7 @@ fn attachment<'a>(app: &'a App, a: &AttachmentPointer, fg: Color) -> Element<'a,
     let is_image = a.content_type.as_deref().is_some_and(|c| c.starts_with("image/"));
     match app.attachments.get(&key) {
         Some(Attach::Ready(path)) if is_image => clickable_image(key, path, Length::Shrink, ContentFit::Contain),
-        Some(Attach::Ready(_)) => row![
-            text(attachment_label(a)).color(fg),
-            button(text("Save…")).on_press(Message::SaveAttachment(key)).style(button::secondary),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .into(),
-        Some(Attach::Loading) => text(format!("{} — downloading…", attachment_label(a))).color(fg).into(),
-        Some(Attach::Failed(e)) => column![
-            text(attachment_label(a)).color(fg),
-            text(format!("Download failed: {e}")).size(12).color(fg),
-            button(text("Retry")).on_press(Message::FetchAttachment(key)).style(button::secondary),
-        ]
-        .into(),
-        None if a.cdn_number.is_none() && a.attachment_identifier.is_none() => {
-            // Our own just-sent attachment, not uploaded yet.
-            text(attachment_label(a)).color(fg).into()
-        }
-        None => row![
-            text(attachment_label(a)).color(fg),
-            button(text("Download")).on_press(Message::FetchAttachment(key)).style(button::secondary),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .into(),
+        _ => file_card(app, a, key, fg),
     }
 }
 
@@ -1101,7 +1436,8 @@ const THUMB: f32 = 200.0;
 
 /// An inline image that opens the viewer; its container id lets tests click it.
 fn clickable_image<'a>(key: String, path: &std::path::Path, size: Length, fit: ContentFit) -> Element<'a, Message> {
-    mouse_area(container(image(image::Handle::from_path(path)).width(size).height(size).content_fit(fit)).id(format!("image:{key}")))
+    let img = image(image::Handle::from_path(path)).width(size).height(size).content_fit(fit).border_radius(14);
+    mouse_area(container(img).id(format!("image:{key}")))
         .on_press(Message::ViewImage(key))
         .interaction(mouse::Interaction::Pointer)
         .into()
@@ -1202,8 +1538,16 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
     }
     let key = (m.author, m.id);
     let is_sticker = m.sticker.is_some() && !m.deleted;
-    // Stickers have no bubble, so their footer sits on the timeline background.
-    let fg = if m.outgoing && !is_sticker { Color::WHITE } else { app.theme().palette().text };
+    let images_only = !m.deleted
+        && m.body.is_empty()
+        && m.quote.is_none()
+        && m.story_reply.is_none()
+        && m.previews.is_empty()
+        && !m.attachments.is_empty()
+        && m.attachments.iter().all(is_image);
+    // Stickers and bare photos have no bubble, so their footer sits on the timeline background.
+    let bare = is_sticker || images_only;
+    let fg = if m.outgoing && !bare { Color::WHITE } else { app.theme().palette().text };
     let mut bubble = Column::new().spacing(4);
     if show_author {
         bubble = bubble.push(text(display_name(&app.names, m.author)).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).color(color!(0x7aa5f7)));
@@ -1273,19 +1617,12 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
         footer = footer.push(text("⏳").size(11).color(Color { a: 0.7, ..fg })); // starts when read
     }
     if m.outgoing {
-        let mark_color = if m.delivery == Delivery::Read { color!(0xa8d0ff) } else { Color { a: 0.8, ..fg } };
-        footer = footer.push(text(delivery_mark(m.delivery)).size(11).color(mark_color));
+        footer = footer.push(delivery_mark(m.delivery, Color { a: 0.85, ..fg }));
     }
     bubble = bubble.push(footer);
 
-    let bubble = container(bubble).padding([8, 12]).max_width(520).style(move |t: &Theme| container::Style {
-        background: if is_sticker {
-            None
-        } else if m.outgoing {
-            Some(Background::Color(BLUE))
-        } else {
-            Some(surface(t).into())
-        },
+    let bubble = container(bubble).padding(if images_only { [2, 4] } else { [8, 12] }).max_width(520).style(move |t: &Theme| container::Style {
+        background: (!bare).then(|| bubble_fill(if m.outgoing { accent(t) } else { surface(t) })),
         border: Border { radius: 18.0.into(), ..Default::default() },
         ..Default::default()
     });
@@ -1294,13 +1631,13 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
     let hovered = o.hovered == Some(key) || o.reacting == Some(key) || o.deleting == Some(key);
     let actions: Element<_> = if hovered && !m.deleted {
         let mut r = row![
-            button(text("☺").size(16)).on_press(Message::ToggleReactions(Some(key))).style(button::text),
-            button(text("↩").size(16)).on_press(Message::Reply(m.author, m.id)).style(button::text),
+            icon_button(icons::SMILE, "React", Some(Message::ToggleReactions(Some(key)))),
+            icon_button(icons::REPLY, "Reply", Some(Message::Reply(m.author, m.id))),
         ];
         if m.can_edit(now) {
-            r = r.push(button(text("✎").size(16)).on_press(Message::Edit(m.id)).style(button::text));
+            r = r.push(icon_button(icons::EDIT, "Edit", Some(Message::Edit(m.id))));
         }
-        r.push(button(text("🗑").size(16)).on_press(Message::ToggleDelete(Some(key))).style(button::text)).into()
+        r.push(icon_button(icons::TRASH, "Delete", Some(Message::ToggleDelete(Some(key))))).into()
     } else {
         Space::new().width(72).into()
     };
@@ -1340,7 +1677,7 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
         let pills = counts.into_iter().fold(row![].spacing(4), |r, (e, (n, mine))| {
             let label = if n > 1 { format!("{e} {n}") } else { e.to_owned() };
             r.push(button(text(label).size(14)).padding([2, 8]).on_press(Message::React(m.author, m.id, e.to_owned())).style(move |t: &Theme, _| button::Style {
-                background: Some(if mine { BLUE.scale_alpha(0.35).into() } else { surface(t).into() }),
+                background: Some(if mine { accent(t).scale_alpha(0.35).into() } else { surface(t).into() }),
                 text_color: t.palette().text,
                 border: Border { radius: 12.0.into(), width: 1.0, color: t.palette().background },
                 ..Default::default()
@@ -1368,7 +1705,7 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         col = col.push(
             container(row![
                 column![text(format!("Replying to {who}")).size(12).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), text(truncate(&q.text, 90)).size(13)].width(Length::Fill),
-                button(text("✕")).on_press(Message::CancelReply).style(button::text),
+                icon_button(icons::CLOSE, "Cancel reply", Some(Message::CancelReply)),
             ])
             .padding([4, 10])
             .style(|t: &Theme| container::Style {
@@ -1383,7 +1720,7 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         col = col.push(
             container(row![
                 column![text("Editing message").size(12).font(Font { weight: Weight::Bold, ..Font::DEFAULT }), text(truncate(&original, 90)).size(13)].width(Length::Fill),
-                button(text("✕")).on_press(Message::CancelEdit).style(button::text),
+                icon_button(icons::CLOSE, "Cancel edit", Some(Message::CancelEdit)),
             ])
             .padding([4, 10])
             .style(|t: &Theme| container::Style {
@@ -1443,7 +1780,7 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     }
     let editor = text_editor(&o.composer)
         .id(COMPOSER)
-        .placeholder("Message  (*bold* _italic_ ~strike~ `mono` ||spoiler|| :emoji:)")
+        .placeholder("Message")
         .on_action(Message::Compose)
         .key_binding(|kp: KeyPress| {
             let enter = matches!(kp.key, keyboard::Key::Named(key::Named::Enter));
@@ -1453,21 +1790,34 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
                 Binding::from_key_press(kp)
             }
         })
-        .padding(10)
-        .height(Length::Shrink);
+        .padding([10, 16])
+        .height(Length::Shrink)
+        .style(|t: &Theme, st| text_editor::Style {
+            background: pill(t),
+            border: Border { radius: 20.0.into(), ..Default::default() },
+            ..text_editor::default(t, st)
+        });
+    let action: Element<_> = if draft.trim().is_empty() && o.files.is_empty() {
+        icon_button(icons::MIC, "Voice note", Some(Message::Record))
+    } else {
+        let send = button(container(tinted(icons::SEND, 18, Color::WHITE)).center(20)).padding(9).on_press(Message::Send).style(|t: &Theme, status| {
+            button::Style {
+                background: Some(if matches!(status, button::Status::Hovered) { mix(accent(t), Color::BLACK, 0.1) } else { accent(t) }.into()),
+                border: Border { radius: 20.0.into(), ..Default::default() },
+                ..Default::default()
+            }
+        });
+        tip(container(send).id("Send"), "Send", tooltip::Position::Top)
+    };
     col.push(
         row![
-            button(text("📎").size(18)).on_press(Message::Attach).style(button::text),
-            button(text("😀").size(18)).on_press(Message::TogglePicker).style(button::text),
-            button(text("🗒").size(18)).on_press(Message::ToggleStickers).style(button::text),
+            icon_button(icons::SMILE, "Emoji", Some(Message::TogglePicker)),
             container(editor).max_height(180).width(Length::Fill),
-            if draft.trim().is_empty() && o.files.is_empty() {
-                button(text("🎤").size(18)).on_press(Message::Record).style(button::text)
-            } else {
-                button(text("Send")).on_press(Message::Send)
-            },
+            icon_button(icons::STICKER, "Stickers", Some(Message::ToggleStickers)),
+            icon_button(icons::ATTACH, "Attach file", Some(Message::Attach)),
+            action,
         ]
-        .spacing(6)
+        .spacing(4)
         .align_y(Alignment::Center),
     )
     .into()
@@ -1591,7 +1941,7 @@ mod tests {
     #[test]
     fn qr_is_dark_on_light_in_every_theme() {
         for dark in [true, false] {
-            let s = qr_style(&signal_theme(dark));
+            let s = qr_style(&app_theme(ThemeChoice::System, dark));
             assert_eq!((s.cell, s.background), (Color::BLACK, Color::WHITE));
         }
     }
@@ -1634,6 +1984,67 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
         let snap = ui.snapshot(&app.theme()).expect("render");
         assert!(snap.matches_image(dir.join("long-thread")).expect("write png"));
+    }
+
+    /// Writes `snapshots/files-*.png`: file cards in each state, incoming and outgoing.
+    #[test]
+    fn files_snapshot() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let file = |digest: u8, name: &str, ct: &str, size: u32| presage::proto::AttachmentPointer {
+            content_type: Some(ct.into()),
+            digest: Some(vec![digest]),
+            cdn_number: Some(3),
+            size: Some(size),
+            file_name: Some(name.into()),
+            ..Default::default()
+        };
+        let files = [
+            (uuid(2), file(0xc1, "Quarterly report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", 48_213)),
+            (uuid(2), file(0xc2, "Launch deck.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation", 3_355_443)),
+            (app.me, file(0xc3, "contributos.txt", "text/plain", 820)),
+            (uuid(2), file(0xc4, "invoice.pdf", "application/pdf", 120_000)),
+            (app.me, file(0xc5, "budget.xlsx", "application/vnd.ms-excel", 22_000)),
+            (uuid(2), file(0xc6, "photos.zip", "application/zip", 9_000_000)),
+        ];
+        let mut keys = vec![];
+        for (i, (who, a)) in files.into_iter().enumerate() {
+            keys.push(attachment_key(&a));
+            let ts = 100 + i as u64;
+            let dm = presage::proto::DataMessage { timestamp: Some(ts), attachments: vec![a], ..Default::default() };
+            app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(who, ts, dm)) }));
+        }
+        app.attachments.insert(keys[1].clone(), Attach::Ready("/nonexistent/deck.pptx".into()));
+        app.attachments.insert(keys[3].clone(), Attach::Loading);
+        app.attachments.insert(keys[5].clone(), Attach::Failed("timed out".into()));
+        app.attachments.remove(&keys[0]);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for theme in [ThemeChoice::Light, ThemeChoice::Rusted] {
+            app.update(Message::SetTheme(theme));
+            let name = format!("files-{theme:?}").to_lowercase();
+            for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if f.file_name().to_string_lossy().starts_with(&name) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+            let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+            let snap = ui.snapshot(&app.theme()).expect("render");
+            assert!(snap.matches_image(dir.join(name)).expect("write png"));
+        }
+        assert!(simulator(view(&app)).find(iced::widget::Id::new("Retry")).is_ok(), "failed download offers a retry");
+    }
+
+    #[test]
+    fn file_icons_follow_the_file_type() {
+        assert_eq!(file_kind(Some("Report.DOCX"), None), ("DOCX".into(), color!(0x2b6be5)));
+        assert_eq!(file_kind(Some("deck.pptx"), None).1, color!(0xe8710a));
+        assert_eq!(file_kind(Some("budget.xlsx"), None).1, color!(0x1f9d55));
+        assert_eq!(file_kind(Some("scan.pdf"), Some("application/pdf")).0, "PDF");
+        assert_eq!(file_kind(None, Some("application/pdf")), ("PDF".into(), color!(0xe5484d)));
+        assert_eq!(file_kind(Some("notes"), Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")).1, color!(0x2b6be5));
+        assert_eq!(file_kind(Some("contributos.txt"), Some("text/plain")).0, "TXT");
+        assert_eq!(file_kind(None, None).0, "FILE");
+        assert_eq!((file_size(820), file_size(14_000), file_size(3_355_443)), ("820 B".into(), "14 KB".into(), "3.2 MB".into()));
     }
 
     #[test]
@@ -1693,7 +2104,7 @@ mod tests {
         let mut ui = simulator(view(&app));
         assert!(ui.find("😂").is_ok(), "reaction pill");
         assert!(ui.find("👍🏽❤️").is_ok(), "jumbo emoji message");
-        assert!(ui.find("✓✓").is_ok(), "read receipt mark");
+        assert!(ui.find(iced::widget::Id::new("receipt-read")).is_ok(), "read receipt mark");
         assert!(ui.find(day_label(10).as_str()).is_ok(), "day separator");
     }
 
@@ -1719,9 +2130,13 @@ mod tests {
     #[test]
     fn snapshots() {
         let mut app = demo();
-        for dark in [true, false] {
+        for (dark, theme, name) in [
+            (true, ThemeChoice::System, "conversation-dark"),
+            (false, ThemeChoice::System, "conversation-light"),
+            (true, ThemeChoice::Rusted, "conversation-rusted"),
+        ] {
             app.dark = dark;
-            let name = if dark { "conversation-dark" } else { "conversation-light" };
+            app.settings.theme = theme;
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots").join(name);
             let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
             let snap = ui.snapshot(&app.theme()).expect("render");
@@ -1747,7 +2162,7 @@ mod tests {
         }
         assert_eq!(app.open.as_ref().unwrap().composer.text().trim(), "hello :wave:");
         let mut ui = simulator(view(&app));
-        ui.click("Send").expect("send button");
+        ui.click(iced::widget::Id::new("Send")).expect("send button");
         for m in ui.into_messages().collect::<Vec<_>>() {
             let _ = app.update(m);
         }
@@ -1766,16 +2181,29 @@ mod tests {
         }
     }
 
+    /// Clicks an icon button by its id (its tooltip label).
+    fn click_id(app: &mut App, id: &'static str) {
+        let mut ui = simulator(view(app));
+        ui.click(iced::widget::Id::new(id)).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        for m in ui.into_messages().collect::<Vec<_>>() {
+            let _ = app.update(m);
+        }
+    }
+
+    fn has_id(app: &App, id: &'static str) -> bool {
+        simulator(view(app)).find(iced::widget::Id::new(id)).is_ok()
+    }
+
     #[test]
     fn hover_edit_then_send_through_the_ui() {
         let (mut app, mut rx) = app();
         let id = crate::app::tests::with_own_message(&mut app, &mut rx, "*typo*");
         app.open.as_mut().unwrap().hovered = Some((uuid(1), id));
-        click(&mut app, "✎");
+        click_id(&mut app, "Edit");
         assert!(simulator(view(&app)).find("Editing message").is_ok(), "edit bar");
         assert_eq!(app.open.as_ref().unwrap().composer.text().trim_end(), "*typo*");
         app.update(Message::Compose(text_editor::Action::Edit(text_editor::Edit::Insert('!'))));
-        click(&mut app, "Send");
+        click_id(&mut app, "Send");
         let cmds: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             cmds.iter().any(|c| matches!(c, Command::Edit { target_ts, body, .. } if *target_ts == id && body == "typo!")),
@@ -1789,15 +2217,15 @@ mod tests {
         let (mut app, mut rx) = app();
         let id = crate::app::tests::with_own_message(&mut app, &mut rx, "oops");
         app.open.as_mut().unwrap().hovered = Some((uuid(1), id));
-        click(&mut app, "🗑");
+        click_id(&mut app, "Delete");
         click(&mut app, "Delete for everyone");
         assert!(matches!(rx.try_recv(), Ok(Command::DeleteForEveryone { target_ts, .. }) if target_ts == id));
         assert!(simulator(view(&app)).find("This message was deleted.").is_ok());
 
         // Alice's message: no edit, and only "Delete for me".
         app.open.as_mut().unwrap().hovered = Some((uuid(2), 10));
-        assert!(simulator(view(&app)).find("✎").is_err());
-        click(&mut app, "🗑");
+        assert!(!has_id(&app, "Edit"));
+        click_id(&mut app, "Delete");
         assert!(simulator(view(&app)).find("Delete for everyone").is_err());
         click(&mut app, "Delete for me");
         assert!(matches!(rx.try_recv(), Ok(Command::DeleteForMe { target_ts: 10, .. })));
@@ -1822,7 +2250,7 @@ mod tests {
         let (mut app, mut rx) = app();
         open_alice(&mut app, &mut rx);
         fake_packs(&mut app, vec![(vec![9], 3)]);
-        click(&mut app, "🗒");
+        click_id(&mut app, "Stickers");
         assert!(simulator(view(&app)).find("Recently used").is_ok(), "recents tab first");
         app.update(Message::StickerTab(StickerTab::Pack(vec![8])));
         let mut ui = simulator(view(&app));
@@ -1877,7 +2305,7 @@ mod tests {
         let key = voice_note(&mut app);
         let mut ui = simulator(view(&app));
         assert!(ui.find("--:--").is_ok(), "length unknown until downloaded");
-        ui.click("▶").expect("play button");
+        ui.click(iced::widget::Id::new("Play")).expect("play button");
         assert!(ui.into_messages().any(|m| matches!(m, Message::PlayPause(k) if k == key)));
 
         app.attachments.insert(key.clone(), Attach::Ready("/nonexistent/a0.m4a".into()));
@@ -1885,7 +2313,7 @@ mod tests {
         app.playback = Some(crate::audio::Playback::new(key, std::time::Instant::now()));
         let mut ui = simulator(view(&app));
         assert!(ui.find("0:00 / 1:15").is_ok(), "progress / length");
-        assert!(ui.find("⏸").is_ok(), "pause while playing");
+        assert!(ui.find(iced::widget::Id::new("Pause")).is_ok(), "pause while playing");
     }
 
     #[test]
@@ -1894,8 +2322,8 @@ mod tests {
         open_alice(&mut app, &mut rx);
         let audio = fake_audio(&mut app);
         let mut ui = simulator(view(&app));
-        assert!(ui.find("Send").is_err(), "empty composer shows the mic instead of Send");
-        ui.click("🎤").expect("mic button");
+        assert!(ui.find(iced::widget::Id::new("Send")).is_err(), "empty composer shows the mic instead of Send");
+        ui.click(iced::widget::Id::new("Voice note")).expect("mic button");
         for m in ui.into_messages().collect::<Vec<_>>() {
             let _ = app.update(m);
         }
@@ -1916,7 +2344,7 @@ mod tests {
             _ => None,
         });
         assert_eq!(sent, Some((true, 1)));
-        assert!(simulator(view(&app)).find("🎤").is_ok(), "back to the composer");
+        assert!(has_id(&app, "Voice note"), "back to the composer");
     }
 
     #[test]
@@ -1938,7 +2366,7 @@ mod tests {
         let (mut app, mut rx) = app();
         open_alice(&mut app, &mut rx);
         let mut ui = simulator(view(&app));
-        ui.click("⏱ Off").expect("timer control in header");
+        ui.click("Off").expect("timer control in header");
         for m in ui.into_messages().collect::<Vec<_>>() {
             let _ = app.update(m);
         }
@@ -1948,7 +2376,7 @@ mod tests {
             let _ = app.update(m);
         }
         assert!(matches!(rx.try_recv(), Ok(crate::backend::Command::SetTimer { seconds: 300, .. })));
-        assert!(simulator(view(&app)).find("⏱ 5m").is_ok(), "header shows the new timer");
+        assert!(simulator(view(&app)).find("5m").is_ok(), "header shows the new timer");
     }
 
     #[test]
@@ -1956,7 +2384,7 @@ mod tests {
         let (mut app, _rx) = app();
         app.update(Message::OpenThread(presage::store::Thread::Group([5; 32]), "Team".into(), true));
         let mut ui = simulator(view(&app));
-        ui.click("⏱ Off").expect("timer shown");
+        ui.click("Off").expect("timer shown");
         assert_eq!(ui.into_messages().count(), 0, "not clickable in groups");
     }
 
@@ -2018,23 +2446,23 @@ mod tests {
     #[test]
     fn row_menu_pins_mutes_archives_and_marks_unread() {
         let (mut app, mut rx) = app();
-        assert!(simulator(view(&app)).find("⋯").is_err(), "only on hover");
+        assert!(!has_id(&app, "Chat actions"), "only on hover");
         app.row_hovered = Some(alice());
-        click(&mut app, "⋯");
+        click_id(&mut app, "Chat actions");
         click(&mut app, "Pin");
         app.row_hovered = Some(alice());
-        click(&mut app, "⋯");
+        click_id(&mut app, "Chat actions");
         click(&mut app, "Mute");
         {
             let mut ui = simulator(view(&app));
-            assert!(ui.find("📌").is_ok() && ui.find("🔕").is_ok(), "pinned and muted marks");
+            assert!(ui.find(iced::widget::Id::new("pinned")).is_ok() && ui.find(iced::widget::Id::new("muted")).is_ok(), "pinned and muted marks");
         }
 
         app.conversations[0].unread = 0;
-        click(&mut app, "⋯");
+        click_id(&mut app, "Chat actions");
         click(&mut app, "Mark unread");
         assert!(app.conversations[0].marked_unread);
-        click(&mut app, "⋯");
+        click_id(&mut app, "Chat actions");
         assert!(simulator(view(&app)).find("Unpin").is_ok() && simulator(view(&app)).find("Mark read").is_ok());
         click(&mut app, "Archive");
         let mut ui = simulator(view(&app));
@@ -2044,7 +2472,7 @@ mod tests {
             let _ = app.update(m);
         }
         assert!(simulator(view(&app)).find("Alice").is_ok(), "listed under Archived");
-        click(&mut app, "← Archived chats");
+        click(&mut app, "Archived chats");
         assert!(!app.show_archived);
 
         let actions: Vec<ChatAction> = std::iter::from_fn(|| rx.try_recv().ok())
@@ -2063,7 +2491,7 @@ mod tests {
         assert!(simulator(view(&app)).find("Bob").is_err(), "collapsed");
         click(&mut app, "▸ Message requests (1)");
         app.row_hovered = Some(bob.clone());
-        assert!(simulator(view(&app)).find("⋯").is_err(), "no menu on requests");
+        assert!(!has_id(&app, "Chat actions"), "no menu on requests");
         click(&mut app, "Bob");
         {
             let mut ui = simulator(view(&app));
@@ -2153,7 +2581,7 @@ mod tests {
     #[test]
     fn new_group_dialog_emits_create() {
         let (mut app, mut rx) = app();
-        click(&mut app, "New group");
+        click_id(&mut app, "New group");
         app.update(Message::NewGroupTitle("Hikers".into()));
         click(&mut app, "Bob");
         click(&mut app, "Create");
@@ -2271,7 +2699,7 @@ mod tests {
     /// Settings open with a fake profile and two fake devices.
     fn settings_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<Command>) {
         let (mut app, mut rx) = app();
-        click(&mut app, "⚙");
+        click_id(&mut app, "Settings");
         assert!(matches!(crate::app::tests::drain(&mut rx).as_slice(), [Command::LoadSettings]));
         let profile = crate::backend::OwnProfile { given: "Fake".into(), family: "Person".into(), about: "Testing".into(), emoji: "🧪".into() };
         app.update(Message::Backend(Event::Profile(profile)));
@@ -2287,19 +2715,26 @@ mod tests {
     fn settings_screen_switches_theme_and_toggles_notifications() {
         let (mut app, mut rx) = settings_app();
         let mut ui = simulator(view(&app));
-        assert!(ui.find("+15550100").is_ok() && ui.find("This device").is_ok(), "number and this device marked");
+        assert!(ui.find("+15550100").is_ok(), "number shown");
         drop(ui);
+        click(&mut app, "Linked devices");
+        assert!(simulator(view(&app)).find("This device").is_ok(), "this device marked");
         app.system_dark = true;
+        click(&mut app, "Themes");
         click(&mut app, "Light");
         assert!(!app.dark, "overrides the dark system theme");
         let cmds = crate::app::tests::drain(&mut rx);
         assert!(matches!(cmds.as_slice(), [Command::SaveSettings(s)] if s.theme == crate::state::ThemeChoice::Light), "{cmds:?}");
+        click(&mut app, "Rusted");
+        assert!(app.dark && app.theme().palette().primary == color!(0xe8641f), "a named theme applies its colors");
+        click(&mut app, "Notifications");
         click(&mut app, "Show message text in notifications");
         assert!(!app.settings.notification_text);
         click(&mut app, "Show notifications");
         assert!(!app.settings.notifications);
         let cmds = crate::app::tests::drain(&mut rx);
         assert!(matches!(cmds.last(), Some(Command::SaveSettings(s)) if !s.notifications && !s.notification_text), "{cmds:?}");
+        click(&mut app, "Themes");
         click(&mut app, "System");
         app.update(Message::Theme(iced::theme::Mode::Light));
         assert!(!app.dark, "follows the system again");
@@ -2329,6 +2764,7 @@ mod tests {
     #[test]
     fn unlinking_needs_confirmation() {
         let (mut app, mut rx) = settings_app();
+        click(&mut app, "Linked devices");
         click(&mut app, "Unlink this device");
         assert!(crate::app::tests::drain(&mut rx).is_empty(), "the first click only asks");
         click(&mut app, "Cancel");
@@ -2363,9 +2799,20 @@ mod tests {
                 let _ = std::fs::remove_file(f.path());
             }
         }
-        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
-        let snap = ui.snapshot(&app.theme()).expect("render");
-        assert!(snap.matches_image(dir.join("settings")).expect("write png"));
+        for (name, section, theme) in [
+            ("settings-profile", SettingsSection::Profile, ThemeChoice::Light),
+            ("settings-devices", SettingsSection::Devices, ThemeChoice::Light),
+            ("settings-themes", SettingsSection::Themes, ThemeChoice::Light),
+            ("settings-themes-rusted", SettingsSection::Themes, ThemeChoice::Rusted),
+            ("settings-about", SettingsSection::About, ThemeChoice::Dark),
+        ] {
+            app.update(Message::SettingsSection(section));
+            app.update(Message::AskUnlink(true));
+            app.update(Message::SetTheme(theme));
+            let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+            let snap = ui.snapshot(&app.theme()).expect("render");
+            assert!(snap.matches_image(dir.join(name)).expect("write png"));
+        }
     }
 
     fn run(app: &mut App, msgs: Vec<Message>) {
@@ -2379,11 +2826,11 @@ mod tests {
         let (mut app, mut rx) = app();
         crate::app::tests::with_stories(&mut app);
         let mut ui = simulator(view(&app));
-        ui.click("● Stories").expect("unviewed dot on the Stories button");
+        ui.click(iced::widget::Id::new("Stories")).expect("Stories tab");
         let msgs: Vec<Message> = ui.into_messages().collect();
         run(&mut app, msgs);
         let mut ui = simulator(view(&app));
-        assert!(ui.find("Bob").is_ok() && ui.find("Chats").is_ok());
+        assert!(ui.find("Bob").is_ok() && ui.find("Stories").is_ok());
         ui.click("Alice").expect("Alice's stories listed");
         let msgs: Vec<Message> = ui.into_messages().collect();
         run(&mut app, msgs);
@@ -2532,17 +2979,17 @@ mod tests {
     fn header_call_button() {
         let (mut app, mut rx) = app();
         open_alice(&mut app, &mut rx);
-        assert_eq!(simulator(view(&app)).find("📞 Call").is_ok(), crate::calls::ENABLED);
+        assert_eq!(has_id(&app, "Call"), crate::calls::ENABLED);
         if crate::calls::ENABLED {
-            click(&mut app, "📞 Call");
+            click_id(&mut app, "Call");
             assert_eq!(sent_calls(&mut rx), [CallCommand::Start(uuid(2))]);
             // Busy with a call: the button does nothing.
             app.update(Message::Backend(Event::Call(call(Phase::Ringing, false))));
-            click(&mut app, "📞 Call");
+            click_id(&mut app, "Call");
             assert!(sent_calls(&mut rx).is_empty());
         }
         let (group, _rx) = crate::app::tests::open_group();
-        assert!(simulator(view(&group)).find("📞 Call").is_err());
+        assert!(!has_id(&group, "Call"));
     }
 
     /// Writes `snapshots/call-bar-*.png`: a connected call over Alice's chat.

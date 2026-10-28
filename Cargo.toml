@@ -8,7 +8,7 @@ description = "Native Rust Signal desktop client (iced UI, presage/libsignal pro
 [dependencies]
 presage = { path = "vendor/presage" }
 presage-store-sqlite = { path = "vendor/presage-store-sqlite" }
-iced = { version = "0.14", features = ["tokio", "image", "qr_code", "advanced"] }
+iced = { version = "0.14", features = ["tokio", "image", "svg", "qr_code", "advanced"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "fs"] }
 futures = "0.3"
 emojis = "0.9"

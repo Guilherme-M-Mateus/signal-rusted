@@ -75,6 +75,13 @@ pub enum ThemeChoice {
     System,
     Light,
     Dark,
+    /// True black, for OLED screens.
+    Midnight,
+    /// Charcoal and orange, after the app icon.
+    Rusted,
+    Nord,
+    Sakura,
+    Mint,
 }
 
 /// The settings screen's choices.
@@ -97,8 +104,8 @@ impl Settings {
     pub fn dark(&self, system_dark: bool) -> bool {
         match self.theme {
             ThemeChoice::System => system_dark,
-            ThemeChoice::Light => false,
-            ThemeChoice::Dark => true,
+            ThemeChoice::Light | ThemeChoice::Sakura | ThemeChoice::Mint => false,
+            ThemeChoice::Dark | ThemeChoice::Midnight | ThemeChoice::Rusted | ThemeChoice::Nord => true,
         }
     }
 
@@ -542,6 +549,8 @@ mod tests {
         assert!(!s.settings.notifications);
         assert!(!s.settings.dark(true), "light wins over a dark system");
         assert!(Settings { theme: ThemeChoice::Dark, ..Settings::default() }.dark(false));
+        assert!(Settings { theme: ThemeChoice::Rusted, ..Settings::default() }.dark(false), "named themes fix their mode");
+        assert!(!Settings { theme: ThemeChoice::Sakura, ..Settings::default() }.dark(true));
     }
 
     #[test]

@@ -97,6 +97,26 @@ pub struct GroupPanel {
 pub struct SettingsPanel {
     pub profile: OwnProfile,
     pub confirm_unlink: bool,
+    pub section: SettingsSection,
+}
+
+/// The settings screen's pages, listed where the chats usually are.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum SettingsSection {
+    #[default]
+    Profile,
+    Themes,
+    Notifications,
+    Devices,
+    About,
+}
+
+/// The navigation rail's tabs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tab {
+    Chats,
+    Stories,
+    Settings,
 }
 
 /// The "New group" dialog.
@@ -263,6 +283,8 @@ pub enum Message {
     Theme(iced::theme::Mode),
     /// Opens or closes the settings screen.
     ToggleSettings,
+    ShowTab(Tab),
+    SettingsSection(SettingsSection),
     EditProfile(OwnProfile),
     SaveProfile,
     SetTheme(ThemeChoice),
@@ -334,7 +356,7 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        crate::view::signal_theme(self.dark)
+        crate::view::app_theme(self.settings.theme, self.dark)
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -845,8 +867,20 @@ impl App {
             Message::ToggleSettings => {
                 if self.settings_panel.take().is_none() {
                     self.new_group = None;
-                    self.settings_panel = Some(SettingsPanel { profile: self.profile.clone().unwrap_or_default(), confirm_unlink: false });
+                    self.settings_panel = Some(SettingsPanel { profile: self.profile.clone().unwrap_or_default(), ..Default::default() });
                     self.send(Command::LoadSettings);
+                }
+            }
+            Message::ShowTab(tab) => {
+                self.stories_open = tab == Tab::Stories;
+                if (tab == Tab::Settings) != self.settings_panel.is_some() {
+                    return self.update(Message::ToggleSettings);
+                }
+            }
+            Message::SettingsSection(section) => {
+                if let Some(s) = &mut self.settings_panel {
+                    s.section = section;
+                    s.confirm_unlink = false;
                 }
             }
             Message::EditProfile(p) => {
