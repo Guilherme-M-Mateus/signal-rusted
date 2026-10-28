@@ -7034,7 +7034,10 @@ dependencies = [
 name = "signal-rusted"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
+ "base64 0.22.1",
+ "bincode",
  "chrono",
  "directories",
  "emojis",
@@ -7042,6 +7045,7 @@ dependencies = [
  "hex",
  "iced",
  "iced_test",
+ "image",
  "keyring",
  "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "libsignal-message-backup",

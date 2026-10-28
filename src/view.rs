@@ -1,8 +1,10 @@
 //! Rendering. Signal-Desktop's layout: conversation list left, timeline + composer right.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{Local, TimeZone};
+use iced::border::Radius;
 use iced::font::{Family, Style as FontStyle, Weight};
 use iced::keyboard::{self, key};
 use iced::widget::text::Span;
@@ -16,7 +18,8 @@ use presage::libsignal_service::prelude::Uuid;
 use presage::proto::data_message::Sticker;
 use presage::proto::{AttachmentPointer, BodyRange, Preview};
 
-use crate::app::{App, Attach, Message, Open, Screen, SettingsSection, StickerTab, TIMERS, Tab, display_name, is_image};
+use crate::app::{App, Attach, Fun, Message, Open, Screen, SettingsSection, StickerTab, TIMERS, Tab, display_name, is_image};
+use crate::gifs::Provider as GifProvider;
 use crate::icons::{self, icon, tinted};
 use crate::state::ThemeChoice;
 use crate::backend::{ChatAction, Conversation, attachment_key, now_ms};
@@ -30,7 +33,7 @@ pub const STORY_REPLY: &str = "story-reply";
 const BLUE: Color = color!(0x2c6bed);
 
 /// The themes the settings offer, in order.
-pub const THEMES: [(ThemeChoice, &str); 8] = [
+pub const THEMES: [(ThemeChoice, &str); 9] = [
     (ThemeChoice::System, "System"),
     (ThemeChoice::Light, "Light"),
     (ThemeChoice::Dark, "Dark"),
@@ -39,6 +42,7 @@ pub const THEMES: [(ThemeChoice, &str); 8] = [
     (ThemeChoice::Nord, "Nord"),
     (ThemeChoice::Sakura, "Sakura"),
     (ThemeChoice::Mint, "Mint"),
+    (ThemeChoice::Everforest, "Everforest"),
 ];
 
 /// `choice`'s colors; `dark` picks Light or Dark for "System".
@@ -50,12 +54,27 @@ pub fn app_theme(choice: ThemeChoice, dark: bool) -> Theme {
         (ThemeChoice::Nord, _) => ("Nord", color!(0x2e3440), color!(0xeceff4), color!(0x5e81ac)),
         (ThemeChoice::Sakura, _) => ("Sakura", color!(0xfff7f9), color!(0x2b1b22), color!(0xd6457a)),
         (ThemeChoice::Mint, _) => ("Mint", color!(0xf3faf6), color!(0x18281f), color!(0x2e8b57)),
+        (ThemeChoice::Everforest, _) => ("Everforest", color!(0x2d353b), color!(0xd3c6aa), color!(0xa7c080)),
         (_, true) => ("Dark", color!(0x121212), color!(0xe9e9e9), BLUE),
         (_, false) => ("Light", color!(0xffffff), color!(0x1b1b1b), BLUE),
     };
     let danger = if dark { color!(0xf44336) } else { color!(0xe53935) };
     let palette = Palette { background, text, primary, success: color!(0x4caf50), warning: color!(0xffc107), danger };
     Theme::custom(format!("signal-rusted {name}"), palette)
+}
+
+/// A custom theme's colors as an iced theme; `None` if a color doesn't parse.
+pub fn custom_theme(t: &crate::themes::CustomTheme) -> Option<Theme> {
+    let (background, text, primary) = t.colors()?;
+    let danger = if background.r + background.g + background.b < 1.5 { color!(0xf44336) } else { color!(0xe53935) };
+    let palette = iced::theme::Palette { background, text, primary, success: color!(0x4caf50), warning: color!(0xffc107), danger };
+    Some(Theme::custom(format!("signal-rusted {}", t.name), palette))
+}
+
+/// Text on the accent color: white, or the background on pale accents (Everforest's green).
+fn on_accent_color(theme: &Theme) -> Color {
+    let a = accent(theme);
+    if 0.299 * a.r + 0.587 * a.g + 0.114 * a.b > 0.6 { theme.palette().background } else { Color::WHITE }
 }
 
 fn is_dark(theme: &Theme) -> bool {
@@ -87,6 +106,25 @@ fn accent(theme: &Theme) -> Color {
     theme.palette().primary
 }
 
+thread_local! {
+    /// Appearance → Rounding: square corners everywhere. Ambient because every style closure needs it;
+    /// per thread since iced runs `update` and `view` on one thread (and each test on its own).
+    static SQUARE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_square(square: bool) {
+    SQUARE.set(square);
+}
+
+/// A corner radius of `px`, or nearly square in the square appearance.
+fn round(px: f32) -> Radius {
+    square_or(px, SQUARE.get()).into()
+}
+
+fn square_or(px: f32, square: bool) -> f32 {
+    if square { px.min(3.0) } else { px }
+}
+
 const BOLD: Font = Font { weight: Weight::Bold, ..Font::DEFAULT };
 
 /// The app icon (assets/icon.svg).
@@ -99,7 +137,7 @@ fn icon_button<'a>(src: &'static str, label: &'static str, msg: Option<Message>)
     let b = button(icon(src, 20)).padding(8).on_press_maybe(msg).style(|t: &Theme, status| button::Style {
         background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| surface(t).into()),
         text_color: t.palette().text,
-        border: Border { radius: 20.0.into(), ..Default::default() },
+        border: Border { radius: round(20.0), ..Default::default() },
         ..Default::default()
     });
     tip(container(b).id(label), label, tooltip::Position::Bottom)
@@ -129,7 +167,7 @@ const AVATAR_COLORS: [Color; 8] = [
 /// The chat's downloaded avatar (`seed` is its thread key), cropped round; else its initial.
 fn avatar<'a>(app: &App, title: &str, seed: &str, size: f32) -> Element<'a, Message> {
     if let Some(h) = app.avatars.get(seed) {
-        return image(h.clone()).width(size).height(size).content_fit(ContentFit::Cover).border_radius(size / 2.0).into();
+        return image(h.clone()).width(size).height(size).content_fit(ContentFit::Cover).border_radius(round(size / 2.0)).into();
     }
     let initial = title.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string());
     let h = seed.bytes().fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize));
@@ -138,7 +176,7 @@ fn avatar<'a>(app: &App, title: &str, seed: &str, size: f32) -> Element<'a, Mess
         .center(size)
         .style(move |_| container::Style {
             background: Some(bg.into()),
-            border: Border { radius: (size / 2.0).into(), ..Default::default() },
+            border: Border { radius: round(size / 2.0), ..Default::default() },
             ..Default::default()
         })
         .into()
@@ -273,14 +311,14 @@ fn nav_rail(app: &App) -> Element<'_, Message> {
         if dot {
             face = face.push(container(container(Space::new()).width(9).height(9).style(|t: &Theme| container::Style {
                 background: Some(accent(t).into()),
-                border: Border { radius: 5.0.into(), ..Default::default() },
+                border: Border { radius: round(5.0), ..Default::default() },
                 ..Default::default()
             })).padding([8, 7]).align_right(44));
         }
         let b = button(face).padding(0).on_press(Message::ShowTab(tab)).style(move |t: &Theme, status| button::Style {
             background: (selected || matches!(status, button::Status::Hovered)).then(|| surface(t).scale_alpha(if selected { 1.0 } else { 0.6 }).into()),
             text_color: t.palette().text,
-            border: Border { radius: 12.0.into(), ..Default::default() },
+            border: Border { radius: round(12.0), ..Default::default() },
             ..Default::default()
         });
         tip(container(b).id(label), label, tooltip::Position::Right)
@@ -368,18 +406,18 @@ fn chat_row<'a>(app: &'a App, c: &'a Conversation) -> Element<'a, Message> {
     let mut bottom = row![text(preview).size(13).wrapping(text::Wrapping::None).width(Length::Fill).style(dim)];
     if c.unread > 0 {
         bottom = bottom.push(
-            container(text(c.unread.to_string()).size(12).color(Color::WHITE))
+            container(text(c.unread.to_string()).size(12).style(|t: &Theme| text::Style { color: Some(on_accent_color(t)) }))
                 .padding([1, 7])
                 .style(|t: &Theme| container::Style {
                     background: Some(accent(t).into()),
-                    border: Border { radius: 10.0.into(), ..Default::default() },
+                    border: Border { radius: round(10.0), ..Default::default() },
                     ..Default::default()
                 }),
         );
     } else if c.marked_unread {
         bottom = bottom.push(container(Space::new()).width(10).height(10).style(|t: &Theme| container::Style {
             background: Some(accent(t).into()),
-            border: Border { radius: 5.0.into(), ..Default::default() },
+            border: Border { radius: round(5.0), ..Default::default() },
             ..Default::default()
         }));
     }
@@ -396,7 +434,7 @@ fn chat_row<'a>(app: &'a App, c: &'a Conversation) -> Element<'a, Message> {
                 (_, button::Status::Hovered) => Some(surface(t).scale_alpha(0.5).into()),
                 _ => None,
             };
-            button::Style { background: bg, text_color: t.palette().text, border: Border { radius: 10.0.into(), ..Default::default() }, ..Default::default() }
+            button::Style { background: bg, text_color: t.palette().text, border: Border { radius: round(10.0), ..Default::default() }, ..Default::default() }
         });
     // iced has no context menu: a "⋯" on hover opens the row's actions (not for requests).
     let menu_open = app.row_menu.as_ref() == Some(&c.thread);
@@ -507,7 +545,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     .align_y(Alignment::Center);
     let search = container(search).padding([2, 12]).style(|t: &Theme| container::Style {
         background: Some(pill(t)),
-        border: Border { radius: 18.0.into(), ..Default::default() },
+        border: Border { radius: round(18.0), ..Default::default() },
         ..Default::default()
     });
     column![
@@ -537,7 +575,7 @@ fn story_rows(app: &App) -> Column<'_, Message> {
         let title = story_owner_title(app, &e.owner);
         let unviewed = e.unviewed();
         let ring = container(avatar(app, &title, &crate::state::thread_key(&e.owner), 36.0)).padding(2).style(move |t: &Theme| container::Style {
-            border: Border { radius: 22.0.into(), width: 2.0, color: if unviewed { accent(t) } else { muted(t) } },
+            border: Border { radius: round(22.0), width: 2.0, color: if unviewed { accent(t) } else { muted(t) } },
             ..Default::default()
         });
         let n = e.stories.len();
@@ -598,7 +636,7 @@ fn story_card<'a>(app: &'a App, s: &'a Story) -> Element<'a, Message> {
             .padding([4, 8])
             .style(move |_| container::Style {
                 background: highlight.map(Background::Color),
-                border: Border { radius: 6.0.into(), ..Default::default() },
+                border: Border { radius: round(6.0), ..Default::default() },
                 ..Default::default()
             });
         let bg = story_background(t);
@@ -608,7 +646,7 @@ fn story_card<'a>(app: &'a App, s: &'a Story) -> Element<'a, Message> {
             .height(640)
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
-            .style(move |_| container::Style { background: Some(bg), border: Border { radius: 12.0.into(), ..Default::default() }, ..Default::default() })
+            .style(move |_| container::Style { background: Some(bg), border: Border { radius: round(12.0), ..Default::default() }, ..Default::default() })
             .into();
     }
     let Some(p) = s.file() else { return text("This story can't be shown").color(Color::WHITE).into() };
@@ -641,7 +679,7 @@ fn story_viewer<'a>(app: &'a App, v: &'a Viewer) -> Element<'a, Message> {
         let a = if j <= at { 0.9 } else { 0.3 };
         r.push(container(Space::new()).width(Length::Fill).height(3).style(move |_| container::Style {
             background: Some(Color { a, ..Color::WHITE }.into()),
-            border: Border { radius: 2.0.into(), ..Default::default() },
+            border: Border { radius: round(2.0), ..Default::default() },
             ..Default::default()
         }))
     });
@@ -702,16 +740,6 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         actions = actions.push(icon_button(icons::INFO, "Group details", Some(Message::ToggleGroupInfo)));
     }
     let header = container(row![container(who).width(Length::Fill), actions].spacing(12).align_y(Alignment::Center)).padding([10, 16]);
-    let header: Element<_> = if o.timer_menu {
-        let current = app.timer(&o.thread);
-        let options = TIMERS.iter().fold(row![].spacing(6), |r, &(secs, label)| {
-            let style = if secs == current { button::primary } else { button::secondary };
-            r.push(button(text(label).size(13)).on_press(Message::SetTimer(secs)).style(style))
-        });
-        column![header, container(options).padding([0, 16]).align_right(Length::Fill)].spacing(4).into()
-    } else {
-        header.into()
-    };
 
     if let Some(p) = &o.info {
         return column![header, rule::horizontal(1), group_panel(app, o, p)].into();
@@ -743,6 +771,11 @@ fn conversation<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     };
 
     let bottom = if app.is_request(&o.thread) { request_bar(o) } else { composer(app, o) };
+    // The timer menu drops down over the timeline, like Signal-Desktop's.
+    let body: Element<_> = match &o.timer_menu {
+        Some(custom) => stack![body, container(timer_menu(app, o, custom)).align_right(Length::Fill).padding([6, 16])].into(),
+        None => body,
+    };
     column![header, rule::horizontal(1), body, bottom].into()
 }
 
@@ -828,10 +861,85 @@ fn timer_control<'a>(app: &App, o: &Open) -> Element<'a, Message> {
     let b = button(label).padding([8, 10]).style(|t: &Theme, status| button::Style {
         background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| surface(t).into()),
         text_color: t.palette().text,
-        border: Border { radius: 18.0.into(), ..Default::default() },
+        border: Border { radius: round(18.0), ..Default::default() },
         ..Default::default()
     });
     tip(b.on_press_maybe(app.can_set_timer().then_some(Message::ToggleTimerMenu)), "Disappearing messages", tooltip::Position::Bottom)
+}
+
+/// "30 seconds", "1 week", "Off": the timer menu's labels.
+pub fn long_duration(secs: u32) -> String {
+    if secs == 0 {
+        return "Off".into();
+    }
+    let &(u, unit) = TIMER_UNITS.iter().rev().find(|&&(u, _)| secs.is_multiple_of(u)).expect("every time divides into seconds");
+    match secs / u {
+        1 => format!("1 {unit}"),
+        n => format!("{n} {unit}s"),
+    }
+}
+
+/// Units for a custom disappearing time: (seconds, name).
+pub const TIMER_UNITS: [(u32, &str); 5] = [(1, "second"), (60, "minute"), (3_600, "hour"), (86_400, "day"), (604_800, "week")];
+
+/// The disappearing-messages dropdown: Signal's presets with a check on the current one, then a custom time.
+fn timer_menu<'a>(app: &'a App, o: &'a Open, custom: &'a crate::app::CustomTimer) -> Element<'a, Message> {
+    let current = app.timer(&o.thread);
+    let row_style = |selected: bool| {
+        move |t: &Theme, status: button::Status| button::Style {
+            background: (selected || matches!(status, button::Status::Hovered)).then(|| surface(t).scale_alpha(if selected { 1.0 } else { 0.6 }).into()),
+            text_color: t.palette().text,
+            border: Border { radius: round(8.0), ..Default::default() },
+            ..Default::default()
+        }
+    };
+    let mut list = column![
+        text("Disappearing messages").font(BOLD),
+        muted_text("New messages in this chat disappear after the time you pick, for everyone."),
+    ]
+    .spacing(4)
+    .width(300);
+    let preset = TIMERS.iter().any(|&(s, _)| s == current);
+    for &(secs, _) in &TIMERS {
+        let check: Element<_> = if secs == current { icon(icons::CHECK, 16).style(|t: &Theme, _| svg::Style { color: Some(accent(t)) }).into() } else { Space::new().width(16).into() };
+        let label = row![text(long_duration(secs)).width(Length::Fill), check].align_y(Alignment::Center);
+        list = list.push(button(label).width(Length::Fill).padding([7, 10]).on_press(Message::SetTimer(secs)).style(row_style(secs == current)));
+    }
+    if !preset {
+        let label = row![text(format!("Custom: {}", long_duration(current))).width(Length::Fill), icon(icons::CHECK, 16).style(|t: &Theme, _| svg::Style { color: Some(accent(t)) })];
+        list = list.push(container(label.align_y(Alignment::Center)).padding([7, 10]).style(|t: &Theme| container::Style {
+            background: Some(surface(t).into()),
+            border: Border { radius: round(8.0), ..Default::default() },
+            ..Default::default()
+        }));
+    }
+    list = list.push(rule::horizontal(1));
+    let units = TIMER_UNITS.iter().fold(row![].spacing(4), |r, &(u, name)| {
+        let selected = custom.unit == u;
+        r.push(button(text(format!("{name}s")).size(12)).padding([4, 8]).on_press(Message::TimerUnit(u)).style(move |t: &Theme, st| {
+            let mut b = row_style(selected)(t, st);
+            b.border.radius = round(12.0);
+            b
+        }))
+    });
+    let set = custom.seconds().filter(|&s| s != current).map(Message::SetTimer);
+    list = list
+        .push(text("Custom time").size(13).font(BOLD))
+        .push(
+            row![
+                text_input("Amount", &custom.amount).id("timer-amount").on_input(Message::TimerAmount).on_submit_maybe(set.clone()).padding([6, 10]).width(90),
+                button(text("Set")).padding([6, 14]).on_press_maybe(set).style(button::primary),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .push(units.wrap());
+    opaque(container(list.spacing(4)).padding(12).style(|t: &Theme| container::Style {
+        background: Some(t.palette().background.into()),
+        border: Border { radius: round(14.0), width: 1.0, color: surface(t) },
+        shadow: iced::Shadow { color: Color::BLACK.scale_alpha(0.25), offset: iced::Vector::new(0.0, 4.0), blur_radius: 16.0 },
+        ..Default::default()
+    }))
 }
 
 fn muted_text<'a>(s: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
@@ -843,7 +951,7 @@ fn badge<'a>(s: &'a str) -> Element<'a, Message> {
         .padding([1, 6])
         .style(|t: &Theme| container::Style {
             background: Some(surface(t).into()),
-            border: Border { radius: 8.0.into(), ..Default::default() },
+            border: Border { radius: round(8.0), ..Default::default() },
             ..Default::default()
         })
         .into()
@@ -934,10 +1042,12 @@ fn group_panel<'a>(app: &'a App, o: &'a Open, p: &'a crate::app::GroupPanel) -> 
     scrollable(col).height(Length::Fill).into()
 }
 
-const SECTIONS: [(SettingsSection, &str, &str); 5] = [
+const SECTIONS: [(SettingsSection, &str, &str); 7] = [
     (SettingsSection::Profile, icons::USER, "Profile"),
-    (SettingsSection::Themes, icons::PALETTE, "Themes"),
+    (SettingsSection::Appearance, icons::PALETTE, "Appearance"),
+    (SettingsSection::Chats, icons::CHATS, "Chats"),
     (SettingsSection::Notifications, icons::BELL, "Notifications"),
+    (SettingsSection::Plugins, icons::PUZZLE, "Plugins"),
     (SettingsSection::Devices, icons::DEVICES, "Linked devices"),
     (SettingsSection::About, icons::ABOUT, "About"),
 ];
@@ -967,7 +1077,7 @@ fn settings_nav<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'
                 background: (selected || matches!(status, button::Status::Hovered))
                     .then(|| surface(t).scale_alpha(if selected { 1.0 } else { 0.5 }).into()),
                 text_color: t.palette().text,
-                border: Border { radius: 10.0.into(), ..Default::default() },
+                border: Border { radius: round(10.0), ..Default::default() },
                 ..Default::default()
             });
         col = col.push(container(item).padding([0, 8]));
@@ -981,7 +1091,7 @@ fn settings_card<'a>(title: &'static str, body: impl Into<Element<'a, Message>>)
         text(title).size(13).font(BOLD).style(|t: &Theme| text::Style { color: Some(muted(t)) }),
         container(body).padding(16).width(Length::Fill).style(|t: &Theme| container::Style {
             background: Some(rail(t).into()),
-            border: Border { radius: 12.0.into(), width: 1.0, color: surface(t) },
+            border: Border { radius: round(12.0), width: 1.0, color: surface(t) },
             ..Default::default()
         }),
     ]
@@ -992,12 +1102,14 @@ fn settings_card<'a>(title: &'static str, body: impl Into<Element<'a, Message>>)
 /// One theme as a little chat preview: an incoming and an outgoing bubble on its background.
 fn theme_card<'a>(app: &App, choice: ThemeChoice, label: &'static str) -> Element<'a, Message> {
     let dark = crate::state::Settings { theme: choice, ..app.settings.clone() }.dark(app.system_dark);
-    let preview = app_theme(choice, dark);
+    theme_swatch(app_theme(choice, dark), label.to_owned(), app.settings.theme == choice, Message::SetTheme(choice))
+}
+
+fn theme_swatch<'a>(preview: Theme, label: String, selected: bool, press: Message) -> Element<'a, Message> {
     let (p, incoming) = (preview.palette(), surface(&preview));
-    let selected = app.settings.theme == choice;
     let bar = |w: f32, c: Color| container(Space::new()).width(w).height(14).style(move |_| container::Style {
         background: Some(c.into()),
-        border: Border { radius: 7.0.into(), ..Default::default() },
+        border: Border { radius: round(7.0), ..Default::default() },
         ..Default::default()
     });
     let chat = column![
@@ -1008,7 +1120,7 @@ fn theme_card<'a>(app: &App, choice: ThemeChoice, label: &'static str) -> Elemen
     .spacing(7);
     let swatch = container(chat).padding(12).width(150).height(90).style(move |t: &Theme| container::Style {
         background: Some(p.background.into()),
-        border: Border { radius: 12.0.into(), width: if selected { 3.0 } else { 1.0 }, color: if selected { accent(t) } else { surface(t) } },
+        border: Border { radius: round(12.0), width: if selected { 3.0 } else { 1.0 }, color: if selected { accent(t) } else { surface(t) } },
         ..Default::default()
     });
     let mut caption = row![text(label).size(14)].spacing(6).align_y(Alignment::Center);
@@ -1017,12 +1129,148 @@ fn theme_card<'a>(app: &App, choice: ThemeChoice, label: &'static str) -> Elemen
     }
     button(column![swatch, caption].spacing(8).align_x(Alignment::Center))
         .padding(4)
-        .on_press(Message::SetTheme(choice))
+        .on_press(press)
         .style(button::text)
         .into()
 }
 
-/// The selected settings page: profile, themes, notifications, linked devices or about.
+/// Custom themes: a card each (with Edit), "New theme", and the editor when one is open.
+fn custom_themes<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, Message> {
+    if let Some((saved, d)) = &s.theme_draft {
+        return theme_editor(saved.is_some(), d);
+    }
+    let selected = app.selected_custom_theme().map(|t| t.name.as_str());
+    let cards = app.custom_themes.iter().filter_map(|t| Some((t, custom_theme(t)?))).fold(row![].spacing(12), |r, (t, preview)| {
+        let edit = button(text("Edit").size(12)).padding([2, 10]).on_press(Message::EditTheme(Some(t.clone()))).style(button::text);
+        r.push(column![theme_swatch(preview, t.name.clone(), selected == Some(t.name.as_str()), Message::SetCustomTheme(t.name.clone())), edit].align_x(Alignment::Center))
+    });
+    let new = button(container(column![icon(icons::EDIT, 22), text("New theme").size(14)].spacing(8).align_x(Alignment::Center)).center_x(150).center_y(90))
+        .padding(4)
+        .on_press(Message::EditTheme(None))
+        .style(|t: &Theme, st| button::Style {
+            background: matches!(st, button::Status::Hovered).then(|| surface(t).into()),
+            text_color: t.palette().text,
+            border: Border { radius: round(12.0), width: 1.0, color: surface(t) },
+            ..Default::default()
+        });
+    column![
+        cards.push(new).wrap().vertical_spacing(12),
+        row![
+            muted_text("Themes are JSON files: share them, or drop others' into the themes folder.").width(Length::Fill),
+            button(text("Open themes folder").size(13)).on_press(Message::OpenThemesFolder).style(button::text),
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .spacing(12)
+    .into()
+}
+
+fn theme_editor<'a>(saved: bool, d: &'a crate::themes::CustomTheme) -> Element<'a, Message> {
+    let field = |label: &'static str, value: &'a str, set: fn(&mut crate::themes::CustomTheme, String)| {
+        let swatch: Element<_> = match crate::themes::hex(value) {
+            Some(c) => container(Space::new()).width(28).height(28).style(move |t: &Theme| container::Style {
+                background: Some(c.into()),
+                border: Border { radius: round(14.0), width: 1.0, color: surface(t) },
+                ..Default::default()
+            }).into(),
+            None => text("✕").style(text::danger).into(),
+        };
+        let d = d.clone();
+        row![
+            text(label).width(110),
+            text_input("#rrggbb", value).on_input(move |v| {
+                let mut d = d.clone();
+                set(&mut d, v);
+                Message::ThemeDraft(d)
+            }).padding(8).width(140),
+            swatch,
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+    };
+    let name = {
+        let d = d.clone();
+        text_input("Theme name", &d.name.clone()).id("theme-name").on_input(move |v| Message::ThemeDraft(crate::themes::CustomTheme { name: v, ..d.clone() })).padding(8)
+    };
+    let preview: Element<_> = match custom_theme(d) {
+        Some(t) => theme_swatch(t, if d.name.trim().is_empty() { "Preview".into() } else { d.name.clone() }, false, Message::ThemeDraft(d.clone())),
+        None => muted_text("Enter three colors as #rrggbb to see a preview.").into(),
+    };
+    let mut actions = row![
+        button(text("Save theme")).padding([8, 16]).on_press_maybe(d.is_valid().then_some(Message::SaveTheme)).style(button::primary),
+        button(text("Cancel")).padding([8, 16]).on_press(Message::CancelThemeEdit).style(button::secondary),
+    ]
+    .spacing(8);
+    if saved {
+        actions = actions.push(button(text("Delete")).padding([8, 16]).on_press(Message::DeleteTheme).style(button::danger));
+    }
+    row![
+        column![
+            name,
+            field("Background", &d.background, |d, v| d.background = v),
+            field("Text", &d.text, |d, v| d.text = v),
+            field("Accent", &d.accent, |d, v| d.accent = v),
+            actions,
+        ]
+        .spacing(10)
+        .width(Length::Fill),
+        preview,
+    ]
+    .spacing(20)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// A row of mutually exclusive choices, the selected one in the accent color.
+fn choices<'a, T: Copy + PartialEq + 'a>(current: T, options: &[(T, &'a str)], msg: impl Fn(T) -> Message) -> Element<'a, Message> {
+    options
+        .iter()
+        .fold(row![].spacing(6), |r, &(v, label)| {
+            let selected = current == v;
+            r.push(button(text(label)).padding([8, 16]).on_press(msg(v)).style(move |t: &Theme, status| button::Style {
+                background: Some(if selected {
+                    accent(t).into()
+                } else if matches!(status, button::Status::Hovered) {
+                    surface(t).into()
+                } else {
+                    t.palette().background.into()
+                }),
+                text_color: if selected { on_accent_color(t) } else { t.palette().text },
+                border: Border { radius: round(18.0), width: 1.0, color: if selected { accent(t) } else { surface(t) } },
+                ..Default::default()
+            }))
+        })
+        .into()
+}
+
+/// Our signal.me link as a QR code, with "Copy link".
+fn share_card(app: &App) -> Element<'_, Message> {
+    let Some((link, qr)) = &app.share else { return muted_text("Loading…").into() };
+    let code = container(qr_code(qr).cell_size(5).style(qr_style)).padding(12).style(|_| container::Style {
+        background: Some(Color::WHITE.into()),
+        border: Border { radius: round(12.0), ..Default::default() },
+        ..Default::default()
+    });
+    let copy = button(row![tinted(icons::COPY, 16, Color::WHITE), text("Copy link")].spacing(8).align_y(Alignment::Center))
+        .padding([8, 16])
+        .on_press(Message::Copy(link.clone()))
+        .style(button::primary);
+    row![
+        code,
+        column![
+            row![icon(icons::QR, 18), text("Scan to chat").font(BOLD)].spacing(8).align_y(Alignment::Center),
+            muted_text("Anyone who scans this with Signal can start a chat with you, and sees your phone number."),
+            text(link.clone()).size(13),
+            copy,
+        ]
+        .spacing(10),
+    ]
+    .spacing(20)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The selected settings page: profile, appearance, chats, notifications, linked devices or about.
 fn settings<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, Message> {
     let title = SECTIONS.iter().find(|(sec, ..)| *sec == s.section).map_or("Settings", |(_, _, l)| l);
     let mut col = Column::new().spacing(20).padding([24, 32]).max_width(640);
@@ -1037,9 +1285,20 @@ fn settings<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, M
                     Message::EditProfile(p)
                 }
             };
+            let has_photo = app.avatars.contains_key(&app.me.to_string());
+            let photo_actions: Element<_> = if s.photo_busy {
+                muted_text("Uploading…").into()
+            } else {
+                let mut r = row![button(text("Change photo")).padding([6, 14]).on_press(Message::ChangePhoto).style(button::secondary)].spacing(8);
+                if has_photo {
+                    r = r.push(button(text("Remove")).padding([6, 14]).on_press(Message::RemovePhoto).style(button::text));
+                }
+                r.into()
+            };
             col = col.push(
                 column![
                     avatar(app, &p.given, &app.me.to_string(), 88.0),
+                    photo_actions,
                     text(if app.phone.is_empty() { "…".to_string() } else { app.phone.clone() }).size(16),
                     muted_text(format!("ACI {}", app.me)).size(12),
                 ]
@@ -1059,15 +1318,42 @@ fn settings<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, M
                 ]
                 .spacing(8),
                 button(text("Save profile")).padding([8, 16]).on_press_maybe(app.can_save_profile(p).then_some(Message::SaveProfile)).style(button::primary),
-                muted_text("Change your photo on your phone: signal-rusted can't upload one yet."),
             ]
             .spacing(12);
             col = col.push(settings_card("Name and about", form));
+            col = col.push(settings_card("Share your profile", share_card(app)));
         }
-        SettingsSection::Themes => {
+        SettingsSection::Appearance => {
             let cards = THEMES.iter().fold(row![].spacing(12), |r, &(choice, label)| r.push(theme_card(app, choice, label)));
             col = col.push(settings_card("Theme", cards.wrap().vertical_spacing(12)));
             col = col.push(muted_text("System follows your desktop's light or dark mode. The others always look the same."));
+            let swatch = container(Space::new()).width(56).height(32).style(|t: &Theme| container::Style {
+                background: Some(bubble_fill(accent(t))),
+                border: Border { radius: round(16.0), ..Default::default() },
+                ..Default::default()
+            });
+            let rounding = column![
+                row![choices(app.settings.square, &[(false, "Round"), (true, "Square")], Message::SetSquare), swatch]
+                    .spacing(16)
+                    .align_y(Alignment::Center),
+                muted_text("The corners of message bubbles, avatars, photos, panels and buttons."),
+            ]
+            .spacing(12);
+            col = col.push(settings_card("Rounding", rounding));
+            col = col.push(settings_card("Custom themes", custom_themes(app, s)));
+        }
+        SettingsSection::Chats => {
+            let (key, signup) = match app.settings.gif_provider {
+                GifProvider::Giphy => ("GIPHY API key", "Get a free key at developers.giphy.com."),
+                GifProvider::Tenor => ("Tenor API key", "Get a key in the Google Cloud console (Tenor API); restrict it to that API."),
+            };
+            let gifs = column![
+                choices(app.settings.gif_provider, &[(GifProvider::Giphy, "GIPHY"), (GifProvider::Tenor, "Tenor")], Message::SetGifProvider),
+                text_input(key, app.settings.gif_key()).id("gif-key").on_input(Message::SetGifKey).padding(10),
+                muted_text(format!("{signup} Searches go straight to the provider, which sees your IP address.")),
+            ]
+            .spacing(12);
+            col = col.push(settings_card("GIFs", gifs));
         }
         SettingsSection::Notifications => {
             let text_toggle = checkbox(app.settings.notification_text).label("Show message text in notifications");
@@ -1077,6 +1363,36 @@ fn settings<'a>(app: &'a App, s: &'a crate::app::SettingsPanel) -> Element<'a, M
             ]
             .spacing(14);
             col = col.push(settings_card("Notifications", body));
+        }
+        SettingsSection::Plugins => {
+            let mut list = Column::new().spacing(14);
+            if app.plugins.is_empty() {
+                list = list.push(muted_text("No plugins yet. Put an executable program in the plugins folder, then come back here."));
+            }
+            for p in &app.plugins {
+                let on = app.settings.plugins.contains(&p.name);
+                let name = p.name.clone();
+                let status = app.plugin_status.get(&p.name).cloned().unwrap_or_else(|| if on { "Starting…".into() } else { "Off".into() });
+                list = list.push(
+                    row![
+                        icon(icons::PUZZLE, 20),
+                        column![text(p.name.clone()).font(BOLD), muted_text(status).size(12)].spacing(2).width(Length::Fill),
+                        checkbox(on).label("Enabled").on_toggle(move |v| Message::TogglePlugin(name.clone(), v)),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                );
+            }
+            col = col.push(settings_card("Installed", list));
+            col = col.push(
+                row![
+                    muted_text("Plugins are programs that read your messages and can send messages for you. Only enable ones you trust; they run with your user's permissions. See docs/plugins.md.")
+                        .width(Length::Fill),
+                    button(text("Open plugins folder").size(13)).on_press(Message::OpenPluginsFolder).style(button::text),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            );
         }
         SettingsSection::Devices => {
             let mut list = Column::new().spacing(12);
@@ -1242,7 +1558,7 @@ fn bubble_fill(c: Color) -> Background {
 /// A round button that stands out on either bubble: accent on grey, white on accent.
 /// `label` is its widget id (for tests).
 fn bubble_button<'a>(src: &'static str, label: &'static str, press: Option<Message>, on_accent: bool) -> Element<'a, Message> {
-    let b = button(container(icon(src, 18).style(move |t: &Theme, _| svg::Style { color: Some(if on_accent { accent(t) } else { Color::WHITE }) })).center(18))
+    let b = button(container(icon(src, 18).style(move |t: &Theme, _| svg::Style { color: Some(if on_accent { accent(t) } else { on_accent_color(t) }) })).center(18))
         .padding(9)
         .on_press_maybe(press)
         .style(move |t: &Theme, status| {
@@ -1252,7 +1568,7 @@ fn bubble_button<'a>(src: &'static str, label: &'static str, press: Option<Messa
                 button::Status::Disabled => base.scale_alpha(0.5),
                 _ => base,
             };
-            button::Style { background: Some(bg.into()), border: Border { radius: 18.0.into(), ..Default::default() }, ..Default::default() }
+            button::Style { background: Some(bg.into()), border: Border { radius: round(18.0), ..Default::default() }, ..Default::default() }
         });
     container(b).id(label).into()
 }
@@ -1313,7 +1629,7 @@ fn file_card<'a>(app: &'a App, a: &AttachmentPointer, key: String, fg: Color) ->
     ];
     let tile = container(page).center(52).style(|t: &Theme| container::Style {
         background: Some(t.palette().background.into()),
-        border: Border { radius: 12.0.into(), ..Default::default() },
+        border: Border { radius: round(12.0), ..Default::default() },
         ..Default::default()
     });
     let fallback = match ct.unwrap_or("") {
@@ -1323,7 +1639,7 @@ fn file_card<'a>(app: &'a App, a: &AttachmentPointer, key: String, fg: Color) ->
     };
     let name = a.file_name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| fallback.into());
     let size = a.size.filter(|s| *s > 0).map(file_size);
-    let on_accent = fg == Color::WHITE;
+    let on_accent = fg != app.theme().palette().text;
     let (detail, action) = match app.attachments.get(&key) {
         Some(Attach::Ready(_)) => (size, Some(bubble_button(icons::SAVE, "Save", Some(Message::SaveAttachment(key)), on_accent))),
         Some(Attach::Loading) => (Some("Downloading…".into()), Some(bubble_button(icons::SENDING, "Downloading", None, on_accent))),
@@ -1355,7 +1671,7 @@ fn audio_player<'a>(app: &'a App, a: &AttachmentPointer, key: String, fg: Color)
         _ if playing.is_some_and(|p| !p.is_paused()) => (icons::PAUSE, "Pause", Some(Message::PlayPause(key.clone()))),
         _ => (icons::PLAY, "Play", Some(Message::PlayPause(key.clone()))),
     };
-    let on_accent = fg == Color::WHITE;
+    let on_accent = fg != app.theme().palette().text;
     let time = match (playing, total) {
         (Some(_), Some(t)) => format!("{} / {}", crate::audio::mmss(pos.min(t)), crate::audio::mmss(t)),
         (Some(_), None) => crate::audio::mmss(pos),
@@ -1371,7 +1687,7 @@ fn audio_player<'a>(app: &'a App, a: &AttachmentPointer, key: String, fg: Color)
         progress_bar(0.0..=1.0, frac).length(140).girth(4).style(move |t: &Theme| progress_bar::Style {
             background: Color { a: 0.3, ..fg }.into(),
             bar: (if on_accent { Color::WHITE } else { accent(t) }).into(),
-            border: Border { radius: 2.0.into(), ..Default::default() },
+            border: Border { radius: round(2.0), ..Default::default() },
         }),
         text(time).size(12).color(fg),
     ]
@@ -1394,7 +1710,7 @@ fn attachment<'a>(app: &'a App, a: &AttachmentPointer, fg: Color) -> Element<'a,
     }
     let is_image = a.content_type.as_deref().is_some_and(|c| c.starts_with("image/"));
     match app.attachments.get(&key) {
-        Some(Attach::Ready(path)) if is_image => clickable_image(key, path, Length::Shrink, ContentFit::Contain),
+        Some(Attach::Ready(path)) if is_image => clickable_image(app, key, path, Length::Shrink, ContentFit::Contain),
         _ => file_card(app, a, key, fg),
     }
 }
@@ -1435,12 +1751,20 @@ fn sticker<'a>(app: &'a App, m: &'a Msg, s: &'a Sticker, fg: Color) -> Element<'
 const THUMB: f32 = 200.0;
 
 /// An inline image that opens the viewer; its container id lets tests click it.
-fn clickable_image<'a>(key: String, path: &std::path::Path, size: Length, fit: ContentFit) -> Element<'a, Message> {
-    let img = image(image::Handle::from_path(path)).width(size).height(size).content_fit(fit).border_radius(14);
+fn clickable_image<'a>(app: &App, key: String, path: &std::path::Path, size: Length, fit: ContentFit) -> Element<'a, Message> {
+    let img = image(image_handle(app, &key, path)).width(size).height(size).content_fit(fit).border_radius(round(14.0));
     mouse_area(container(img).id(format!("image:{key}")))
         .on_press(Message::ViewImage(key))
         .interaction(mouse::Interaction::Pointer)
         .into()
+}
+
+/// The image file, or the current frame of an animated GIF.
+fn image_handle(app: &App, key: &str, path: &std::path::Path) -> image::Handle {
+    match app.animations.get(key) {
+        Some(a) => a.frame(app.now.saturating_duration_since(app.started)).clone(),
+        None => image::Handle::from_path(path),
+    }
 }
 
 /// Several images in one message: a grid, two per row.
@@ -1451,7 +1775,7 @@ fn image_grid<'a>(app: &'a App, images: &[&'a AttachmentPointer], fg: Color) -> 
             c.push(pair.iter().fold(row![].spacing(4), |r, a| {
                 let key = attachment_key(a);
                 r.push(match app.attachments.get(&key) {
-                    Some(Attach::Ready(path)) => clickable_image(key, path, Length::Fixed(THUMB), ContentFit::Cover),
+                    Some(Attach::Ready(path)) => clickable_image(app, key, path, Length::Fixed(THUMB), ContentFit::Cover),
                     _ => container(attachment(app, a, fg)).center(THUMB).into(),
                 })
             }))
@@ -1476,7 +1800,7 @@ fn preview_card<'a>(app: &'a App, p: &'a Preview, fg: Color) -> Option<Element<'
     col = col.push(text(domain).size(12).color(Color { a: 0.7, ..fg }));
     let card = container(col).padding([6, 8]).width(320).style(|_| container::Style {
         background: Some(Color { a: 0.18, ..Color::BLACK }.into()),
-        border: Border { radius: 8.0.into(), ..Default::default() },
+        border: Border { radius: round(8.0), ..Default::default() },
         ..Default::default()
     });
     Some(mouse_area(card).on_press(Message::OpenUrl(url.to_owned())).interaction(mouse::Interaction::Pointer).into())
@@ -1506,7 +1830,7 @@ fn lightbox<'a>(app: &'a App, key: &'a str) -> Element<'a, Message> {
     let shown: Element<_> = match app.attachments.get(key) {
         Some(Attach::Ready(path)) => {
             top = top.push(button(text("Save…")).on_press(Message::SaveAttachment(key.to_owned())).style(button::secondary));
-            image(image::Handle::from_path(path)).width(Length::Fill).height(Length::Fill).into()
+            image(image_handle(app, key, path)).width(Length::Fill).height(Length::Fill).into()
         }
         Some(Attach::Failed(e)) => text(format!("Download failed: {e}")).color(Color::WHITE).into(),
         _ => text("Loading…").color(Color::WHITE).into(),
@@ -1547,7 +1871,7 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
         && m.attachments.iter().all(is_image);
     // Stickers and bare photos have no bubble, so their footer sits on the timeline background.
     let bare = is_sticker || images_only;
-    let fg = if m.outgoing && !bare { Color::WHITE } else { app.theme().palette().text };
+    let fg = if m.outgoing && !bare { on_accent_color(&app.theme()) } else { app.theme().palette().text };
     let mut bubble = Column::new().spacing(4);
     if show_author {
         bubble = bubble.push(text(display_name(&app.names, m.author)).size(13).font(Font { weight: Weight::Bold, ..Font::DEFAULT }).color(color!(0x7aa5f7)));
@@ -1561,7 +1885,7 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
                     .padding([4, 8])
                     .style(move |_| container::Style {
                         background: Some(Color { a: 0.18, ..Color::BLACK }.into()),
-                        border: Border { radius: 8.0.into(), width: 0.0, color: Color::TRANSPARENT },
+                        border: Border { radius: round(8.0), width: 0.0, color: Color::TRANSPARENT },
                         ..Default::default()
                     }),
             );
@@ -1580,7 +1904,7 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
                 .padding([4, 8])
                 .style(move |_| container::Style {
                     background: Some(Color { a: 0.18, ..Color::BLACK }.into()),
-                    border: Border { radius: 8.0.into(), width: 0.0, color: Color::TRANSPARENT },
+                    border: Border { radius: round(8.0), width: 0.0, color: Color::TRANSPARENT },
                     ..Default::default()
                 }),
             );
@@ -1623,7 +1947,7 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
 
     let bubble = container(bubble).padding(if images_only { [2, 4] } else { [8, 12] }).max_width(520).style(move |t: &Theme| container::Style {
         background: (!bare).then(|| bubble_fill(if m.outgoing { accent(t) } else { surface(t) })),
-        border: Border { radius: 18.0.into(), ..Default::default() },
+        border: Border { radius: round(18.0), ..Default::default() },
         ..Default::default()
     });
 
@@ -1653,7 +1977,7 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
             .push(button(text("Cancel").size(13)).on_press(Message::ToggleDelete(None)).style(button::text));
         col = col.push(container(bar).padding(4).style(|t: &Theme| container::Style {
             background: Some(surface(t).into()),
-            border: Border { radius: 12.0.into(), ..Default::default() },
+            border: Border { radius: round(12.0), ..Default::default() },
             ..Default::default()
         }));
     }
@@ -1663,7 +1987,7 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
             .fold(row![].spacing(2), |r, e| r.push(button(text(*e).size(22)).on_press(Message::React(m.author, m.id, (*e).into())).style(button::text)));
         col = col.push(container(bar).padding(4).style(|t: &Theme| container::Style {
             background: Some(surface(t).into()),
-            border: Border { radius: 20.0.into(), ..Default::default() },
+            border: Border { radius: round(20.0), ..Default::default() },
             ..Default::default()
         }));
     }
@@ -1679,7 +2003,7 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
             r.push(button(text(label).size(14)).padding([2, 8]).on_press(Message::React(m.author, m.id, e.to_owned())).style(move |t: &Theme, _| button::Style {
                 background: Some(if mine { accent(t).scale_alpha(0.35).into() } else { surface(t).into() }),
                 text_color: t.palette().text,
-                border: Border { radius: 12.0.into(), width: 1.0, color: t.palette().background },
+                border: Border { radius: round(12.0), width: 1.0, color: t.palette().background },
                 ..Default::default()
             }))
         });
@@ -1694,11 +2018,8 @@ fn message<'a>(app: &'a App, o: &'a Open, m: &'a Msg, show_author: bool) -> Elem
 
 fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     let mut col = Column::new().spacing(6).padding([8, 16]);
-    if let Some(p) = &o.picker {
-        col = col.push(emoji_picker(p));
-    }
-    if let Some(tab) = &o.stickers {
-        col = col.push(sticker_picker(app, tab));
+    if let Some(panel) = fun_panel(app, o) {
+        col = col.push(panel);
     }
     if let Some(q) = &o.quote {
         let who = if q.author == app.me { "You".into() } else { display_name(&app.names, q.author) };
@@ -1710,7 +2031,7 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
             .padding([4, 10])
             .style(|t: &Theme| container::Style {
                 background: Some(surface(t).into()),
-                border: Border { radius: 8.0.into(), ..Default::default() },
+                border: Border { radius: round(8.0), ..Default::default() },
                 ..Default::default()
             }),
         );
@@ -1725,7 +2046,7 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
             .padding([4, 10])
             .style(|t: &Theme| container::Style {
                 background: Some(surface(t).into()),
-                border: Border { radius: 8.0.into(), ..Default::default() },
+                border: Border { radius: round(8.0), ..Default::default() },
                 ..Default::default()
             }),
         );
@@ -1750,7 +2071,7 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         });
         col = col.push(container(list).padding(4).style(|t: &Theme| container::Style {
             background: Some(surface(t).into()),
-            border: Border { radius: 8.0.into(), ..Default::default() },
+            border: Border { radius: round(8.0), ..Default::default() },
             ..Default::default()
         }));
     }
@@ -1794,16 +2115,16 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
         .height(Length::Shrink)
         .style(|t: &Theme, st| text_editor::Style {
             background: pill(t),
-            border: Border { radius: 20.0.into(), ..Default::default() },
+            border: Border { radius: round(20.0), ..Default::default() },
             ..text_editor::default(t, st)
         });
     let action: Element<_> = if draft.trim().is_empty() && o.files.is_empty() {
         icon_button(icons::MIC, "Voice note", Some(Message::Record))
     } else {
-        let send = button(container(tinted(icons::SEND, 18, Color::WHITE)).center(20)).padding(9).on_press(Message::Send).style(|t: &Theme, status| {
+        let send = button(container(icon(icons::SEND, 18).style(|t: &Theme, _| svg::Style { color: Some(on_accent_color(t)) })).center(20)).padding(9).on_press(Message::Send).style(|t: &Theme, status| {
             button::Style {
                 background: Some(if matches!(status, button::Status::Hovered) { mix(accent(t), Color::BLACK, 0.1) } else { accent(t) }.into()),
-                border: Border { radius: 20.0.into(), ..Default::default() },
+                border: Border { radius: round(20.0), ..Default::default() },
                 ..Default::default()
             }
         });
@@ -1823,18 +2144,73 @@ fn composer<'a>(app: &'a App, o: &'a Open) -> Element<'a, Message> {
     .into()
 }
 
+/// Signal's "fun" panel: emoji, sticker and GIF pickers as tabs.
+fn fun_panel<'a>(app: &'a App, o: &'a Open) -> Option<Element<'a, Message>> {
+    let (active, body) = match (&o.picker, &o.stickers, &o.gifs) {
+        (Some(p), ..) => (Fun::Emoji, emoji_picker(p)),
+        (_, Some(tab), _) => (Fun::Stickers, sticker_picker(app, tab)),
+        (.., Some(g)) => (Fun::Gifs, gif_picker(app, g)),
+        _ => return None,
+    };
+    let tabs = [(Fun::Emoji, "Emoji"), (Fun::Stickers, "Stickers"), (Fun::Gifs, "GIFs")].into_iter().fold(row![].spacing(4), |r, (fun, label)| {
+        let selected = fun == active;
+        r.push(button(text(label).size(13)).padding([5, 14]).on_press(Message::OpenFun(fun)).style(move |t: &Theme, status| button::Style {
+            background: if selected {
+                Some(accent(t).into())
+            } else {
+                matches!(status, button::Status::Hovered).then(|| t.palette().background.into())
+            },
+            text_color: if selected { on_accent_color(t) } else { t.palette().text },
+            border: Border { radius: round(14.0), ..Default::default() },
+            ..Default::default()
+        }))
+    });
+    Some(
+        container(column![tabs, body].spacing(8))
+            .width(Length::Fill)
+            .padding(10)
+            .style(|t: &Theme| container::Style {
+                background: Some(surface(t).into()),
+                border: Border { radius: round(14.0), ..Default::default() },
+                ..Default::default()
+            })
+            .into(),
+    )
+}
+
+/// Highlights the selected tab of a picker's sub-navigation.
+fn tab_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |t, s| {
+        let mut st = button::text(t, s);
+        if selected {
+            st.background = Some(t.palette().background.into());
+        }
+        st.border.radius = round(8.0);
+        st
+    }
+}
+
+/// The category icon for an emoji group, as in Signal's picker.
+fn group_icon(g: emojis::Group) -> &'static str {
+    use emojis::Group::*;
+    match g {
+        SmileysAndEmotion => icons::SMILE,
+        PeopleAndBody => icons::USER,
+        AnimalsAndNature => icons::PAW,
+        FoodAndDrink => icons::APPLE,
+        TravelAndPlaces => icons::PLANE,
+        Activities => icons::TROPHY,
+        Objects => icons::BULB,
+        Symbols => icons::HEART,
+        Flags => icons::FLAG,
+    }
+}
+
 fn emoji_picker(p: &crate::app::Picker) -> Element<'_, Message> {
-    let tabs = emojis::Group::iter()
-        .fold(row![].spacing(2), |r, g| {
-            let icon = g.emojis().next().map_or("?", |e| e.as_str());
-            r.push(button(text(icon).size(18)).on_press(Message::PickerGroup(g)).style(move |t: &Theme, s| {
-                let mut st = button::text(t, s);
-                if g == p.group && p.query.is_empty() {
-                    st.background = Some(surface(t).into());
-                }
-                st
-            }))
-        });
+    let tabs = emojis::Group::iter().fold(row![].spacing(2), |r, g| {
+        let selected = g == p.group && p.query.is_empty();
+        r.push(button(icon(group_icon(g), 18)).padding(6).on_press(Message::PickerGroup(g)).style(tab_style(selected)))
+    });
     let grid = emoji::search(&p.query, p.group)
         .into_iter()
         .take(600)
@@ -1842,32 +2218,24 @@ fn emoji_picker(p: &crate::app::Picker) -> Element<'_, Message> {
             r.push(button(text(e.as_str()).size(22)).padding(2).on_press(Message::InsertEmoji(e.as_str())).style(button::text))
         })
         .wrap();
-    container(column![
-        text_input("Search emoji", &p.query).on_input(Message::PickerQuery).padding(6),
-        tabs,
-        scrollable(grid).height(220),
-    ]
-    .spacing(6))
-    .padding(8)
-    .style(|t: &Theme| container::Style {
-        background: Some(surface(t).into()),
-        border: Border { radius: 12.0.into(), ..Default::default() },
-        ..Default::default()
-    })
-    .into()
+    column![search_box("Search emoji", &p.query, Message::PickerQuery), tabs, scrollable(grid).height(220)].spacing(6).into()
+}
+
+/// A pill-shaped search field, like the chat list's.
+fn search_box<'a>(placeholder: &'a str, value: &'a str, on_input: fn(String) -> Message) -> Element<'a, Message> {
+    text_input(placeholder, value)
+        .on_input(on_input)
+        .padding([6, 12])
+        .style(|t: &Theme, st| text_input::Style {
+            background: t.palette().background.into(),
+            border: Border { radius: round(16.0), ..Default::default() },
+            ..text_input::default(t, st)
+        })
+        .into()
 }
 
 fn sticker_picker<'a>(app: &'a App, tab: &StickerTab) -> Element<'a, Message> {
-    let tab_style = |selected: bool| {
-        move |t: &Theme, s| {
-            let mut st = button::text(t, s);
-            if selected {
-                st.background = Some(t.palette().background.into());
-            }
-            st
-        }
-    };
-    let mut tabs = row![button(text("🕘").size(18)).on_press(Message::StickerTab(StickerTab::Recent)).style(tab_style(*tab == StickerTab::Recent))]
+    let mut tabs = row![button(icon(icons::CLOCK, 18)).padding(6).on_press(Message::StickerTab(StickerTab::Recent)).style(tab_style(*tab == StickerTab::Recent))]
         .spacing(2)
         .align_y(Alignment::Center);
     for p in &app.packs {
@@ -1891,6 +2259,7 @@ fn sticker_picker<'a>(app: &'a App, tab: &StickerTab) -> Element<'a, Message> {
         StickerTab::Pack(id) => app.packs.iter().filter(|p| p.id == *id).flat_map(|p| p.stickers.iter().map(|s| (p.id.as_slice(), s))).collect(),
     };
     let title = match tab {
+        StickerTab::Recent if cells.is_empty() && app.packs.is_empty() => "No sticker packs yet: install one from a sticker someone sends you",
         StickerTab::Recent if cells.is_empty() => "No recent stickers",
         StickerTab::Recent => "Recently used",
         StickerTab::Pack(id) => app.packs.iter().find(|p| p.id == *id).map_or("", |p| p.title.as_str()),
@@ -1902,15 +2271,40 @@ fn sticker_picker<'a>(app: &'a App, tab: &StickerTab) -> Element<'a, Message> {
             r.push(button(cell).padding(2).on_press(Message::SendSticker(pack.to_vec(), s.id)).style(button::text))
         })
         .wrap();
-    container(column![tabs, text(title).size(13).style(|t: &Theme| text::Style { color: Some(muted(t)) }), scrollable(grid).height(240)].spacing(6))
-        .width(Length::Fill)
-        .padding(8)
-        .style(|t: &Theme| container::Style {
-            background: Some(surface(t).into()),
-            border: Border { radius: 12.0.into(), ..Default::default() },
-            ..Default::default()
+    column![tabs, muted_text(title).size(13), scrollable(grid).height(240)].spacing(6).into()
+}
+
+/// GIF search through the provider picked in settings; a click sends the GIF.
+fn gif_picker<'a>(app: &'a App, g: &'a crate::app::GifPanel) -> Element<'a, Message> {
+    // Both providers' terms ask for attribution next to results.
+    let attribution = match app.settings.gif_provider {
+        GifProvider::Giphy => "Powered by GIPHY",
+        GifProvider::Tenor => "Via Tenor",
+    };
+    let status: Element<_> = match (&g.error, g.loading) {
+        (Some(e), _) => text(e.clone()).size(13).style(text::danger).into(),
+        (None, true) => muted_text("Loading…").size(13).into(),
+        (None, false) if g.results.is_empty() => muted_text("No GIFs found").size(13).into(),
+        (None, false) => muted_text(if g.query.trim().is_empty() { "Trending" } else { "Results" }).size(13).into(),
+    };
+    let grid = g
+        .results
+        .iter()
+        .enumerate()
+        .fold(row![].spacing(4), |r, (i, (gif, h))| {
+            let cell = container(image(h.clone()).height(96).content_fit(ContentFit::Contain).border_radius(round(8.0))).id(format!("gif-{i}"));
+            r.push(button(cell).padding(2).on_press(Message::SendGif(gif.url.clone())).style(button::text))
         })
-        .into()
+        .wrap();
+    column![
+        row![container(search_box("Search GIFs", &g.query, Message::GifQuery)).width(Length::Fill), muted_text(attribution).size(11)]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        status,
+        scrollable(grid).height(260),
+    ]
+    .spacing(6)
+    .into()
 }
 
 #[cfg(test)]
@@ -2371,12 +2765,109 @@ mod tests {
             let _ = app.update(m);
         }
         let mut ui = simulator(view(&app));
-        ui.click("5m").expect("timer choices");
+        ui.click("5 minutes").expect("timer choices");
         for m in ui.into_messages().collect::<Vec<_>>() {
             let _ = app.update(m);
         }
         assert!(matches!(rx.try_recv(), Ok(crate::backend::Command::SetTimer { seconds: 300, .. })));
         assert!(simulator(view(&app)).find("5m").is_ok(), "header shows the new timer");
+    }
+
+    #[test]
+    fn timer_menu_sets_a_custom_time() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        app.update(Message::ToggleTimerMenu);
+        assert!(simulator(view(&app)).find("4 weeks").is_ok());
+        app.update(Message::TimerAmount("9x0".into()));
+        assert_eq!(app.open.as_ref().unwrap().timer_menu.as_ref().unwrap().amount, "90", "digits only");
+        click(&mut app, "minutes");
+        click(&mut app, "Set");
+        assert!(matches!(rx.try_recv(), Ok(Command::SetTimer { seconds: 5400, .. })));
+        app.update(Message::ToggleTimerMenu);
+        assert!(simulator(view(&app)).find("Custom: 90 minutes").is_ok(), "a non-preset time is shown as custom");
+        assert_eq!(app.open.as_ref().unwrap().timer_menu.as_ref().unwrap().seconds(), None, "fresh entry");
+    }
+
+    /// Writes `snapshots/timer-menu-*.png`: the disappearing-messages dropdown over the chat.
+    #[test]
+    fn timer_menu_snapshot() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        app.update(Message::SetTheme(ThemeChoice::Everforest));
+        app.update(Message::ToggleTimerMenu);
+        app.update(Message::TimerAmount("90".into()));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("snapshots");
+        for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if f.file_name().to_string_lossy().starts_with("timer-menu") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        let snap = ui.snapshot(&app.theme()).expect("render");
+        assert!(snap.matches_image(dir.join("timer-menu")).expect("write png"));
+    }
+
+    #[test]
+    fn timer_labels() {
+        assert_eq!(
+            [0, 30, 300, 3_600, 28_800, 86_400, 604_800, 2_419_200, 5_400, 90].map(long_duration),
+            ["Off", "30 seconds", "5 minutes", "1 hour", "8 hours", "1 day", "1 week", "4 weeks", "90 minutes", "90 seconds"]
+        );
+        let c = |amount: &str, unit| crate::app::CustomTimer { amount: amount.into(), unit };
+        assert_eq!((c("2", 86_400).seconds(), c("0", 60).seconds(), c("53", 604_800).seconds()), (Some(172_800), None, None), "a year at most");
+    }
+
+    #[test]
+    fn everforest_puts_dark_text_on_its_pale_accent() {
+        let t = app_theme(ThemeChoice::Everforest, true);
+        assert_eq!(on_accent_color(&t), t.palette().background);
+        assert_eq!(on_accent_color(&app_theme(ThemeChoice::Dark, true)), Color::WHITE);
+    }
+
+    #[test]
+    fn plugin_actions_send_only_to_listed_chats() {
+        use crate::plugins::{Action, Update};
+        let (mut app, mut rx) = app();
+        let send = |chat: String| Message::Plugin("bot".into(), Update::Action(Action::Send { chat, body: "pong".into() }));
+        app.update(send(crate::state::thread_key(&alice())));
+        assert!(drain(&mut rx).is_empty(), "disabled plugins are ignored");
+        app.update(Message::TogglePlugin("bot".into(), true));
+        drain(&mut rx);
+        app.update(send(crate::state::thread_key(&alice())));
+        let cmds = drain(&mut rx);
+        assert!(matches!(cmds.as_slice(), [Command::Send { thread, body, .. }] if *thread == alice() && body == "pong"), "{cmds:?}");
+        app.update(send(crate::state::thread_key(&presage::store::Thread::Group([9; 32]))));
+        assert!(drain(&mut rx).is_empty(), "not to chats outside the list");
+    }
+
+    #[test]
+    fn plugins_get_incoming_and_sent_messages() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        app.update(Message::TogglePlugin("bot".into(), true));
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        app.update(Message::Plugin("bot".into(), crate::plugins::Update::Ready(tx)));
+        app.update(Message::Backend(Event::Incoming { thread: alice(), content: Box::new(content(uuid(2), 30, crate::timeline::tests::text(30, "!ping"))) }));
+        let e: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!((e["type"].as_str(), e["body"].as_str(), e["from_name"].as_str(), e["outgoing"].as_bool()), (Some("message"), Some("!ping"), Some("Alice"), Some(false)));
+        assert_eq!(e["chat"].as_str(), Some(crate::state::thread_key(&alice()).as_str()));
+        app.open.as_mut().unwrap().composer = iced::widget::text_editor::Content::with_text("hello");
+        app.update(Message::Send);
+        let e: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!((e["type"].as_str(), e["body"].as_str(), e["chat_name"].as_str()), (Some("sent"), Some("hello"), Some("Alice")));
+    }
+
+    #[test]
+    fn picked_photo_is_uploaded_once() {
+        let (mut app, mut rx) = settings_app();
+        app.update(Message::PhotoReady(Ok(vec![0xff, 0xd8])));
+        app.update(Message::PhotoReady(Ok(vec![0xff, 0xd8])));
+        let cmds = drain(&mut rx);
+        assert!(matches!(cmds.as_slice(), [Command::SetAvatar(Some(_))]), "one upload at a time: {cmds:?}");
+        assert!(simulator(view(&app)).find("Uploading…").is_ok());
+        app.update(Message::Backend(Event::Profile(app.profile.clone().unwrap())));
+        assert!(simulator(view(&app)).find("Change photo").is_ok(), "done");
     }
 
     #[test]
@@ -2720,7 +3211,7 @@ mod tests {
         click(&mut app, "Linked devices");
         assert!(simulator(view(&app)).find("This device").is_ok(), "this device marked");
         app.system_dark = true;
-        click(&mut app, "Themes");
+        click(&mut app, "Appearance");
         click(&mut app, "Light");
         assert!(!app.dark, "overrides the dark system theme");
         let cmds = crate::app::tests::drain(&mut rx);
@@ -2734,7 +3225,7 @@ mod tests {
         assert!(!app.settings.notifications);
         let cmds = crate::app::tests::drain(&mut rx);
         assert!(matches!(cmds.last(), Some(Command::SaveSettings(s)) if !s.notifications && !s.notification_text), "{cmds:?}");
-        click(&mut app, "Themes");
+        click(&mut app, "Appearance");
         click(&mut app, "System");
         app.update(Message::Theme(iced::theme::Mode::Light));
         assert!(!app.dark, "follows the system again");
@@ -2759,6 +3250,60 @@ mod tests {
                 if given == "Faker" && family == "Person" && about == "Testing" && emoji == "🧪"),
             "{cmds:?}"
         );
+    }
+
+    #[test]
+    fn profile_shares_a_signal_me_qr_code() {
+        let (mut app, _rx) = settings_app();
+        click(&mut app, "Profile");
+        let mut ui = simulator(view(&app));
+        ui.click("Copy link").expect("copy button");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        assert!(matches!(msgs.as_slice(), [Message::Copy(l)] if l == "https://signal.me/#p/+15550100"), "{msgs:?}");
+    }
+
+    #[test]
+    fn appearance_rounding_and_gif_provider_are_saved() {
+        let (mut app, mut rx) = settings_app();
+        click(&mut app, "Appearance");
+        click(&mut app, "Square");
+        assert!(app.settings.square);
+        click(&mut app, "Chats");
+        click(&mut app, "Tenor");
+        let cmds = crate::app::tests::drain(&mut rx);
+        assert!(matches!(cmds.last(), Some(Command::SaveSettings(s)) if s.square && s.gif_provider == GifProvider::Tenor), "{cmds:?}");
+        app.update(Message::SetGifKey("abc".into()));
+        assert_eq!((app.settings.tenor_key.as_str(), app.settings.giphy_key.as_str()), ("abc", ""), "the key goes to the selected provider");
+        assert_eq!((square_or(18.0, true), square_or(2.0, true), square_or(18.0, false)), (3.0, 2.0, 18.0));
+    }
+
+    #[test]
+    fn fun_panel_tabs_and_sending_a_gif() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        click_id(&mut app, "Emoji");
+        assert!(app.open.as_ref().unwrap().picker.is_some(), "emoji tab first");
+        click(&mut app, "GIFs");
+        let o = app.open.as_ref().unwrap();
+        assert!(o.gifs.is_some() && o.picker.is_none() && o.stickers.is_none());
+        app.update(Message::GifResults(String::new(), Err("Add a Giphy API key in Settings → Chats".into())));
+        assert!(simulator(view(&app)).find("Add a Giphy API key in Settings → Chats").is_ok());
+        let gif = crate::gifs::Gif { title: "cat".into(), preview: "https://p".into(), url: "https://media0.giphy.com/cat.gif".into() };
+        let still = image::Handle::from_rgba(1, 1, vec![0; 4]);
+        app.update(Message::GifResults(String::new(), Ok(vec![(gif, still)])));
+        let mut ui = simulator(view(&app));
+        ui.click(iced::widget::Id::new("gif-0")).expect("gif cell");
+        let msgs: Vec<Message> = ui.into_messages().collect();
+        assert!(matches!(msgs.as_slice(), [Message::SendGif(u)] if u == "https://media0.giphy.com/cat.gif"), "{msgs:?}");
+        drain(&mut rx);
+        app.update(Message::GifDownloaded(Ok("/tmp/gif-1.gif".into())));
+        let cmds = drain(&mut rx);
+        assert!(cmds.iter().any(|c| matches!(c, Command::Send { attachments, .. } if attachments.len() == 1)), "{cmds:?}");
+        app.update(Message::OpenFun(Fun::Stickers));
+        assert!(app.open.as_ref().unwrap().stickers.is_some());
+        click_id(&mut app, "Emoji");
+        let o = app.open.as_ref().unwrap();
+        assert!(o.picker.is_none() && o.stickers.is_none() && o.gifs.is_none(), "the emoji button closes any open tab");
     }
 
     #[test]
@@ -2802,8 +3347,10 @@ mod tests {
         for (name, section, theme) in [
             ("settings-profile", SettingsSection::Profile, ThemeChoice::Light),
             ("settings-devices", SettingsSection::Devices, ThemeChoice::Light),
-            ("settings-themes", SettingsSection::Themes, ThemeChoice::Light),
-            ("settings-themes-rusted", SettingsSection::Themes, ThemeChoice::Rusted),
+            ("settings-appearance", SettingsSection::Appearance, ThemeChoice::Light),
+            ("settings-appearance-rusted", SettingsSection::Appearance, ThemeChoice::Rusted),
+            ("settings-chats", SettingsSection::Chats, ThemeChoice::Dark),
+            ("settings-plugins", SettingsSection::Plugins, ThemeChoice::Everforest),
             ("settings-about", SettingsSection::About, ThemeChoice::Dark),
         ] {
             app.update(Message::SettingsSection(section));

@@ -87,6 +87,42 @@ pub const READ: &str = icon!(
     r#"<circle cx="8.5" cy="12" r="7.5" fill="black" stroke="none" mask="url(#l)"/><circle cx="15.5" cy="12" r="7.5" fill="black" stroke="none" mask="url(#c)"/>"#
 );
 
+// The emoji picker's categories, the sticker picker's recents, and profile sharing.
+pub const CLOCK: &str = icon!(r#"<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>"#);
+pub const PAW: &str = icon!(
+    r#"<circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/>"#,
+    r#"<path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/>"#
+);
+pub const APPLE: &str = icon!(
+    r#"<path d="M12 20.94c1.5 0 2.75 1.06 4 1.06 3 0 6-8 6-12.22A4.91 4.91 0 0 0 17 5c-2.22 0-4 1.44-5 2-1-.56-2.78-2-5-2a4.9 4.9 0 0 0-5 4.78C2 14 5 22 8 22c1.25 0 2.5-1.06 4-1.06Z"/>"#,
+    r#"<path d="M10 2c1 .5 2 2 2 5"/>"#
+);
+pub const PLANE: &str = icon!(
+    r#"<path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/>"#
+);
+pub const TROPHY: &str = icon!(
+    r#"<path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/><path d="M4 22h16"/>"#,
+    r#"<path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/><path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/>"#,
+    r#"<path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"/>"#
+);
+pub const BULB: &str = icon!(
+    r#"<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/>"#,
+    r#"<path d="M9 18h6"/><path d="M10 22h4"/>"#
+);
+pub const HEART: &str = icon!(
+    r#"<path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/>"#
+);
+pub const FLAG: &str = icon!(r#"<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><path d="M4 22v-7"/>"#);
+pub const QR: &str = icon!(
+    r#"<rect width="5" height="5" x="3" y="3" rx="1"/><rect width="5" height="5" x="16" y="3" rx="1"/><rect width="5" height="5" x="3" y="16" rx="1"/>"#,
+    r#"<path d="M21 16h-3a2 2 0 0 0-2 2v3"/><path d="M21 21v.01"/><path d="M12 7v3a2 2 0 0 1-2 2H7"/><path d="M3 12h.01"/>"#,
+    r#"<path d="M12 3h.01"/><path d="M12 16v.01"/><path d="M16 12h1"/><path d="M21 12v.01"/><path d="M12 21v-1"/>"#
+);
+pub const PUZZLE: &str = icon!(
+    r#"<path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z"/>"#
+);
+pub const COPY: &str = icon!(r#"<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>"#);
+
 /// `src` at `size` px in the theme's text color.
 pub fn icon<'a>(src: &'static str, size: impl Into<iced::Length> + Copy) -> Svg<'a> {
     svg(svg::Handle::from_memory(src.as_bytes())).width(size).height(size).style(|t: &Theme, _| svg::Style { color: Some(t.palette().text) })
@@ -105,6 +141,7 @@ mod tests {
         for src in [
             CHATS, STORIES, SETTINGS, COMPOSE, SEARCH, PHONE, TIMER, INFO, MORE, PIN, MUTED, SMILE, REPLY, EDIT, TRASH, ATTACH, STICKER, MIC,
             SEND, CLOSE, BACK, USER, PALETTE, BELL, DEVICES, ARCHIVE, CHECK, PLAY, PAUSE, DOWNLOAD, SAVE, RETRY, DOCUMENT, SENDING, SENT, DELIVERED, READ,
+            CLOCK, PAW, APPLE, PLANE, TROPHY, BULB, HEART, FLAG, QR, COPY, PUZZLE,
         ] {
             assert!(src.starts_with("<svg") && src.ends_with("</svg>"));
             assert_eq!(src.matches('<').count(), src.matches('>').count());

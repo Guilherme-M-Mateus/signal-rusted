@@ -108,6 +108,8 @@ pub enum Command {
     /// Fetches our profile and linked devices for the settings screen.
     LoadSettings,
     UpdateProfile { given: String, family: String, about: String, emoji: String },
+    /// A new profile photo (JPEG from `avatar_jpeg`), or `None` to remove it.
+    SetAvatar(Option<Vec<u8>>),
     SaveSettings(Settings),
     /// Unlinks this device, then deletes all local data and returns to the link screen.
     Unlink,
@@ -325,6 +327,44 @@ pub fn attachments_dir(data_dir: &Path) -> PathBuf {
 }
 
 /// Where a thread's avatar is cached.
+/// The CDN form the server returns for a new profile photo.
+#[derive(serde::Deserialize)]
+struct AvatarUpload {
+    key: String,
+    credential: String,
+    acl: String,
+    algorithm: String,
+    date: String,
+    policy: String,
+    signature: String,
+}
+
+/// Signal's profile photo size.
+const AVATAR_PX: u32 = 640;
+
+/// A picked image as profile photo bytes: center-cropped to a square, at most 640px, JPEG.
+pub fn avatar_jpeg(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| format!("not an image: {e}"))?;
+    let side = img.width().min(img.height());
+    let px = side.min(AVATAR_PX);
+    let img = img
+        .crop_imm((img.width() - side) / 2, (img.height() - side) / 2, side, side)
+        .resize_exact(px, px, image::imageops::FilterType::Lanczos3);
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&img.to_rgb8()).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// AES-256-GCM under the profile key: nonce, then ciphertext and tag (Signal's ProfileCipherOutputStream).
+fn encrypt_avatar(key: [u8; 32], plain: &[u8]) -> Vec<u8> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit};
+    let mut nonce = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+    let sealed = Aes256Gcm::new(&key.into()).encrypt(&nonce.into(), plain).expect("in-memory AES-GCM");
+    [nonce.as_slice(), &sealed].concat()
+}
+
 pub fn avatar_path(data_dir: &Path, key: &str) -> PathBuf {
     data_dir.join("avatars").join(key.replace(':', "_"))
 }
@@ -1330,6 +1370,12 @@ impl Backend {
                     self.emit(Event::Profile(p));
                 }
             }
+            Command::SetAvatar(jpeg) => {
+                let r = self.set_avatar(jpeg).await;
+                if let Some(p) = self.report("change your profile photo", r) {
+                    self.emit(Event::Profile(p));
+                }
+            }
             Command::SaveSettings(s) => self.state.set_settings(s),
             Command::Unlink => {
                 let r = self.manager.unlink_self().await;
@@ -1345,6 +1391,66 @@ impl Backend {
         anyhow::ensure!(!given.is_empty(), "your profile needs a first name");
         let name = presage::libsignal_service::profile_name::ProfileName { given_name: given, family_name: opt(family) };
         self.manager.update_profile(name, opt(about), opt(emoji)).await?;
+        let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::LocalProfile as i32) };
+        self.sync_to_self(SyncMessage { content: Some(SyncContent::FetchLatest(fetch)), ..Default::default() }).await?;
+        Ok(OwnProfile::from_profile(self.manager.retrieve_profile().await?))
+    }
+
+    /// Writes our profile with a new photo (or none), keeping name and about, then uploads the
+    /// encrypted photo to the CDN slot the server hands back. libsignal-service leaves this unimplemented.
+    async fn set_avatar(&mut self, jpeg: Option<Vec<u8>>) -> anyhow::Result<OwnProfile> {
+        use base64::Engine;
+        use presage::libsignal_service::profile_cipher::ProfileCipher;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let aci = self.manager.registration_data().service_ids.aci();
+        let key = self.manager.registration_data().profile_key();
+        let current = OwnProfile::from_profile(self.manager.retrieve_profile().await?);
+        anyhow::ensure!(!current.given.trim().is_empty(), "set a first name before a photo");
+        let cipher = ProfileCipher::new(key);
+        let rng = &mut rand::rng();
+        let name = presage::libsignal_service::profile_name::ProfileName {
+            given_name: current.given.as_str(),
+            family_name: Some(current.family.as_str()).filter(|f| !f.is_empty()),
+        };
+        // The server takes the version as the hex string bincode produces, as libsignal-service sends it.
+        let version = bincode::serialize(&key.get_profile_key_version(aci))?;
+        let body = serde_json::json!({
+            "version": std::str::from_utf8(&version)?,
+            "name": b64(&cipher.encrypt_name(name, rng)?),
+            "about": b64(&cipher.encrypt_about(current.about.clone(), rng)?),
+            "aboutEmoji": b64(&cipher.encrypt_emoji(current.emoji.clone(), rng)?),
+            "avatar": jpeg.is_some(),
+            "sameAvatar": false,
+            "commitment": b64(&bincode::serialize(&key.get_commitment(aci))?),
+        });
+        let push = self.manager.push_service();
+        let resp = push.request(reqwest::Method::PUT, Endpoint::service("/v1/profile"), HttpAuthOverride::NoOverride)?.json(&body).send().await?;
+        anyhow::ensure!(resp.status().is_success(), "profile update failed: HTTP {}", resp.status());
+        let cache = avatar_path(&self.data_dir, &self.me.to_string());
+        if let Some(jpeg) = &jpeg {
+            let form: AvatarUpload = resp.json().await?;
+            let file = reqwest::multipart::Part::bytes(encrypt_avatar(key.get_bytes(), jpeg)).mime_str("application/octet-stream")?;
+            // S3 POST policy: the fields in this order, the file last.
+            let form = reqwest::multipart::Form::new()
+                .text("acl", form.acl)
+                .text("key", form.key)
+                .text("policy", form.policy)
+                .text("Content-Type", "application/octet-stream")
+                .text("x-amz-algorithm", form.algorithm)
+                .text("x-amz-credential", form.credential)
+                .text("x-amz-date", form.date)
+                .text("x-amz-signature", form.signature)
+                .part("file", file);
+            let up = push.request(reqwest::Method::POST, Endpoint::cdn(0, "/"), HttpAuthOverride::Unidentified)?.multipart(form).send().await?;
+            anyhow::ensure!(up.status().is_success(), "photo upload failed: HTTP {}", up.status());
+            let _ = std::fs::create_dir_all(cache.parent().expect("avatars dir"));
+            std::fs::write(&cache, jpeg)?;
+            self.avatars.insert(self.me.to_string(), iced::widget::image::Handle::from_bytes(jpeg.clone()));
+        } else {
+            let _ = std::fs::remove_file(&cache);
+            self.avatars.remove(&self.me.to_string());
+        }
+        self.emit(Event::Avatars(self.avatars.clone()));
         let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::LocalProfile as i32) };
         self.sync_to_self(SyncMessage { content: Some(SyncContent::FetchLatest(fetch)), ..Default::default() }).await?;
         Ok(OwnProfile::from_profile(self.manager.retrieve_profile().await?))
@@ -1919,6 +2025,23 @@ impl Backend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn avatar_photo_is_square_jpeg_and_round_trips_through_the_profile_cipher() {
+        let mut png = Vec::new();
+        image::RgbImage::from_pixel(900, 300, image::Rgb([200, 30, 30]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let jpeg = avatar_jpeg(&png).unwrap();
+        let img = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!((img.width(), img.height()), (300, 300), "center square, not upscaled");
+        assert!(jpeg.starts_with(&[0xff, 0xd8]), "JPEG");
+        assert!(avatar_jpeg(b"not an image").is_err());
+        let key = ProfileKey::create([7; 32]);
+        let sealed = encrypt_avatar(key.get_bytes(), &jpeg);
+        let cipher = presage::libsignal_service::profile_cipher::ProfileCipher::new(key);
+        assert_eq!(cipher.decrypt_avatar(&sealed).unwrap(), jpeg, "phones decrypt it with the profile key");
+    }
+
     use super::*;
     use crate::timeline::tests::{content, text, uuid};
 

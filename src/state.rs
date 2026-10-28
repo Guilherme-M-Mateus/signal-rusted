@@ -82,6 +82,10 @@ pub enum ThemeChoice {
     Nord,
     Sakura,
     Mint,
+    /// Everforest Dark (sainnhe's palette).
+    Everforest,
+    /// `Settings::custom_theme`, from the themes folder.
+    Custom,
 }
 
 /// The settings screen's choices.
@@ -92,11 +96,31 @@ pub struct Settings {
     pub notifications: bool,
     /// Show the message text in notifications (else just who it's from).
     pub notification_text: bool,
+    /// Square corners instead of Signal's rounded ones (Appearance → Rounding).
+    pub square: bool,
+    /// The custom theme's name, when `theme` is `Custom`.
+    pub custom_theme: String,
+    /// Enabled plugins, by file name (all are off until enabled).
+    pub plugins: Vec<String>,
+    pub gif_provider: crate::gifs::Provider,
+    /// The user's own API keys: neither provider serves requests without one.
+    pub giphy_key: String,
+    pub tenor_key: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { theme: ThemeChoice::System, notifications: true, notification_text: true }
+        Settings {
+            theme: ThemeChoice::System,
+            notifications: true,
+            notification_text: true,
+            square: false,
+            custom_theme: String::new(),
+            plugins: Vec::new(),
+            gif_provider: crate::gifs::Provider::Giphy,
+            giphy_key: String::new(),
+            tenor_key: String::new(),
+        }
     }
 }
 
@@ -105,7 +129,17 @@ impl Settings {
         match self.theme {
             ThemeChoice::System => system_dark,
             ThemeChoice::Light | ThemeChoice::Sakura | ThemeChoice::Mint => false,
-            ThemeChoice::Dark | ThemeChoice::Midnight | ThemeChoice::Rusted | ThemeChoice::Nord => true,
+            ThemeChoice::Dark | ThemeChoice::Midnight | ThemeChoice::Rusted | ThemeChoice::Nord | ThemeChoice::Everforest => true,
+            // Custom themes bring their own colors; this only matters for "System".
+            ThemeChoice::Custom => system_dark,
+        }
+    }
+
+    /// The selected GIF provider's API key.
+    pub fn gif_key(&self) -> &str {
+        match self.gif_provider {
+            crate::gifs::Provider::Giphy => &self.giphy_key,
+            crate::gifs::Provider::Tenor => &self.tenor_key,
         }
     }
 
