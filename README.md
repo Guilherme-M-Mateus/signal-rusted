@@ -107,8 +107,9 @@ Idle rows are the median of 3 runs: 30 s to settle, then 30 s of sampling.
 
 ¹ A group chat of roughly 400 messages with photos and links, scrolled back to its first message
 in both apps, measured once each. Signal Desktop's window was larger (maximised), which costs it
-some extra memory. **Known issue:** with that chat open, signal-rusted kept using ~22 % of one
-CPU core instead of going idle (Signal Desktop: 0.1 %); this is being looked into.
+some extra memory. signal-rusted used to keep ~22 % of one CPU core busy with that chat
+open: GIFs scrolled far out of view still drove the animation timer. Fixed: only GIFs on screen
+animate, and the open chat now idles at 0.1 %, the same as Signal Desktop.
 
 ```sh
 cargo build --release
