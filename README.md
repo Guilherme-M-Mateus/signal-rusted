@@ -27,6 +27,7 @@ No Electron, no web engine: an [iced](https://iced.rs) GUI on top of
 
 - [Highlights](#highlights)
 - [Features](#features)
+- [Performance](#performance)
 - [Install and build](#install-and-build)
 - [Using it](#using-it)
 - [Security and privacy](#security-and-privacy)
@@ -83,6 +84,36 @@ real account.
 - Desktop notifications, with or without message text
 - Plugins: your own programs that react to messages ([docs/plugins.md](docs/plugins.md))
 - Optional 1:1 voice calls through Signal's RingRTC ([docs/calls.md](docs/calls.md))
+
+## Performance
+
+Measured against the official Signal Desktop (8.32.0, Flathub) as the control, same account and
+machine (Ryzen AI 7 350, 32 GB, Arch Linux, KDE Wayland), with `scripts/bench.py`. It follows
+each app's whole process tree and reads `/proc`: memory is PSS (shared pages split fairly between
+processes), so Electron's helper processes are counted once.
+
+| | signal-rusted | Signal Desktop | |
+|---|---:|---:|---|
+| Memory after start-up, idle | **217 MiB** | 590 MiB | 2.7× less |
+| Peak memory during start-up | **242 MiB** | 737 MiB | 3.0× less |
+| Memory with a large chat open¹ | **250 MiB** | 744 MiB | 3.0× less |
+| CPU while idle | **0.0 %** | 2.6 % | |
+| CPU used to start | **0.4 s** | 3.0 s | 7.5× less |
+| Start-up, until the CPU goes quiet | **~1 s** | ~3 s | |
+| Processes | **1** | 11 | |
+| Size on disk | **49 MiB** (stripped binary) | 392 MiB (Flatpak) | 8× less |
+
+Idle rows are the median of 3 runs: 30 s to settle, then 30 s of sampling.
+
+¹ A group chat of roughly 400 messages with photos and links, scrolled back to its first message
+in both apps, measured once each. Signal Desktop's window was larger (maximised), which costs it
+some extra memory. **Known issue:** with that chat open, signal-rusted kept using ~22 % of one
+CPU core instead of going idle (Signal Desktop: 0.1 %); this is being looked into.
+
+```sh
+cargo build --release
+scripts/bench.py target/release/signal-rusted "flatpak run org.signal.Signal" --runs 3
+```
 
 ## Install and build
 
