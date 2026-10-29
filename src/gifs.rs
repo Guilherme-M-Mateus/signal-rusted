@@ -132,6 +132,14 @@ impl Animation {
     }
 }
 
+#[cfg(test)]
+impl Animation {
+    pub fn fake() -> Self {
+        let h = Handle::from_rgba(1, 1, vec![0; 4]);
+        Self { frames: vec![(h.clone(), Duration::from_millis(40)), (h, Duration::from_millis(40))], total: Duration::from_millis(80) }
+    }
+}
+
 /// Decodes an animated GIF; `None` for stills, non-GIFs and ones too big to hold decoded.
 pub fn decode(path: &Path) -> Option<Animation> {
     use image::AnimationDecoder;
