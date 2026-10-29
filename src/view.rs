@@ -11,7 +11,7 @@ use iced::widget::text::Span;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::widget::{
     Column, Space, button, center, checkbox, column, container, image, mouse_area, opaque, progress_bar, qr_code, rich_text, row,
-    rule, scrollable, span, stack, svg, text, text_editor, text_input, tooltip,
+    rule, scrollable, sensor, span, stack, svg, text, text_editor, text_input, tooltip,
 };
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Font, Length, Theme, color, mouse};
 use presage::libsignal_service::prelude::Uuid;
@@ -1753,10 +1753,16 @@ const THUMB: f32 = 200.0;
 /// An inline image that opens the viewer; its container id lets tests click it.
 fn clickable_image<'a>(app: &App, key: String, path: &std::path::Path, size: Length, fit: ContentFit) -> Element<'a, Message> {
     let img = image(image_handle(app, &key, path)).width(size).height(size).content_fit(fit).border_radius(round(14.0));
-    mouse_area(container(img).id(format!("image:{key}")))
-        .on_press(Message::ViewImage(key))
-        .interaction(mouse::Interaction::Pointer)
-        .into()
+    let img = mouse_area(container(img).id(format!("image:{key}"))).on_press(Message::ViewImage(key.clone())).interaction(mouse::Interaction::Pointer);
+    // Animated GIFs tick only while on screen; the key re-arms the sensor when rows shift.
+    match app.open.as_ref().filter(|_| app.animations.contains_key(&key)) {
+        Some(o) => {
+            let epoch = o.gif_epoch();
+            let k = key.clone();
+            sensor(img).key((key.clone(), epoch)).on_show(move |_| Message::GifSeen(k.clone(), epoch, true)).on_hide(Message::GifSeen(key, epoch, false)).into()
+        }
+        None => img.into(),
+    }
 }
 
 /// The image file, or the current frame of an animated GIF.
@@ -2357,6 +2363,48 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
         let snap = ui.snapshot(&app.theme()).expect("render");
         assert!(snap.matches_image(dir.join("link-dark")).expect("write png"));
+    }
+
+    /// Each animation tick rebuilds the whole timeline, so a GIF scrolled out of view must not keep it ticking
+    /// (it held ~22% of a core with a long, fully loaded group chat open).
+    #[test]
+    fn only_gifs_on_screen_animate() {
+        let (mut app, mut rx) = app();
+        open_alice(&mut app, &mut rx);
+        let gif = |d: u8| AttachmentPointer { content_type: Some("image/gif".into()), digest: Some(vec![d]), cdn_number: Some(3), ..Default::default() };
+        let mut t = crate::timeline::Timeline::new(uuid(1));
+        for i in 1..=400u64 {
+            let mut dm = crate::timeline::tests::text(i * 60_000, &format!("fake message {i}"));
+            if i == 1 || i == 400 {
+                dm.body = None;
+                dm.attachments = vec![gif(i as u8)];
+            }
+            t.apply(&content(uuid(2), i * 60_000, dm));
+        }
+        app.update(Message::Backend(Event::Timeline { thread: alice(), timeline: t }));
+        app.update(Message::LoadOlder);
+        app.open.as_mut().unwrap().shown = 400; // every page loaded
+        let (old, new) = (attachment_key(&gif(1)), attachment_key(&gif(400u64 as u8)));
+        for k in [&old, &new] {
+            app.attachments.insert(k.clone(), Attach::Ready("/nonexistent.gif".into()));
+            app.animations.insert(k.clone(), crate::gifs::Animation::fake());
+        }
+        assert!(!app.animating(), "nothing reported on screen yet");
+        let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), (1100.0, 760.0), view(&app));
+        ui.simulate([iced::Event::Window(iced::window::Event::RedrawRequested(std::time::Instant::now()))]);
+        let seen: Vec<Message> = ui.into_messages().collect();
+        assert!(seen.iter().any(|m| matches!(m, Message::GifSeen(k, _, true) if *k == new)), "the newest GIF is on screen");
+        assert!(!seen.iter().any(|m| matches!(m, Message::GifSeen(k, _, true) if *k == old)), "the oldest is 399 messages up");
+        for m in seen {
+            app.update(m);
+        }
+        assert!(app.animating());
+        let epoch = app.open.as_ref().unwrap().gif_epoch();
+        app.update(Message::GifSeen(new.clone(), epoch, false));
+        assert!(!app.animating(), "scrolled away: idle again");
+        app.update(Message::GifSeen(new, epoch, true));
+        app.update(Message::LoadOlder);
+        assert!(!app.animating(), "rows shifted: the sighting is stale until the sensor reports again");
     }
 
     /// Writes `snapshots/long-thread-*.png`: a fresh 60-message chat must open at the newest message.

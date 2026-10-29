@@ -86,8 +86,18 @@ pub struct Open {
     pub info: Option<GroupPanel>,
     /// Attachment key of the image shown full-window.
     pub viewer: Option<String>,
+    /// Animated GIFs in the scrolled-to part of the timeline, with the `gif_epoch` they were seen in.
+    pub gifs_on_screen: HashSet<(String, (usize, usize))>,
     last_keystroke: Option<Instant>,
     typing_sent: bool,
+}
+
+impl Open {
+    /// Changes when timeline rows may shift, which drops GIF sensors without an on_hide;
+    /// sightings from an older epoch no longer count.
+    pub fn gif_epoch(&self) -> (usize, usize) {
+        (self.timeline.as_ref().map_or(0, |t| t.messages.len()), self.shown)
+    }
 }
 
 /// The disappearing-messages menu's custom time: an amount of `unit` seconds.
@@ -295,6 +305,8 @@ pub enum Message {
     GifDownloaded(Result<PathBuf, String>),
     Animated(String, Option<Animation>),
     AnimTick(Instant),
+    /// An animated GIF scrolled into (true) or out of view: (attachment key, gif epoch, shown).
+    GifSeen(String, (usize, usize), bool),
     StickerTab(StickerTab),
     /// (pack id, sticker id)
     SendSticker(Vec<u8>, u32),
@@ -485,12 +497,7 @@ impl App {
                 subs.push(Subscription::run_with(p.clone(), crate::plugins::run).with(name).map(|(name, u)| Message::Plugin(name, u)));
             }
         }
-        let animating = self.open.as_ref().and_then(|o| Some((o, o.timeline.as_ref()?))).is_some_and(|(o, t)| {
-            t.messages[t.messages.len().saturating_sub(o.shown)..]
-                .iter()
-                .any(|m| m.attachments.iter().any(|a| self.animations.contains_key(&attachment_key(a))))
-        });
-        if animating {
+        if self.animating() {
             subs.push(iced::time::every(Duration::from_millis(40)).map(Message::AnimTick));
         }
         let typing_active = self.typing.values().any(|m| !m.is_empty());
@@ -509,6 +516,15 @@ impl App {
             subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
         }
         Subscription::batch(subs)
+    }
+
+    /// Whether a GIF is on screen: each frame rebuilds the whole timeline, so off-screen ones must not tick.
+    pub fn animating(&self) -> bool {
+        let Some(o) = &self.open else { return false };
+        match &o.viewer {
+            Some(k) => self.animations.contains_key(k),
+            None => o.info.is_none() && o.gifs_on_screen.iter().any(|(_, e)| *e == o.gif_epoch()),
+        }
     }
 
     fn send(&self, c: Command) {
@@ -598,6 +614,7 @@ impl App {
                     mentions: Vec::new(),
                     recording: None,
                     info: None,
+                    gifs_on_screen: HashSet::new(),
                     viewer: None,
                     last_keystroke: None,
                     typing_sent: false,
@@ -805,6 +822,17 @@ impl App {
                 }
             }
             Message::AnimTick(now) => self.now = now,
+            Message::GifSeen(key, epoch, seen) => {
+                if let Some(o) = &mut self.open {
+                    let now = o.gif_epoch();
+                    o.gifs_on_screen.retain(|(_, e)| *e == now);
+                    if seen && epoch == now {
+                        o.gifs_on_screen.insert((key, epoch));
+                    } else {
+                        o.gifs_on_screen.remove(&(key, epoch));
+                    }
+                }
+            }
             Message::StickerTab(tab) => {
                 if let Some(o) = self.open.as_mut().filter(|o| o.stickers.is_some()) {
                     o.stickers = Some(tab);
@@ -879,6 +907,7 @@ impl App {
             Message::ToggleGroupInfo => {
                 let description = self.group_info().map(|g| g.description.clone()).unwrap_or_default();
                 if let Some(o) = self.open.as_mut().filter(|o| o.is_group) {
+                    o.gifs_on_screen.clear(); // the timeline is rebuilt; its fresh sensors report again
                     o.info = match o.info {
                         Some(_) => None,
                         None => Some(GroupPanel { title: o.title.clone(), description, add_query: String::new() }),
@@ -1009,6 +1038,7 @@ impl App {
             Message::ViewImage(key) => {
                 let Some(o) = &mut self.open else { return Task::none() };
                 o.viewer = Some(key.clone());
+                o.gifs_on_screen.clear(); // the timeline is rebuilt under the viewer; its fresh sensors report again
                 self.fetch(&key);
                 // Unfocus the composer so arrows and Esc reach the viewer.
                 return iced::widget::operation::focus("lightbox");
@@ -1028,6 +1058,7 @@ impl App {
             Message::CloseViewer => {
                 if let Some(o) = self.open.as_mut().filter(|o| o.viewer.is_some()) {
                     o.viewer = None;
+                    o.gifs_on_screen.clear();
                     return iced::widget::operation::focus(crate::view::COMPOSER);
                 }
             }
